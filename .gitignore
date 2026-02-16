@@ -1,0 +1,9 @@
+*.txt
+*.bak
+*.code-workspace
+CLAUDE.md
+AGENTS.md
+.DS_Store/
+.cursor/
+.claude/
+.vscode/
