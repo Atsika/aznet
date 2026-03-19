@@ -250,13 +250,19 @@ func (t *queueTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 		return nil, ErrNoData
 	}
 	var combined []byte
+	var wg sync.WaitGroup
 	for _, msg := range resp.Messages {
 		if msg.MessageText != nil {
 			data, _ := base64.StdEncoding.DecodeString(*msg.MessageText)
 			combined = append(combined, data...)
-			_, _ = t.rxQueue.DeleteMessage(ctx, *msg.MessageID, *msg.PopReceipt, nil)
+			wg.Add(1)
+			go func(id, receipt string) {
+				defer wg.Done()
+				_, _ = t.rxQueue.DeleteMessage(ctx, id, receipt, nil)
+			}(*msg.MessageID, *msg.PopReceipt)
 		}
 	}
+	wg.Wait()
 	if len(combined) == 0 {
 		return nil, ErrNoData
 	}

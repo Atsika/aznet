@@ -275,7 +275,7 @@ func (t *tableTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 	t.mu.Lock()
 	seq := t.rxSeq
 	t.mu.Unlock()
-	pager := t.rxClient.NewListEntitiesPager(&aztables.ListEntitiesOptions{Filter: to.Ptr("PartitionKey eq 'data' and RowKey ge '" + formatRowKey(seq) + "'"), Top: to.Ptr(int32(10))})
+	pager := t.rxClient.NewListEntitiesPager(&aztables.ListEntitiesOptions{Filter: to.Ptr("PartitionKey eq 'data' and RowKey ge '" + formatRowKey(seq) + "'"), Top: to.Ptr(int32(100))})
 	if pager.More() {
 		resp, err := pager.NextPage(ctx)
 		if err == nil && len(resp.Entities) > 0 {
