@@ -1,6 +1,9 @@
 # vscode
 .vscode/
 
+# starlight template boilerplate, not published
+README.md
+
 # build output
 dist/
 # generated types
