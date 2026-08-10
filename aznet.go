@@ -280,10 +280,12 @@ type Conn struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 
-	bufs  *Buffers
-	cfg   *Config
-	noise *Noise
-	poll  *AdaptivePoll
+	bufs      *Buffers
+	cfg       *Config
+	noise     *Noise
+	poll      *AdaptivePoll
+	wake      chan struct{} // buffered(1) nudge from flush() to wake an idle reader
+	pollTimer *time.Timer   // reusable idle-wait timer (reader goroutine only)
 
 	readDeadline  atomic.Pointer[time.Time]
 	writeDeadline atomic.Pointer[time.Time]
@@ -292,6 +294,7 @@ type Conn struct {
 
 	lastActive   atomic.Int64
 	peerLastSeen atomic.Int64
+	lastNudge    atomic.Int64 // UnixNano of last reader nudge; rate-limits wakes
 
 	cleanupToken sync.Once
 	closeOnce    sync.Once
@@ -342,6 +345,7 @@ func newConn(ctx context.Context, cancel context.CancelFunc, t Transport, cfg *C
 		id:        connID,
 		cfg:       cfg,
 		noise:     noise,
+		wake:      make(chan struct{}, 1),
 		bufs:      buffersPool.Get().(*Buffers),
 		mtu:       t.MaxRawSize() - NoiseOverhead - FrameHeaderSize,
 	}
@@ -430,13 +434,13 @@ func (c *Conn) Read(p []byte) (int, error) {
 		rawStream, err := c.transport.ReadRaw(c.ctx)
 		if err != nil {
 			if errors.Is(err, ErrNoData) {
-				c.poll.Sleep()
+				if !c.idleWait() {
+					return 0, os.ErrDeadlineExceeded
+				}
 				continue
 			}
-			if errors.Is(err, context.Canceled) {
-				if c.closed.Load() == 1 {
-					return 0, net.ErrClosed
-				}
+			if errors.Is(err, context.Canceled) && c.closed.Load() == 1 {
+				return 0, net.ErrClosed
 			}
 			return 0, err
 		}
@@ -654,6 +658,68 @@ func (c *Conn) flush() error {
 		}
 
 		c.lastActive.Store(time.Now().UnixNano())
+		c.nudgeReader()
+	}
+}
+
+// nudgeReader hints the read loop that a reply is likely imminent (we just sent),
+// collapsing its poll back-off to fetch sooner. It is rate-limited to at most one
+// nudge per dataPoll so a busy one-directional writer cannot pin the idle reverse
+// channel at fast-poll rate (which would bill extra, uncounted Azure reads).
+func (c *Conn) nudgeReader() {
+	now := time.Now().UnixNano()
+	last := c.lastNudge.Load()
+	if now-last < int64(c.cfg.dataPoll) {
+		return
+	}
+	if !c.lastNudge.CompareAndSwap(last, now) {
+		return
+	}
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
+}
+
+// idleWait blocks after an empty read until the next poll interval elapses, a
+// local send nudges the reader awake, the connection is torn down, or the read
+// deadline expires. It returns false only when the read deadline has passed.
+func (c *Conn) idleWait() bool {
+	d := c.poll.Next()
+	if d <= 0 {
+		return true // post-activity fast path: retry immediately
+	}
+	if c.pollTimer == nil {
+		c.pollTimer = time.NewTimer(d)
+	} else {
+		c.pollTimer.Reset(d)
+	}
+
+	var deadlineCh <-chan time.Time
+	if dl := c.readDeadline.Load(); dl != nil && !dl.IsZero() {
+		remaining := time.Until(*dl)
+		if remaining <= 0 {
+			c.pollTimer.Stop()
+			return false
+		}
+		dt := time.NewTimer(remaining)
+		defer dt.Stop()
+		deadlineCh = dt.C
+	}
+
+	select {
+	case <-c.ctx.Done():
+		c.pollTimer.Stop()
+		return true // loop observes closed/ctx and returns appropriately
+	case <-c.wake:
+		c.pollTimer.Stop()
+		c.poll.Reset()
+		return true
+	case <-c.pollTimer.C:
+		return true
+	case <-deadlineCh:
+		c.pollTimer.Stop()
+		return false
 	}
 }
 
