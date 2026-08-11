@@ -22,19 +22,23 @@ func NewAdaptivePoll(fast, steady time.Duration) *AdaptivePoll {
 	return &AdaptivePoll{Cur: fast, Fast: fast, Steady: steady, skip: false}
 }
 
-// Sleep waits for the current interval and then backs off exponentially up to Steady.
-func (p *AdaptivePoll) Sleep() {
+// Next returns the interval to wait before the next poll and then backs off
+// exponentially up to Steady. It returns 0 exactly once after Reset() (without
+// advancing the back-off) so activity resumes at full speed. The caller owns the
+// actual waiting, which keeps AdaptivePoll single-goroutine and lock-free.
+func (p *AdaptivePoll) Next() time.Duration {
 	if p.skip {
 		p.skip = false
-		return
+		return 0
 	}
-	time.Sleep(p.Cur)
+	d := p.Cur
 	if p.Cur < p.Steady {
 		p.Cur *= 2
 		if p.Cur > p.Steady {
 			p.Cur = p.Steady
 		}
 	}
+	return d
 }
 
 // Reset moves the current interval back to the fast value.

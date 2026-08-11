@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azqueue"
@@ -20,6 +23,35 @@ const queueDriverName = "azqueue"
 
 // MaxQueuePayload is the maximum raw data size stored in a queue message (64 KB).
 const MaxQueueTextMessageSize = 64 * 1024
+
+const (
+	// seqHeaderSize is the big-endian sequence number prepended to every queue
+	// message. Azure Storage Queues are at-least-once and not strictly FIFO, so
+	// the receiver uses this to dedup and reorder into a clean byte stream.
+	seqHeaderSize = 8
+	// queueSizeMargin keeps the base64-encoded message safely below the 64 KiB
+	// queue ceiling. See MaxRawSize: base64 expands by 4/3, and the encoded form
+	// of (seqHeaderSize + sealed chunk) must stay <= MaxQueueTextMessageSize.
+	queueSizeMargin = 64
+	// maxPendingMessages caps the reassembly buffer's MEMORY footprint: it bounds
+	// how many out-of-order messages may be held while waiting on a missing
+	// sequence. Liveness (failing a permanently missing sequence, e.g. a message
+	// that hit its TTL) is no longer tied to this cap; it is enforced by the
+	// time-based stall clock in ReadRaw.
+	maxPendingMessages = 256
+	// defaultReassemblyStall bounds the wait for a missing sequence when the
+	// config carries no usable idle timeout.
+	defaultReassemblyStall = 60 * time.Second
+)
+
+// ErrReassemblyOverflow is returned when the azqueue reassembly buffer exceeds
+// maxPendingMessages, indicating a sequence gap that will not resolve.
+var ErrReassemblyOverflow = errors.New("azqueue: reassembly buffer overflow")
+
+// ErrReassemblyStalled is returned when a sequence gap in the azqueue receive
+// stream fails to close within the stall bound, i.e. a message was lost and the
+// byte stream can never be completed.
+var ErrReassemblyStalled = errors.New("azqueue: reassembly stalled on missing sequence")
 
 func init() {
 	RegisterFactory(queueDriverName, &queueFactory{})
@@ -208,7 +240,7 @@ func (p *queueDriver) NewTransport(_ context.Context, connID string, tokens Sess
 	} else {
 		tx, rx = p.client.NewQueueClient(resName), p.client.NewQueueClient(reqName)
 	}
-	return &queueTransport{connID: connID, txQueue: tx, rxQueue: rx, ep: p.ep, txName: reqName, rxName: resName, cfg: p.cfg}, nil
+	return &queueTransport{connID: connID, txQueue: tx, rxQueue: rx, ep: p.ep, txName: reqName, rxName: resName, cfg: p.cfg, pending: make(map[uint64][]byte)}, nil
 }
 
 func (p *queueDriver) CleanupBootstrap(ctx context.Context) error {
@@ -234,43 +266,208 @@ type queueTransport struct {
 	ep               *Endpoint
 	cfg              *Config
 
+	// rmu guards the whole receive-reassembly state: pending, rxSeq, stallSince
+	// and rxErr. net.Conn is documented as safe for concurrent use, and Conn.Read
+	// calls ReadRaw with its own read mutex released, so two goroutines really can
+	// be inside ReadRaw at once. Without this lock that would be concurrent map
+	// access on pending, i.e. Go's unrecoverable "concurrent map writes" fatal
+	// error. Held only around in-memory state, never across a queue round-trip:
+	// DequeueMessages runs before the lock is taken and the DeleteMessage
+	// goroutines are merely spawned under it and waited on after release.
+	rmu     sync.Mutex
+	pending map[uint64][]byte // rx reassembly buffer; guarded by rmu
+
+	// rxErr is the sticky reassembly failure (nil while healthy). Overflow and
+	// stall both mean a sequence gap that will never close, so the transport is
+	// finished: recording the verdict here makes every later ReadRaw return the
+	// same error instead of letting the caller retry — retries would otherwise
+	// ingest one more message per call and grow pending without bound.
+	// Guarded by rmu.
+	rxErr error
+
+	// stallSince is when rxSeq last became blocked on a missing sequence
+	// (zero when not stalled). Guarded by rmu. Placed among the
+	// pointer/reference fields so time.Time's *Location does not extend the
+	// struct's pointer-scan region (keeps fieldalignment quiet).
+	stallSince time.Time
+
 	connID         string
 	txName, rxName string
+
+	// txSeq needs no lock: WriteRaw is only reached through Conn.flush, which
+	// holds Conn.fmu, so the write path is already serialized by the caller.
+	txSeq uint64 // next sequence to send
+	rxSeq uint64 // next contiguous sequence expected; guarded by rmu
+}
+
+// encodeQueueMessage prepends the big-endian sequence to raw and base64-encodes
+// the result for transport in a single queue message.
+func encodeQueueMessage(seq uint64, raw []byte) string {
+	msg := make([]byte, seqHeaderSize+len(raw))
+	binary.BigEndian.PutUint64(msg[:seqHeaderSize], seq)
+	copy(msg[seqHeaderSize:], raw)
+	return base64.StdEncoding.EncodeToString(msg)
+}
+
+// decodeQueueMessage reverses encodeQueueMessage.
+func decodeQueueMessage(text string) (uint64, []byte, error) {
+	data, err := base64.StdEncoding.DecodeString(text)
+	if err != nil {
+		return 0, nil, err
+	}
+	if len(data) < seqHeaderSize {
+		return 0, nil, fmt.Errorf("azqueue: message too short (%d bytes)", len(data))
+	}
+	return binary.BigEndian.Uint64(data[:seqHeaderSize]), data[seqHeaderSize:], nil
+}
+
+// ingestLocked buffers one decoded message, discarding duplicates (already-
+// delivered or already-buffered sequences). It reports whether the buffer has
+// overflowed. Caller must hold t.rmu.
+func (t *queueTransport) ingestLocked(seq uint64, payload []byte) (overflow bool) {
+	if seq < t.rxSeq {
+		return false // already delivered; redelivery under at-least-once
+	}
+	if _, dup := t.pending[seq]; dup {
+		return false
+	}
+	t.pending[seq] = payload
+	return len(t.pending) > maxPendingMessages
+}
+
+// drainLocked returns the contiguous in-order run starting at rxSeq, advancing
+// rxSeq and removing the drained entries from the buffer. Caller must hold
+// t.rmu.
+func (t *queueTransport) drainLocked() []byte {
+	var out []byte
+	for {
+		payload, ok := t.pending[t.rxSeq]
+		if !ok {
+			break
+		}
+		out = append(out, payload...)
+		delete(t.pending, t.rxSeq)
+		t.rxSeq++
+	}
+	return out
+}
+
+// stallLimit is how long rxSeq may stay blocked on a missing sequence before the
+// connection fails. Tied to idleTimeout: past that the peer is already treated as
+// dead (the listener's janitor reaps the session on the same clock), so there is
+// no separate knob.
+func (t *queueTransport) stallLimit() time.Duration {
+	if t.cfg != nil && t.cfg.idleTimeout > 0 {
+		return t.cfg.idleTimeout
+	}
+	return defaultReassemblyStall
 }
 
 func (t *queueTransport) WriteRaw(ctx context.Context, data io.ReadSeeker) error {
-	raw, _ := io.ReadAll(data)
-	_, err := t.txQueue.EnqueueMessage(ctx, base64.StdEncoding.EncodeToString(raw), nil)
-	return err
+	raw, err := io.ReadAll(data)
+	if err != nil {
+		return err
+	}
+	if _, err := t.txQueue.EnqueueMessage(ctx, encodeQueueMessage(t.txSeq, raw), nil); err != nil {
+		return err
+	}
+	t.txSeq++ // only advance on success so sequences stay gap-free
+	return nil
 }
 
 func (t *queueTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
-	resp, err := t.rxQueue.DequeueMessages(ctx, &azqueue.DequeueMessagesOptions{NumberOfMessages: to.Ptr[int32](32)})
-	if err != nil || len(resp.Messages) == 0 {
-		return nil, ErrNoData
+	// Once reassembly has failed there is no path back to a correct byte stream,
+	// so short-circuit before touching the queue and repeat the same verdict.
+	t.rmu.Lock()
+	failed := t.rxErr
+	t.rmu.Unlock()
+	if failed != nil {
+		return nil, failed
 	}
-	var combined []byte
-	var wg sync.WaitGroup
-	for _, msg := range resp.Messages {
-		if msg.MessageText != nil {
-			data, _ := base64.StdEncoding.DecodeString(*msg.MessageText)
-			combined = append(combined, data...)
+
+	resp, err := t.rxQueue.DequeueMessages(ctx, &azqueue.DequeueMessagesOptions{NumberOfMessages: to.Ptr[int32](32)})
+
+	overflow := false
+	if err == nil && len(resp.Messages) > 0 {
+		var wg sync.WaitGroup
+
+		t.rmu.Lock()
+		for _, msg := range resp.Messages {
+			if msg.MessageText == nil {
+				continue
+			}
+
+			seq, payload, derr := decodeQueueMessage(*msg.MessageText)
+			if derr != nil {
+				// Leave an undecodable message in the queue: it reappears after
+				// the visibility timeout and can be retried. Deleting it here
+				// would drop a sequence we never ingested, opening a gap that
+				// can never close and that the stall clock would then fail on.
+				continue
+			}
+			overflow = t.ingestLocked(seq, payload)
+
+			// Deleted only now that the message is accounted for in pending.
+			// Duplicates redelivered under at-least-once are discarded by
+			// ingestLocked, never re-read downstream. Deletes stay concurrent;
+			// the goroutines touch no rmu-guarded state, so spawning them under
+			// the lock is safe and the wait happens after it is released.
 			wg.Add(1)
 			go func(id, receipt string) {
 				defer wg.Done()
 				_, _ = t.rxQueue.DeleteMessage(ctx, id, receipt, nil)
 			}(*msg.MessageID, *msg.PopReceipt)
+
+			if overflow {
+				break
+			}
 		}
+		t.rmu.Unlock()
+
+		wg.Wait()
 	}
-	wg.Wait()
+
+	t.rmu.Lock()
+	defer t.rmu.Unlock()
+
+	// Overflow is terminal, not transient: pending is full of out-of-order
+	// messages waiting on a sequence that is not coming, exactly the conclusion
+	// the stall clock reaches. Record it so retries stop here instead of
+	// ingesting one more message per call forever.
+	if overflow {
+		t.rxErr = ErrReassemblyOverflow
+		return nil, t.rxErr
+	}
+
+	combined := t.drainLocked()
+
+	// Stall clock: rxSeq made no forward progress while out-of-order messages are
+	// buffered => we are blocked on a missing sequence. Fail loudly if it never
+	// lands, and make that failure stick for the same reason overflow does.
+	switch {
+	case len(combined) > 0 || len(t.pending) == 0:
+		t.stallSince = time.Time{} // progress, or nothing buffered
+	case t.stallSince.IsZero():
+		t.stallSince = time.Now() // first blocked poll: start the clock
+	case time.Since(t.stallSince) > t.stallLimit():
+		t.rxErr = fmt.Errorf("%w: seq %d missing for %s (%d messages buffered)",
+			ErrReassemblyStalled, t.rxSeq, t.stallLimit(), len(t.pending))
+		return nil, t.rxErr
+	}
+
 	if len(combined) == 0 {
-		return nil, ErrNoData
+		return nil, ErrNoData // out-of-order messages await their predecessors
 	}
 	return io.NopCloser(bytes.NewReader(combined)), nil
 }
 
-func (t *queueTransport) Close() error    { return nil }
-func (t *queueTransport) MaxRawSize() int { return (MaxQueueTextMessageSize * 3) / 4 }
+func (t *queueTransport) Close() error { return nil }
+
+// MaxRawSize reserves room for the sequence header and a safety margin so the
+// base64-encoded message stays under the 64 KiB queue ceiling.
+func (t *queueTransport) MaxRawSize() int {
+	return (MaxQueueTextMessageSize*3)/4 - seqHeaderSize - queueSizeMargin
+}
 func (t *queueTransport) LocalAddr() net.Addr {
 	return ServiceAddr{queueDriverName, t.ep.ServiceURL(), t.txName}
 }
