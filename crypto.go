@@ -29,6 +29,9 @@ var (
 	ErrNoiseInitFailed = errors.New("noise handshake initialization failed")
 	// ErrNoiseMsgFailed is returned when a Noise handshake message cannot be created.
 	ErrNoiseMsgFailed = errors.New("handshake message creation failed")
+	// ErrChunkTooLarge is returned when a sealed chunk declares a length larger
+	// than the transport can produce, which means the stream is corrupt.
+	ErrChunkTooLarge = errors.New("sealed chunk exceeds transport maximum")
 )
 
 // Noise encapsulates the Noise Protocol handshake state and cipher suite.
@@ -154,20 +157,32 @@ func (nh *Noise) SealData(dst, plaintext []byte) ([]byte, error) {
 
 // UnsealData attempts to extract and decrypt a Noise chunk from data.
 // It returns the decrypted plaintext into dst, the remaining data, and an error.
-func (nh *Noise) UnsealData(dst, data []byte) (plaintext, remaining []byte, err error) {
+//
+// maxChunk bounds the total size of a sealed chunk (length prefix included);
+// callers pass their transport's MaxRawSize. A declared length above that bound
+// cannot come from a legitimate peer, so it fails with ErrChunkTooLarge instead
+// of io.ErrShortBuffer — otherwise the caller would keep buffering, waiting for
+// bytes that never arrive. A maxChunk of zero or less disables the check.
+func (nh *Noise) UnsealData(dst, data []byte, maxChunk int) (plaintext, remaining []byte, err error) {
 	if len(data) < 4 {
 		return nil, data, io.ErrShortBuffer
 	}
 
-	length := int(binary.BigEndian.Uint32(data[:4]))
-	if len(data) < 4+length {
+	// Width the arithmetic to uint64: on 32-bit platforms (js/wasm) a garbage
+	// uint32 length would otherwise overflow int and slice with a negative bound.
+	length := uint64(binary.BigEndian.Uint32(data[:4]))
+	total := 4 + length
+	if maxChunk > 0 && total > uint64(maxChunk) {
+		return nil, nil, fmt.Errorf("%w: %d > %d", ErrChunkTooLarge, total, maxChunk)
+	}
+	if uint64(len(data)) < total {
 		return nil, data, io.ErrShortBuffer
 	}
 
-	decrypted, err := nh.DecryptData(dst[:0], data[4:4+length])
+	decrypted, err := nh.DecryptData(dst[:0], data[4:total])
 	if err != nil {
 		return nil, nil, err
 	}
 
-	return decrypted, data[4+length:], nil
+	return decrypted, data[total:], nil
 }

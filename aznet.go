@@ -283,6 +283,7 @@ type Conn struct {
 	bufs      *Buffers
 	cfg       *Config
 	noise     *Noise
+	pending   pendingChunk // sealed chunk awaiting a write retry; guarded by fmu
 	poll      *AdaptivePoll
 	wake      chan struct{} // buffered(1) nudge from flush() to wake an idle reader
 	pollTimer *time.Timer   // reusable idle-wait timer (reader goroutine only)
@@ -313,6 +314,17 @@ type Conn struct {
 	closedWrite atomic.Uint32
 	mtu         int
 	readRemain  int
+}
+
+// pendingChunk holds a sealed chunk whose transport write failed. Noise nonces
+// advance on every seal, so a retry has to resend the exact same ciphertext:
+// re-sealing the same plaintext would consume a second nonce and desync the
+// peer's cipher state permanently. Guarded by fmu.
+type pendingChunk struct {
+	data    []byte // sealed ciphertext, owned copy; keeps its capacity for reuse
+	consume int    // bytes of bufs.Write this chunk covers (0 for control chunks)
+	rotate  bool   // call RotateTX once the write lands
+	valid   bool   // true while data holds a chunk still owed to the peer
 }
 
 // Buffers encapsulates the internal bytes.Buffer instances used by a connection.
@@ -372,6 +384,13 @@ func (c *Conn) Read(p []byte) (int, error) {
 		if c.closedRead.Load() == 1 {
 			c.rmu.Unlock()
 			return 0, io.EOF
+		}
+		// Close() recycles bufs into the shared pool while holding rmu, so a
+		// non-nil check under the lock is what keeps this read off a buffer that
+		// now belongs to another connection.
+		if c.bufs == nil {
+			c.rmu.Unlock()
+			return 0, net.ErrClosed
 		}
 
 		deadline := c.readDeadline.Load()
@@ -445,17 +464,26 @@ func (c *Conn) Read(p []byte) (int, error) {
 			return 0, err
 		}
 
-		// Read directly from the stream into the Noise buffer.
+		// Read directly from the stream into the Noise buffer, then decrypt.
+		// Both touch bufs, so they run under rmu; the blocking ReadRaw above
+		// deliberately does not.
+		c.rmu.Lock()
+		if c.bufs == nil {
+			c.rmu.Unlock()
+			rawStream.Close()
+			return 0, net.ErrClosed
+		}
+
 		_, err = c.bufs.Noise.ReadFrom(rawStream)
 		rawStream.Close()
 		if err != nil && err != io.EOF {
+			c.rmu.Unlock()
 			return 0, err
 		}
 
-		// Decrypt and process
-		c.rmu.Lock()
+		maxChunk := c.transport.MaxRawSize()
 		for {
-			decrypted, rest, err := c.noise.UnsealData(c.bufs.Dec, c.bufs.Noise.Bytes())
+			decrypted, rest, err := c.noise.UnsealData(c.bufs.Dec, c.bufs.Noise.Bytes(), maxChunk)
 			if err != nil {
 				if err != io.ErrShortBuffer {
 					c.rmu.Unlock()
@@ -496,6 +524,10 @@ func (c *Conn) Write(p []byte) (int, error) {
 
 	total := len(p)
 	c.wmu.Lock()
+	if c.bufs == nil {
+		c.wmu.Unlock()
+		return 0, io.ErrClosedPipe
+	}
 	for len(p) > 0 {
 		chunkSize := min(len(p), int(c.mtu))
 		BuildFrame(&c.bufs.Write, Frame{Type: MsgTypeData, Payload: p[:chunkSize]})
@@ -523,8 +555,16 @@ func (c *Conn) Close() error {
 
 		_ = c.flush()
 		err = c.transport.Close()
+		// Cancel first: it unblocks any in-flight transport call so the reader
+		// releases rmu instead of making the teardown below wait on the network.
 		c.cancel()
 
+		// Recycling into the shared pool hands this memory to another
+		// connection, so every in-flight user has to be out first. Full lock
+		// order: fmu → wmu → rmu.
+		c.fmu.Lock()
+		c.wmu.Lock()
+		c.rmu.Lock()
 		if c.bufs != nil {
 			c.bufs.Read.Reset()
 			c.bufs.Write.Reset()
@@ -534,6 +574,10 @@ func (c *Conn) Close() error {
 			buffersPool.Put(c.bufs)
 			c.bufs = nil
 		}
+		c.pending = pendingChunk{}
+		c.rmu.Unlock()
+		c.wmu.Unlock()
+		c.fmu.Unlock()
 	})
 	return err
 }
@@ -545,6 +589,10 @@ func (c *Conn) CloseWrite() error {
 		return nil
 	}
 	c.wmu.Lock()
+	if c.bufs == nil {
+		c.wmu.Unlock()
+		return net.ErrClosed
+	}
 	BuildFrame(&c.bufs.Write, Frame{Type: MsgTypeFin})
 	c.wmu.Unlock()
 
@@ -596,6 +644,10 @@ func (c *Conn) keepAlive() {
 			last := c.lastActive.Load()
 			if time.Since(time.Unix(0, last)) >= c.cfg.pingInterval {
 				c.wmu.Lock()
+				if c.bufs == nil {
+					c.wmu.Unlock()
+					return
+				}
 				BuildFrame(&c.bufs.Write, Frame{Type: MsgTypePing})
 				c.wmu.Unlock()
 				_ = c.flush()
@@ -608,6 +660,18 @@ func (c *Conn) keepAlive() {
 func (c *Conn) flush() error {
 	c.fmu.Lock()
 	defer c.fmu.Unlock()
+
+	if c.bufs == nil {
+		return net.ErrClosed
+	}
+
+	// A chunk left over from a failed write goes out before anything new is
+	// sealed, so the peer sees chunks in nonce order.
+	if c.pending.valid {
+		if err := c.sendChunk(c.pending.data, c.pending.consume, c.pending.rotate); err != nil {
+			return err
+		}
+	}
 
 	maxChunk := c.transport.MaxRawSize() - NoiseOverhead
 
@@ -632,34 +696,62 @@ func (c *Conn) flush() error {
 			}
 			c.bufs.Enc = sealed[:0]
 
-			if err := c.transport.WriteRaw(c.ctx, bytes.NewReader(sealed)); err != nil {
-				return err
-			}
-			if err := c.rotator.RotateTX(c.ctx); err != nil {
+			if err := c.sendChunk(sealed, 0, true); err != nil {
 				return err
 			}
 			continue // Re-check buffer after rotation
 		}
 
-		takeLen := min(c.bufs.Write.Len(), int(maxChunk))
-		plaintext := c.bufs.Write.Next(takeLen)
-		c.wmu.Unlock()
-
-		sealed, err := c.noise.SealData(c.bufs.Enc, plaintext)
+		takeLen := min(c.bufs.Write.Len(), maxChunk)
+		// Seal while still holding wmu: the slice aliases the write buffer's
+		// backing array, which a concurrent Write can slide in place.
+		sealed, err := c.noise.SealData(c.bufs.Enc, c.bufs.Write.Bytes()[:takeLen])
 		if err != nil {
+			c.wmu.Unlock()
 			return err
 		}
-
 		c.bufs.Enc = sealed[:0]
+		c.wmu.Unlock()
 
-		err = c.transport.WriteRaw(c.ctx, bytes.NewReader(sealed))
-		if err != nil {
+		if err := c.sendChunk(sealed, takeLen, false); err != nil {
 			return err
 		}
 
 		c.lastActive.Store(time.Now().UnixNano())
 		c.nudgeReader()
 	}
+}
+
+// sendChunk writes one sealed chunk and, only once the write has landed,
+// consumes the plaintext it covered from the write buffer and applies any
+// rotation the chunk announced. A failed write leaves the plaintext queued and
+// stashes the ciphertext for the next flush() to resend verbatim, so a transient
+// transport error costs a retry instead of punching a hole in the stream.
+//
+// Caller must hold fmu and must not hold wmu.
+func (c *Conn) sendChunk(sealed []byte, consume int, rotate bool) error {
+	if err := c.transport.WriteRaw(c.ctx, bytes.NewReader(sealed)); err != nil {
+		if !c.pending.valid {
+			// Copy, because sealed aliases bufs.Enc and the next seal reuses it.
+			c.pending.data = append(c.pending.data[:0], sealed...)
+			c.pending.consume = consume
+			c.pending.rotate = rotate
+			c.pending.valid = true
+		}
+		return err
+	}
+
+	c.pending.valid = false
+
+	if consume > 0 {
+		c.wmu.Lock()
+		c.bufs.Write.Next(consume)
+		c.wmu.Unlock()
+	}
+	if rotate {
+		return c.rotator.RotateTX(c.ctx)
+	}
+	return nil
 }
 
 // nudgeReader hints the read loop that a reply is likely imminent (we just sent),
