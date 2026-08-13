@@ -670,6 +670,7 @@ func (c *Conn) flush() error {
 	}
 
 	maxChunk := c.transport.MaxRawSize() - NoiseOverhead
+	aligned := true
 
 	for {
 		c.wmu.Lock()
@@ -678,8 +679,10 @@ func (c *Conn) flush() error {
 			return nil
 		}
 
-		// Check rotation while holding lock
-		if c.rotator != nil && c.rotator.ShouldRotate() {
+		// Check rotation while holding lock. Only ever at a frame boundary:
+		// chunking below is frame-aligned, so the Rotate frame becomes a chunk
+		// of its own between whole frames.
+		if aligned && c.rotator != nil && c.rotator.ShouldRotate() {
 			c.wmu.Unlock()
 
 			// Send rotation frame
@@ -698,7 +701,15 @@ func (c *Conn) flush() error {
 			continue // Re-check buffer after rotation
 		}
 
-		takeLen := min(c.bufs.Write.Len(), maxChunk)
+		takeLen := alignedChunkLen(c.bufs.Write.Bytes(), maxChunk)
+		if takeLen == 0 {
+			// Unreachable while Write caps payloads at mtu. Send an unaligned
+			// chunk rather than stall, and hold rotation off until the buffer
+			// drains and the next flush() starts on a frame boundary again.
+			takeLen = min(c.bufs.Write.Len(), maxChunk)
+			aligned = false
+		}
+
 		// Seal while still holding wmu: the slice aliases the write buffer's
 		// backing array, which a concurrent Write can slide in place.
 		sealed, err := c.noise.SealData(c.bufs.Enc, c.bufs.Write.Bytes()[:takeLen])
