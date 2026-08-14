@@ -55,6 +55,7 @@ type Transport interface {
 	// RemoteAddr returns the remote network address.
 	RemoteAddr() net.Addr
 	// MaxRawSize returns the maximum raw capacity of the transport in bytes.
+	// It must be constant for the lifetime of the transport.
 	MaxRawSize() int
 }
 
@@ -131,6 +132,8 @@ var (
 	ErrInvalidConfig = errors.New("invalid configuration")
 	// ErrNoData is returned when no data is available to read.
 	ErrNoData = errors.New("no data available")
+	// ErrFrameTooLarge is returned when a queued frame exceeds one chunk.
+	ErrFrameTooLarge = errors.New("frame exceeds chunk size")
 )
 
 // RegisterFactory registers a factory for the given scheme (e.g., "azblob").
@@ -669,8 +672,8 @@ func (c *Conn) flush() error {
 		}
 	}
 
-	maxChunk := c.transport.MaxRawSize() - NoiseOverhead
-	aligned := true
+	// Derived from mtu so the largest frame always fits in one chunk.
+	maxChunk := int(c.mtu) + FrameHeaderSize
 
 	for {
 		c.wmu.Lock()
@@ -679,10 +682,8 @@ func (c *Conn) flush() error {
 			return nil
 		}
 
-		// Check rotation while holding lock. Only ever at a frame boundary:
-		// chunking below is frame-aligned, so the Rotate frame becomes a chunk
-		// of its own between whole frames.
-		if aligned && c.rotator != nil && c.rotator.ShouldRotate() {
+		// Always at a frame boundary, since chunking below is frame-aligned.
+		if c.rotator != nil && c.rotator.ShouldRotate() {
 			c.wmu.Unlock()
 
 			// Send rotation frame
@@ -703,11 +704,9 @@ func (c *Conn) flush() error {
 
 		takeLen := alignedChunkLen(c.bufs.Write.Bytes(), maxChunk)
 		if takeLen == 0 {
-			// Unreachable while Write caps payloads at mtu. Send an unaligned
-			// chunk rather than stall, and hold rotation off until the buffer
-			// drains and the next flush() starts on a frame boundary again.
-			takeLen = min(c.bufs.Write.Len(), maxChunk)
-			aligned = false
+			// Framing is already broken; an unaligned chunk would hide it.
+			c.wmu.Unlock()
+			return fmt.Errorf("%w: frame exceeds chunk size %d", ErrFrameTooLarge, maxChunk)
 		}
 
 		// Seal while still holding wmu: the slice aliases the write buffer's
