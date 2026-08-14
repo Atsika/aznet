@@ -155,21 +155,16 @@ func (nh *Noise) SealData(dst, plaintext []byte) ([]byte, error) {
 	return dst[:4+len(ciphertext)], nil
 }
 
-// UnsealData attempts to extract and decrypt a Noise chunk from data.
-// It returns the decrypted plaintext into dst, the remaining data, and an error.
-//
-// maxChunk bounds the total size of a sealed chunk (length prefix included);
-// callers pass their transport's MaxRawSize. A declared length above that bound
-// cannot come from a legitimate peer, so it fails with ErrChunkTooLarge instead
-// of io.ErrShortBuffer — otherwise the caller would keep buffering, waiting for
-// bytes that never arrive. A maxChunk of zero or less disables the check.
+// UnsealData extracts and decrypts one Noise chunk from data, returning the
+// plaintext in dst and the unconsumed remainder. maxChunk bounds the sealed
+// chunk size (0 disables): a larger declared length is corrupt, and reporting it
+// as io.ErrShortBuffer would leave the caller buffering for bytes never coming.
 func (nh *Noise) UnsealData(dst, data []byte, maxChunk int) (plaintext, remaining []byte, err error) {
 	if len(data) < 4 {
 		return nil, data, io.ErrShortBuffer
 	}
 
-	// Width the arithmetic to uint64: on 32-bit platforms (js/wasm) a garbage
-	// uint32 length would otherwise overflow int and slice with a negative bound.
+	// uint64: on 32-bit (js/wasm) a garbage length would overflow int.
 	length := uint64(binary.BigEndian.Uint32(data[:4]))
 	total := 4 + length
 	if maxChunk > 0 && total > uint64(maxChunk) {

@@ -315,15 +315,14 @@ type Conn struct {
 	readRemain  int
 }
 
-// pendingChunk holds a sealed chunk whose transport write failed. Noise nonces
-// advance on every seal, so a retry has to resend the exact same ciphertext:
-// re-sealing the same plaintext would consume a second nonce and desync the
-// peer's cipher state permanently. Guarded by fmu.
+// pendingChunk holds a sealed chunk whose write failed, for verbatim resend.
+// Re-sealing is not an option: Noise nonces advance per seal, so a second seal
+// of the same plaintext would desync the peer permanently. Guarded by fmu.
 type pendingChunk struct {
-	data    []byte // sealed ciphertext, owned copy; keeps its capacity for reuse
+	data    []byte // sealed ciphertext, owned copy
 	consume int    // bytes of bufs.Write this chunk covers (0 for control chunks)
 	rotate  bool   // call RotateTX once the write lands
-	valid   bool   // true while data holds a chunk still owed to the peer
+	valid   bool   // data holds a chunk still owed to the peer
 }
 
 // Buffers encapsulates the internal bytes.Buffer instances used by a connection.
@@ -625,10 +624,8 @@ func (c *Conn) MTU() int {
 
 func (c *Conn) GetMetrics() Metrics { return c.cfg.metrics }
 
-// keepAlive sends periodic Ping frames when the local side is idle.
-// lastActive tracks the time of the most recent flush (local send).
-// peerLastSeen (updated in Read) tracks the most recent received frame.
-// A Ping is only sent if no data was flushed within the pingInterval.
+// keepAlive sends a Ping frame whenever nothing has been flushed for a full
+// pingInterval.
 func (c *Conn) keepAlive() {
 	ticker := time.NewTicker(c.cfg.pingInterval)
 	defer ticker.Stop()
@@ -721,13 +718,9 @@ func (c *Conn) flush() error {
 	}
 }
 
-// sendChunk writes one sealed chunk and, only once the write has landed,
-// consumes the plaintext it covered from the write buffer and applies any
-// rotation the chunk announced. A failed write leaves the plaintext queued and
-// stashes the ciphertext for the next flush() to resend verbatim, so a transient
-// transport error costs a retry instead of punching a hole in the stream.
-//
-// Caller must hold fmu and must not hold wmu.
+// sendChunk writes one sealed chunk, consuming the plaintext it covered and
+// applying any rotation only once the write lands; a failure leaves both queued
+// for retry. Caller must hold fmu and must not hold wmu.
 func (c *Conn) sendChunk(sealed []byte, consume int, rotate bool) error {
 	if err := c.transport.WriteRaw(c.ctx, bytes.NewReader(sealed)); err != nil {
 		if !c.pending.valid {
@@ -754,9 +747,9 @@ func (c *Conn) sendChunk(sealed []byte, consume int, rotate bool) error {
 }
 
 // nudgeReader hints the read loop that a reply is likely imminent (we just sent),
-// collapsing its poll back-off to fetch sooner. It is rate-limited to at most one
-// nudge per dataPoll so a busy one-directional writer cannot pin the idle reverse
-// channel at fast-poll rate (which would bill extra, uncounted Azure reads).
+// collapsing its poll back-off to fetch sooner. Rate-limited to one nudge per
+// dataPoll so a one-directional writer cannot pin the idle reverse channel at
+// fast-poll rate and bill extra reads.
 func (c *Conn) nudgeReader() {
 	now := time.Now().UnixNano()
 	last := c.lastNudge.Load()

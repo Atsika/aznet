@@ -33,11 +33,8 @@ const (
 	// queue ceiling. See MaxRawSize: base64 expands by 4/3, and the encoded form
 	// of (seqHeaderSize + sealed chunk) must stay <= MaxQueueTextMessageSize.
 	queueSizeMargin = 64
-	// maxPendingMessages caps the reassembly buffer's MEMORY footprint: it bounds
-	// how many out-of-order messages may be held while waiting on a missing
-	// sequence. Liveness (failing a permanently missing sequence, e.g. a message
-	// that hit its TTL) is no longer tied to this cap; it is enforced by the
-	// time-based stall clock in ReadRaw.
+	// maxPendingMessages caps the reassembly buffer's memory footprint. Liveness
+	// is not tied to it: the stall clock in ReadRaw fails a missing sequence.
 	maxPendingMessages = 256
 	// defaultReassemblyStall bounds the wait for a missing sequence when the
 	// config carries no usable idle timeout.
@@ -266,38 +263,28 @@ type queueTransport struct {
 	ep               *Endpoint
 	cfg              *Config
 
-	// rmu guards the whole receive-reassembly state: pending, rxSeq, stallSince
-	// and rxErr. net.Conn is documented as safe for concurrent use, and Conn.Read
-	// calls ReadRaw with its own read mutex released, so two goroutines really can
-	// be inside ReadRaw at once. Without this lock that would be concurrent map
-	// access on pending, i.e. Go's unrecoverable "concurrent map writes" fatal
-	// error. Held only around in-memory state, never across a queue round-trip:
-	// DequeueMessages runs before the lock is taken and the DeleteMessage
-	// goroutines are merely spawned under it and waited on after release.
+	// rmu guards the reassembly state below. Conn.Read calls ReadRaw with its own
+	// lock released, so concurrent readers would otherwise race the pending map.
+	// Never held across a queue round-trip.
 	rmu     sync.Mutex
-	pending map[uint64][]byte // rx reassembly buffer; guarded by rmu
+	pending map[uint64][]byte // rx reassembly buffer
 
-	// rxErr is the sticky reassembly failure (nil while healthy). Overflow and
-	// stall both mean a sequence gap that will never close, so the transport is
-	// finished: recording the verdict here makes every later ReadRaw return the
-	// same error instead of letting the caller retry — retries would otherwise
-	// ingest one more message per call and grow pending without bound.
-	// Guarded by rmu.
+	// rxErr is the sticky reassembly failure: overflow and stall both mean a gap
+	// that will never close, so every later ReadRaw repeats the same verdict
+	// rather than letting retries grow pending without bound.
 	rxErr error
 
-	// stallSince is when rxSeq last became blocked on a missing sequence
-	// (zero when not stalled). Guarded by rmu. Placed among the
-	// pointer/reference fields so time.Time's *Location does not extend the
-	// struct's pointer-scan region (keeps fieldalignment quiet).
+	// stallSince is when rxSeq became blocked on a missing sequence (zero if not).
+	// Placed among the pointer fields so time.Time's *Location does not extend the
+	// struct's pointer-scan region.
 	stallSince time.Time
 
 	connID         string
 	txName, rxName string
 
-	// txSeq needs no lock: WriteRaw is only reached through Conn.flush, which
-	// holds Conn.fmu, so the write path is already serialized by the caller.
+	// txSeq needs no lock: WriteRaw is only reached via Conn.flush, which holds fmu.
 	txSeq uint64 // next sequence to send
-	rxSeq uint64 // next contiguous sequence expected; guarded by rmu
+	rxSeq uint64 // next contiguous sequence expected
 }
 
 // encodeQueueMessage prepends the big-endian sequence to raw and base64-encodes
@@ -399,19 +386,14 @@ func (t *queueTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 
 			seq, payload, derr := decodeQueueMessage(*msg.MessageText)
 			if derr != nil {
-				// Leave an undecodable message in the queue: it reappears after
-				// the visibility timeout and can be retried. Deleting it here
-				// would drop a sequence we never ingested, opening a gap that
-				// can never close and that the stall clock would then fail on.
+				// Leave it queued: deleting a sequence we never ingested opens
+				// a gap that can never close. It reappears after the timeout.
 				continue
 			}
 			overflow = t.ingestLocked(seq, payload)
 
-			// Deleted only now that the message is accounted for in pending.
-			// Duplicates redelivered under at-least-once are discarded by
-			// ingestLocked, never re-read downstream. Deletes stay concurrent;
-			// the goroutines touch no rmu-guarded state, so spawning them under
-			// the lock is safe and the wait happens after it is released.
+			// Delete only now the message is accounted for; redeliveries are
+			// deduped by ingestLocked. Spawned under rmu, waited on after.
 			wg.Add(1)
 			go func(id, receipt string) {
 				defer wg.Done()
@@ -430,10 +412,8 @@ func (t *queueTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 	t.rmu.Lock()
 	defer t.rmu.Unlock()
 
-	// Overflow is terminal, not transient: pending is full of out-of-order
-	// messages waiting on a sequence that is not coming, exactly the conclusion
-	// the stall clock reaches. Record it so retries stop here instead of
-	// ingesting one more message per call forever.
+	// Terminal: pending is waiting on a sequence that is not coming, so retries
+	// would just ingest one more message per call forever.
 	if overflow {
 		t.rxErr = ErrReassemblyOverflow
 		return nil, t.rxErr
@@ -441,9 +421,8 @@ func (t *queueTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 
 	combined := t.drainLocked()
 
-	// Stall clock: rxSeq made no forward progress while out-of-order messages are
-	// buffered => we are blocked on a missing sequence. Fail loudly if it never
-	// lands, and make that failure stick for the same reason overflow does.
+	// Stall clock: no progress while messages are buffered means a missing
+	// sequence. Fail, and stick, for the same reason overflow does.
 	switch {
 	case len(combined) > 0 || len(t.pending) == 0:
 		t.stallSince = time.Time{} // progress, or nothing buffered

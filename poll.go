@@ -27,10 +27,9 @@ func NewAdaptivePoll(fast, steady time.Duration) *AdaptivePoll {
 	return &AdaptivePoll{Cur: fast, Fast: fast, Steady: steady, skip: false}
 }
 
-// Next returns the interval to wait before the next poll and then backs off
-// exponentially up to Steady. It returns 0 exactly once after Reset() (without
-// advancing the back-off) so activity resumes at full speed. The caller owns the
-// actual waiting.
+// Next returns the interval to wait before the next poll, backing off
+// exponentially up to Steady. It returns 0 once after Reset so activity resumes
+// at full speed. The caller does the waiting.
 func (p *AdaptivePoll) Next() time.Duration {
 	p.mu.Lock()
 	defer p.mu.Unlock()
