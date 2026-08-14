@@ -280,13 +280,12 @@ type Conn struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 
-	bufs      *Buffers
-	cfg       *Config
-	noise     *Noise
-	pending   pendingChunk // sealed chunk awaiting a write retry; guarded by fmu
-	poll      *AdaptivePoll
-	wake      chan struct{} // buffered(1) nudge from flush() to wake an idle reader
-	pollTimer *time.Timer   // reusable idle-wait timer (reader goroutine only)
+	bufs    *Buffers
+	cfg     *Config
+	noise   *Noise
+	pending pendingChunk // sealed chunk awaiting a write retry; guarded by fmu
+	poll    *AdaptivePoll
+	wake    chan struct{} // buffered(1) nudge from flush() to wake an idle reader
 
 	readDeadline  atomic.Pointer[time.Time]
 	writeDeadline atomic.Pointer[time.Time]
@@ -781,17 +780,14 @@ func (c *Conn) idleWait() bool {
 	if d <= 0 {
 		return true // post-activity fast path: retry immediately
 	}
-	if c.pollTimer == nil {
-		c.pollTimer = time.NewTimer(d)
-	} else {
-		c.pollTimer.Reset(d)
-	}
+	// Local rather than a Conn field: net.Conn allows concurrent Read.
+	pollTimer := time.NewTimer(d)
+	defer pollTimer.Stop()
 
 	var deadlineCh <-chan time.Time
 	if dl := c.readDeadline.Load(); dl != nil && !dl.IsZero() {
 		remaining := time.Until(*dl)
 		if remaining <= 0 {
-			c.pollTimer.Stop()
 			return false
 		}
 		dt := time.NewTimer(remaining)
@@ -801,16 +797,13 @@ func (c *Conn) idleWait() bool {
 
 	select {
 	case <-c.ctx.Done():
-		c.pollTimer.Stop()
 		return true // loop observes closed/ctx and returns appropriately
 	case <-c.wake:
-		c.pollTimer.Stop()
 		c.poll.Reset()
 		return true
-	case <-c.pollTimer.C:
+	case <-pollTimer.C:
 		return true
 	case <-deadlineCh:
-		c.pollTimer.Stop()
 		return false
 	}
 }

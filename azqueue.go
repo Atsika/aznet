@@ -385,10 +385,10 @@ func (t *queueTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 		return nil, failed
 	}
 
-	resp, err := t.rxQueue.DequeueMessages(ctx, &azqueue.DequeueMessagesOptions{NumberOfMessages: to.Ptr[int32](32)})
+	resp, derr := t.rxQueue.DequeueMessages(ctx, &azqueue.DequeueMessagesOptions{NumberOfMessages: to.Ptr[int32](32)})
 
 	overflow := false
-	if err == nil && len(resp.Messages) > 0 {
+	if derr == nil && len(resp.Messages) > 0 {
 		var wg sync.WaitGroup
 
 		t.rmu.Lock()
@@ -456,6 +456,11 @@ func (t *queueTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 	}
 
 	if len(combined) == 0 {
+		if derr != nil {
+			// Reporting this as ErrNoData would make a persistent failure
+			// (expired SAS, auth, network) look exactly like an idle queue.
+			return nil, derr
+		}
 		return nil, ErrNoData // out-of-order messages await their predecessors
 	}
 	return io.NopCloser(bytes.NewReader(combined)), nil
