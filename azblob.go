@@ -15,6 +15,7 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/streaming"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/appendblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
@@ -258,26 +259,44 @@ type blobTransport struct {
 	connID         string
 	txBlob, rxBlob string
 	blocksWritten  int64
-	readOffset     int64
+	txOffset       int64 // bytes appended to txBlob; the append-position guard
+	rxOffset       int64
 	txSeq, rxSeq   int
 	mu             sync.Mutex
 	isInitiator    bool
 }
 
-func (t *blobTransport) WriteRaw(ctx context.Context, data io.ReadSeeker) error {
+func (t *blobTransport) WriteRaw(ctx context.Context, seq uint64, data io.ReadSeeker) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	_, err := t.containerClient.NewAppendBlobClient(t.txBlob).AppendBlock(ctx, streaming.NopCloser(data), nil)
-	if err == nil {
-		t.blocksWritten++
+
+	n, _ := data.Seek(0, io.SeekEnd)
+	_, _ = data.Seek(0, io.SeekStart)
+
+	// Append only at txOffset. A block that already landed makes the blob longer,
+	// so the precondition fails (412) and the resend is the idempotent success.
+	// seq is unused; byte offset is the blob's native key.
+	opts := &appendblob.AppendBlockOptions{
+		AppendPositionAccessConditions: &appendblob.AppendPositionAccessConditions{AppendPosition: &t.txOffset},
 	}
-	return err
+	_, err := t.containerClient.NewAppendBlobClient(t.txBlob).AppendBlock(ctx, streaming.NopCloser(data), opts)
+	if err != nil {
+		if bloberror.HasCode(err, bloberror.AppendPositionConditionNotMet) {
+			t.txOffset += n
+			t.blocksWritten++
+			return nil
+		}
+		return err
+	}
+	t.txOffset += n
+	t.blocksWritten++
+	return nil
 }
 
 func (t *blobTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	resp, err := t.containerClient.NewBlobClient(t.rxBlob).DownloadStream(ctx, &blob.DownloadStreamOptions{Range: blob.HTTPRange{Offset: t.readOffset}})
+	resp, err := t.containerClient.NewBlobClient(t.rxBlob).DownloadStream(ctx, &blob.DownloadStreamOptions{Range: blob.HTTPRange{Offset: t.rxOffset}})
 	if err != nil {
 		if re, ok := err.(*azcore.ResponseError); ok && (re.StatusCode == http.StatusNotFound || re.StatusCode == http.StatusRequestedRangeNotSatisfiable) {
 			return nil, ErrNoData
@@ -292,7 +311,7 @@ func (t *blobTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 		resp.Body.Close()
 		return nil, ErrNoData
 	}
-	t.readOffset += contentLen
+	t.rxOffset += contentLen
 	return resp.Body, nil
 }
 
@@ -321,6 +340,7 @@ func (t *blobTransport) RotateTX(ctx context.Context) error {
 	}
 	t.txBlob = prefix + "-" + strconv.Itoa(t.txSeq)
 	t.blocksWritten = 0
+	t.txOffset = 0
 	_, err := t.containerClient.NewAppendBlobClient(t.txBlob).Create(ctx, nil)
 	return err
 }
@@ -334,7 +354,7 @@ func (t *blobTransport) RotateRX() error {
 		prefix = t.cfg.reqPrefix
 	}
 	t.rxBlob = prefix + "-" + strconv.Itoa(t.rxSeq)
-	t.readOffset = 0
+	t.rxOffset = 0
 	return nil
 }
 

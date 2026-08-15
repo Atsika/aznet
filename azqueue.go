@@ -282,8 +282,6 @@ type queueTransport struct {
 	connID         string
 	txName, rxName string
 
-	// txSeq needs no lock: WriteRaw is only reached via Conn.flush, which holds fmu.
-	txSeq uint64 // next sequence to send
 	rxSeq uint64 // next contiguous sequence expected
 }
 
@@ -350,16 +348,14 @@ func (t *queueTransport) stallLimit() time.Duration {
 	return defaultReassemblyStall
 }
 
-func (t *queueTransport) WriteRaw(ctx context.Context, data io.ReadSeeker) error {
+func (t *queueTransport) WriteRaw(ctx context.Context, seq uint64, data io.ReadSeeker) error {
 	raw, err := io.ReadAll(data)
 	if err != nil {
 		return err
 	}
-	if _, err := t.txQueue.EnqueueMessage(ctx, encodeQueueMessage(t.txSeq, raw), nil); err != nil {
-		return err
-	}
-	t.txSeq++ // only advance on success so sequences stay gap-free
-	return nil
+	// seq rides in the header; the receiver dedups on it, so a resend is discarded.
+	_, err = t.txQueue.EnqueueMessage(ctx, encodeQueueMessage(seq, raw), nil)
+	return err
 }
 
 func (t *queueTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
