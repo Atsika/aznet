@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -257,17 +258,18 @@ type tableTransport struct {
 	connID         string
 	txName, rxName string
 	mu             sync.Mutex
-	txSeq, rxSeq   int
+	rxSeq          int
 }
 
-func (t *tableTransport) WriteRaw(ctx context.Context, data io.ReadSeeker) error {
-	t.mu.Lock()
-	seq := t.txSeq
-	t.txSeq++
-	t.mu.Unlock()
+func (t *tableTransport) WriteRaw(ctx context.Context, seq uint64, data io.ReadSeeker) error {
 	raw, _ := io.ReadAll(data)
-	edata, _ := buildTableEntity("data", formatRowKey(seq), raw)
+	edata, _ := buildTableEntity("data", formatRowKey(int(seq)), raw)
 	_, err := t.txClient.AddEntity(ctx, edata, nil)
+	// seq is the row key; a resend collides (409) and is the idempotent success.
+	var respErr *azcore.ResponseError
+	if errors.As(err, &respErr) && respErr.ErrorCode == "EntityAlreadyExists" {
+		return nil
+	}
 	return err
 }
 

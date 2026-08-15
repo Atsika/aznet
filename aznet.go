@@ -44,8 +44,9 @@ type SessionTokens struct {
 
 // Transport is the raw byte-exchange interface implemented by drivers.
 type Transport interface {
-	// WriteRaw sends raw bytes to the peer.
-	WriteRaw(ctx context.Context, data io.ReadSeeker) error
+	// WriteRaw sends raw bytes to the peer. seq is the chunk number, reused on a
+	// retry so the driver can keep the write idempotent.
+	WriteRaw(ctx context.Context, seq uint64, data io.ReadSeeker) error
 	// ReadRaw attempts to read raw bytes from the peer.
 	ReadRaw(ctx context.Context) (io.ReadCloser, error)
 	// Close terminates the transport.
@@ -283,12 +284,13 @@ type Conn struct {
 	ctx       context.Context
 	cancel    context.CancelFunc
 
-	bufs    *Buffers
-	cfg     *Config
-	noise   *Noise
-	pending pendingChunk // sealed chunk awaiting a write retry; guarded by fmu
-	poll    *AdaptivePoll
-	wake    chan struct{} // buffered(1) nudge from flush() to wake an idle reader
+	bufs     *Buffers
+	cfg      *Config
+	noise    *Noise
+	pending  pendingChunk // sealed chunk awaiting a write retry; guarded by fmu
+	chunkSeq uint64       // next chunk seq to assign; guarded by fmu
+	poll     *AdaptivePoll
+	wake     chan struct{} // buffered(1) nudge from flush() to wake an idle reader
 
 	readDeadline  atomic.Pointer[time.Time]
 	writeDeadline atomic.Pointer[time.Time]
@@ -323,6 +325,7 @@ type Conn struct {
 // of the same plaintext would desync the peer permanently. Guarded by fmu.
 type pendingChunk struct {
 	data    []byte // sealed ciphertext, owned copy
+	seq     uint64 // chunk sequence, reused so the retry is idempotent
 	consume int    // bytes of bufs.Write this chunk covers (0 for control chunks)
 	rotate  bool   // call RotateTX once the write lands
 	valid   bool   // data holds a chunk still owed to the peer
@@ -664,10 +667,10 @@ func (c *Conn) flush() error {
 		return net.ErrClosed
 	}
 
-	// A chunk left over from a failed write goes out before anything new is
-	// sealed, so the peer sees chunks in nonce order.
+	// Resend a failed chunk before sealing anything new, so chunks stay in nonce
+	// order. Its original seq keeps the resend idempotent at the driver.
 	if c.pending.valid {
-		if err := c.sendChunk(c.pending.data, c.pending.consume, c.pending.rotate); err != nil {
+		if err := c.sendChunk(c.pending.data, c.pending.consume, c.pending.rotate, c.pending.seq); err != nil {
 			return err
 		}
 	}
@@ -696,7 +699,7 @@ func (c *Conn) flush() error {
 			}
 			c.bufs.Enc = sealed[:0]
 
-			if err := c.sendChunk(sealed, 0, true); err != nil {
+			if err := c.sendChunk(sealed, 0, true, c.chunkSeq); err != nil {
 				return err
 			}
 			continue // Re-check buffer after rotation
@@ -719,7 +722,7 @@ func (c *Conn) flush() error {
 		c.bufs.Enc = sealed[:0]
 		c.wmu.Unlock()
 
-		if err := c.sendChunk(sealed, takeLen, false); err != nil {
+		if err := c.sendChunk(sealed, takeLen, false, c.chunkSeq); err != nil {
 			return err
 		}
 
@@ -731,11 +734,12 @@ func (c *Conn) flush() error {
 // sendChunk writes one sealed chunk, consuming the plaintext it covered and
 // applying any rotation only once the write lands; a failure leaves both queued
 // for retry. Caller must hold fmu and must not hold wmu.
-func (c *Conn) sendChunk(sealed []byte, consume int, rotate bool) error {
-	if err := c.transport.WriteRaw(c.ctx, bytes.NewReader(sealed)); err != nil {
+func (c *Conn) sendChunk(sealed []byte, consume int, rotate bool, seq uint64) error {
+	if err := c.transport.WriteRaw(c.ctx, seq, bytes.NewReader(sealed)); err != nil {
 		if !c.pending.valid {
 			// Copy, because sealed aliases bufs.Enc and the next seal reuses it.
 			c.pending.data = append(c.pending.data[:0], sealed...)
+			c.pending.seq = seq
 			c.pending.consume = consume
 			c.pending.rotate = rotate
 			c.pending.valid = true
@@ -744,6 +748,7 @@ func (c *Conn) sendChunk(sealed []byte, consume int, rotate bool) error {
 	}
 
 	c.pending.valid = false
+	c.chunkSeq = seq + 1
 
 	if consume > 0 {
 		c.wmu.Lock()
@@ -970,7 +975,7 @@ func newMetricsTransport(t Transport, m Metrics) *metricsTransport {
 	return mt
 }
 
-func (t *metricsTransport) WriteRaw(ctx context.Context, data io.ReadSeeker) error {
+func (t *metricsTransport) WriteRaw(ctx context.Context, seq uint64, data io.ReadSeeker) error {
 	var size int64
 	if data != nil {
 		pos, _ := data.Seek(0, io.SeekCurrent)
@@ -978,7 +983,7 @@ func (t *metricsTransport) WriteRaw(ctx context.Context, data io.ReadSeeker) err
 		_, _ = data.Seek(pos, io.SeekStart)
 		size = end - pos
 	}
-	err := t.Transport.WriteRaw(ctx, data)
+	err := t.Transport.WriteRaw(ctx, seq, data)
 	if err == nil {
 		t.m.IncrementWriteTransaction()
 		t.m.IncrementBytesSent(size)
