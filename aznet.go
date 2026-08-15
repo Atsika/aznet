@@ -135,6 +135,11 @@ var (
 	ErrNoData = errors.New("no data available")
 	// ErrFrameTooLarge is returned when a queued frame exceeds one chunk.
 	ErrFrameTooLarge = errors.New("frame exceeds chunk size")
+	// ErrResourceBeingDeleted is returned when a bootstrap resource cannot be
+	// created because Azure is still deleting one of the same name, which it does
+	// for roughly 30-40s after a listener stops. Retrying later succeeds; the
+	// library reports the condition and leaves that decision to the caller.
+	ErrResourceBeingDeleted = errors.New("storage resource is being deleted, retry once Azure has released the name")
 )
 
 // RegisterFactory registers a factory for the given scheme (e.g., "azblob").
@@ -192,6 +197,10 @@ func initialize(network, address string, opts []Option) (Driver, *Endpoint, *Con
 
 // Listen is analogous to net.Listen. It takes a network type (e.g. "azblob")
 // and an address (e.g. "account.blob.core.windows.net").
+//
+// Listen fails with ErrResourceBeingDeleted when Azure is still deleting
+// resources left by a previous listener of the same name. That is a transient
+// condition, but waiting it out is the caller's decision, not the library's.
 func Listen(network, address string, opts ...Option) (net.Listener, error) {
 	driver, ep, cfg, err := initialize(network, address, opts)
 	if err != nil {
