@@ -55,6 +55,7 @@ type Transport interface {
 	// RemoteAddr returns the remote network address.
 	RemoteAddr() net.Addr
 	// MaxRawSize returns the maximum raw capacity of the transport in bytes.
+	// It must be constant for the lifetime of the transport.
 	MaxRawSize() int
 }
 
@@ -131,6 +132,8 @@ var (
 	ErrInvalidConfig = errors.New("invalid configuration")
 	// ErrNoData is returned when no data is available to read.
 	ErrNoData = errors.New("no data available")
+	// ErrFrameTooLarge is returned when a queued frame exceeds one chunk.
+	ErrFrameTooLarge = errors.New("frame exceeds chunk size")
 )
 
 // RegisterFactory registers a factory for the given scheme (e.g., "azblob").
@@ -669,7 +672,8 @@ func (c *Conn) flush() error {
 		}
 	}
 
-	maxChunk := c.transport.MaxRawSize() - NoiseOverhead
+	// Derived from mtu so the largest frame always fits in one chunk.
+	maxChunk := int(c.mtu) + FrameHeaderSize
 
 	for {
 		c.wmu.Lock()
@@ -678,7 +682,7 @@ func (c *Conn) flush() error {
 			return nil
 		}
 
-		// Check rotation while holding lock
+		// Always at a frame boundary, since chunking below is frame-aligned.
 		if c.rotator != nil && c.rotator.ShouldRotate() {
 			c.wmu.Unlock()
 
@@ -698,7 +702,13 @@ func (c *Conn) flush() error {
 			continue // Re-check buffer after rotation
 		}
 
-		takeLen := min(c.bufs.Write.Len(), maxChunk)
+		takeLen := alignedChunkLen(c.bufs.Write.Bytes(), maxChunk)
+		if takeLen == 0 {
+			// Framing is already broken; an unaligned chunk would hide it.
+			c.wmu.Unlock()
+			return fmt.Errorf("%w: frame exceeds chunk size %d", ErrFrameTooLarge, maxChunk)
+		}
+
 		// Seal while still holding wmu: the slice aliases the write buffer's
 		// backing array, which a concurrent Write can slide in place.
 		sealed, err := c.noise.SealData(c.bufs.Enc, c.bufs.Write.Bytes()[:takeLen])
