@@ -29,6 +29,9 @@ var (
 	ErrNoiseInitFailed = errors.New("noise handshake initialization failed")
 	// ErrNoiseMsgFailed is returned when a Noise handshake message cannot be created.
 	ErrNoiseMsgFailed = errors.New("handshake message creation failed")
+	// ErrChunkTooLarge is returned when a sealed chunk declares a length larger
+	// than the transport can produce, which means the stream is corrupt.
+	ErrChunkTooLarge = errors.New("sealed chunk exceeds transport maximum")
 )
 
 // Noise encapsulates the Noise Protocol handshake state and cipher suite.
@@ -152,22 +155,29 @@ func (nh *Noise) SealData(dst, plaintext []byte) ([]byte, error) {
 	return dst[:4+len(ciphertext)], nil
 }
 
-// UnsealData attempts to extract and decrypt a Noise chunk from data.
-// It returns the decrypted plaintext into dst, the remaining data, and an error.
-func (nh *Noise) UnsealData(dst, data []byte) (plaintext, remaining []byte, err error) {
+// UnsealData extracts and decrypts one Noise chunk from data, returning the
+// plaintext in dst and the unconsumed remainder. maxChunk bounds the sealed
+// chunk size (0 disables): a larger declared length is corrupt, and reporting it
+// as io.ErrShortBuffer would leave the caller buffering for bytes never coming.
+func (nh *Noise) UnsealData(dst, data []byte, maxChunk int) (plaintext, remaining []byte, err error) {
 	if len(data) < 4 {
 		return nil, data, io.ErrShortBuffer
 	}
 
-	length := int(binary.BigEndian.Uint32(data[:4]))
-	if len(data) < 4+length {
+	// uint64: on 32-bit (js/wasm) a garbage length would overflow int.
+	length := uint64(binary.BigEndian.Uint32(data[:4]))
+	total := 4 + length
+	if maxChunk > 0 && total > uint64(maxChunk) {
+		return nil, nil, fmt.Errorf("%w: %d > %d", ErrChunkTooLarge, total, maxChunk)
+	}
+	if uint64(len(data)) < total {
 		return nil, data, io.ErrShortBuffer
 	}
 
-	decrypted, err := nh.DecryptData(dst[:0], data[4:4+length])
+	decrypted, err := nh.DecryptData(dst[:0], data[4:total])
 	if err != nil {
 		return nil, nil, err
 	}
 
-	return decrypted, data[4+length:], nil
+	return decrypted, data[total:], nil
 }
