@@ -47,6 +47,11 @@ func (d *blobFactory) NewDriver(ep *Endpoint, cfg *Config) (Driver, error) {
 	if client != nil {
 		for _, name := range []string{cfg.handshakeEndpoint, cfg.tokenEndpoint} {
 			if _, err := client.CreateContainer(cfg.ctx, name, nil); err != nil && !bloberror.HasCode(err, bloberror.ContainerAlreadyExists) {
+				// Azure holds a deleted container's name for ~40s; surface that as
+				// the shared sentinel so Listen can wait it out.
+				if bloberror.HasCode(err, bloberror.ContainerBeingDeleted) {
+					return nil, fmt.Errorf("%w: container %q: %v", ErrResourceBeingDeleted, name, err)
+				}
 				return nil, err
 			}
 		}

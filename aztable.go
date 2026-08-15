@@ -69,7 +69,22 @@ func (d *tableFactory) NewDriver(ep *Endpoint, cfg *Config) (Driver, error) {
 	}
 	if client != nil {
 		for _, name := range []string{cfg.handshakeEndpoint, cfg.tokenEndpoint} {
-			_, _ = client.CreateTable(cfg.ctx, name, nil)
+			if _, err := client.CreateTable(cfg.ctx, name, nil); err != nil {
+				var respErr *azcore.ResponseError
+				if errors.As(err, &respErr) {
+					switch aztables.TableErrorCode(respErr.ErrorCode) {
+					case aztables.TableAlreadyExists:
+						continue
+					case aztables.TableBeingDeleted:
+						// Azure holds a deleted table's name for ~40s; surface that as
+						// the shared sentinel so Listen can wait it out.
+						return nil, fmt.Errorf("%w: table %q: %v", ErrResourceBeingDeleted, name, err)
+					}
+				}
+				// Previously ignored, which reported a healthy listener whose agents
+				// then died on the first missing table.
+				return nil, err
+			}
 		}
 	}
 	var hSAS, tSAS string
