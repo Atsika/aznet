@@ -45,9 +45,10 @@ type SessionTokens struct {
 // Transport is the raw byte-exchange interface implemented by drivers.
 type Transport interface {
 	// WriteRaw sends raw bytes to the peer. seq is the chunk number, reused on a
-	// retry so the driver can keep the write idempotent.
+	// retry so the driver can keep the write idempotent. It must honor ctx.
 	WriteRaw(ctx context.Context, seq uint64, data io.ReadSeeker) error
-	// ReadRaw attempts to read raw bytes from the peer.
+	// ReadRaw attempts to read raw bytes from the peer. The request and returned
+	// stream must honor ctx; closing the stream must unblock a pending Read.
 	ReadRaw(ctx context.Context) (io.ReadCloser, error)
 	// Close terminates the transport.
 	Close() error
@@ -287,24 +288,24 @@ func Dial(network, address string, opts ...Option) (net.Conn, error) {
 
 // Conn implements net.Conn.
 type Conn struct {
-	transport Transport
-	rotator   Rotator // nil if transport doesn't support rotation
-	driver    Driver
-	ctx       context.Context
-	cancel    context.CancelFunc
-
-	bufs     *Buffers
-	cfg      *Config
-	noise    *Noise
-	pending  pendingChunk // sealed chunk awaiting a write retry; guarded by fmu
-	chunkSeq uint64       // next chunk seq to assign; guarded by fmu
-	poll     *AdaptivePoll
-	wake     chan struct{} // buffered(1) nudge from flush() to wake an idle reader
-
-	readDeadline  atomic.Pointer[time.Time]
-	writeDeadline atomic.Pointer[time.Time]
-
-	id string
+	transport     Transport
+	rotator       Rotator // nil if transport doesn't support rotation
+	driver        Driver
+	ctx           context.Context
+	closeErr      error
+	id            string
+	cancel        context.CancelFunc
+	bufs          *Buffers
+	cfg           *Config
+	noise         *Noise
+	poll          *AdaptivePoll
+	wake          chan struct{} // buffered(1) nudge from flush() to wake an idle reader
+	readGate      chan struct{}
+	flushGate     chan struct{} // owns encryption and pending chunks; acquire before wmu
+	readDeadline  ioDeadline
+	writeDeadline ioDeadline
+	pending       pendingChunk // sealed chunk awaiting write or rotation retry; guarded by flushGate
+	chunkSeq      uint64       // next chunk sequence; guarded by flushGate
 
 	lastActive   atomic.Int64
 	peerLastSeen atomic.Int64
@@ -315,12 +316,9 @@ type Conn struct {
 	// wmu guards the write buffer (bufs.Write). Acquired briefly inside flush()
 	// to drain the buffer, then released before the transport.WriteRaw call.
 	wmu sync.Mutex
-	// rmu guards the read buffer (bufs.Read), readRemain, and the Noise decryption
-	// buffer. Never held while calling transport methods.
+	// rmu protects read buffers from recycling. readGate serializes the entire
+	// receive operation, including transport calls and polling.
 	rmu sync.Mutex
-	// fmu serializes flush() calls so only one goroutine encrypts and sends at a
-	// time. Lock order: fmu → wmu (never reverse).
-	fmu sync.Mutex
 
 	closed      atomic.Uint32
 	closedRead  atomic.Uint32
@@ -331,13 +329,14 @@ type Conn struct {
 
 // pendingChunk holds a sealed chunk whose write failed, for verbatim resend.
 // Re-sealing is not an option: Noise nonces advance per seal, so a second seal
-// of the same plaintext would desync the peer permanently. Guarded by fmu.
+// of the same plaintext would desync the peer permanently. Guarded by flushGate.
 type pendingChunk struct {
 	data    []byte // sealed ciphertext, owned copy
 	seq     uint64 // chunk sequence, reused so the retry is idempotent
 	consume int    // bytes of bufs.Write this chunk covers (0 for control chunks)
 	rotate  bool   // call RotateTX once the write lands
 	valid   bool   // data holds a chunk still owed to the peer
+	sent    bool   // ciphertext landed, but rotation may still need committing
 }
 
 // Buffers encapsulates the internal bytes.Buffer instances used by a connection.
@@ -371,6 +370,8 @@ func newConn(ctx context.Context, cancel context.CancelFunc, t Transport, cfg *C
 		cfg:       cfg,
 		noise:     noise,
 		wake:      make(chan struct{}, 1),
+		readGate:  make(chan struct{}, 1),
+		flushGate: make(chan struct{}, 1),
 		bufs:      buffersPool.Get().(*Buffers),
 		mtu:       t.MaxRawSize() - NoiseOverhead - FrameHeaderSize,
 	}
@@ -387,7 +388,21 @@ func newConn(ctx context.Context, cancel context.CancelFunc, t Transport, cfg *C
 	return c
 }
 
-func (c *Conn) Read(p []byte) (int, error) {
+func (c *Conn) Read(p []byte) (n int, err error) {
+	ctx, finish := c.readDeadline.operation(c.ctx)
+	defer finish()
+	defer func() {
+		if err != nil {
+			err = c.ioError(ctx, err)
+		}
+	}()
+	if err := lockIO(ctx, c.readGate); err != nil {
+		return 0, err
+	}
+	defer func() { <-c.readGate }()
+	if len(p) == 0 {
+		return 0, nil
+	}
 	for {
 		if c.closed.Load() == 1 {
 			return 0, net.ErrClosed
@@ -406,10 +421,9 @@ func (c *Conn) Read(p []byte) (int, error) {
 			return 0, net.ErrClosed
 		}
 
-		deadline := c.readDeadline.Load()
-		if deadline != nil && !deadline.IsZero() && time.Now().After(*deadline) {
+		if err := context.Cause(ctx); err != nil {
 			c.rmu.Unlock()
-			return 0, os.ErrDeadlineExceeded
+			return 0, err
 		}
 
 		// Drain leftover payload from a previous partial read.
@@ -463,11 +477,11 @@ func (c *Conn) Read(p []byte) (int, error) {
 		c.rmu.Unlock()
 
 		// Fetch more data
-		rawStream, err := c.transport.ReadRaw(c.ctx)
+		rawStream, err := c.transport.ReadRaw(ctx)
 		if err != nil {
 			if errors.Is(err, ErrNoData) {
-				if !c.idleWait() {
-					return 0, os.ErrDeadlineExceeded
+				if err := c.idleWait(ctx); err != nil {
+					return 0, err
 				}
 				continue
 			}
@@ -478,8 +492,8 @@ func (c *Conn) Read(p []byte) (int, error) {
 		}
 
 		// Read directly from the stream into the Noise buffer, then decrypt.
-		// Both touch bufs, so they run under rmu; the blocking ReadRaw above
-		// deliberately does not.
+		// readGate covers fetching, body consumption, decryption and frame parsing.
+		// rmu additionally protects buffer recycling during teardown.
 		c.rmu.Lock()
 		if c.bufs == nil {
 			c.rmu.Unlock()
@@ -487,8 +501,19 @@ func (c *Conn) Read(p []byte) (int, error) {
 			return 0, net.ErrClosed
 		}
 
+		// Closing the response body interrupts a blocked stream read as well
+		// as canceling the context passed to ReadRaw.
+		bodyClosed := make(chan struct{})
+		stopClose := context.AfterFunc(ctx, func() { rawStream.Close(); close(bodyClosed) })
 		_, err = c.bufs.Noise.ReadFrom(rawStream)
-		rawStream.Close()
+		if stopClose() {
+			rawStream.Close()
+		} else {
+			<-bodyClosed
+		}
+		if cause := context.Cause(ctx); cause != nil {
+			err = cause
+		}
 		if err != nil && err != io.EOF {
 			c.rmu.Unlock()
 			return 0, err
@@ -526,18 +551,22 @@ func (c *Conn) Read(p []byte) (int, error) {
 	}
 }
 
+// Write reports bytes accepted into the connection, including when flushing
+// fails. The connection owns those bytes and retains their ciphertext for retry;
+// callers must only resubmit p[n:].
 func (c *Conn) Write(p []byte) (int, error) {
 	if c.closed.Load() == 1 || c.closedWrite.Load() == 1 {
 		return 0, io.ErrClosedPipe
 	}
-	deadline := c.writeDeadline.Load()
-	if deadline != nil && !deadline.IsZero() && time.Now().After(*deadline) {
-		return 0, os.ErrDeadlineExceeded
+	ctx, finish := c.writeDeadline.operation(c.ctx)
+	defer finish()
+	if err := context.Cause(ctx); err != nil {
+		return 0, c.ioError(ctx, err)
 	}
 
 	total := len(p)
 	c.wmu.Lock()
-	if c.bufs == nil {
+	if c.bufs == nil || c.closed.Load() == 1 || c.closedWrite.Load() == 1 {
 		c.wmu.Unlock()
 		return 0, io.ErrClosedPipe
 	}
@@ -548,50 +577,81 @@ func (c *Conn) Write(p []byte) (int, error) {
 	}
 	c.wmu.Unlock()
 
-	if err := c.flush(); err != nil {
-		return 0, err
+	if err := c.flushContext(ctx); err != nil {
+		return total, c.ioError(ctx, err)
 	}
 	return total, nil
 }
 
+// closeGracePeriod bounds the entire best-effort graceful close, including a
+// backend that fails to honor cancellation. Such a backend retains ownership of
+// its buffers until it returns; teardown must never recycle them prematurely.
+const closeGracePeriod = 250 * time.Millisecond
+
+// Close attempts accepted data followed by FIN within 250 ms, then cancels I/O.
+// A timeout means delivery and transport teardown are not confirmed.
 func (c *Conn) Close() error {
-	var err error
 	c.closeOnce.Do(func() {
 		c.closed.Store(1)
-		_ = c.flush()
-
-		if c.closedWrite.Load() == 0 {
+		timer := time.NewTimer(closeGracePeriod)
+		defer timer.Stop()
+		done := make(chan error, 1)
+		go func() {
 			c.wmu.Lock()
-			BuildFrame(&c.bufs.Write, Frame{Type: MsgTypeFin})
+			if c.closedWrite.Swap(1) == 0 && c.bufs != nil {
+				BuildFrame(&c.bufs.Write, Frame{Type: MsgTypeFin})
+			}
 			c.wmu.Unlock()
+			ctx, finish := c.writeDeadline.operation(c.ctx)
+			err := c.flushContext(ctx)
+			if cause := context.Cause(ctx); cause != nil {
+				err = cause
+			}
+			finish()
+			c.cancel()
+			err = errors.Join(err, c.transport.Close())
+			c.recycleBuffers()
+			done <- err
+		}()
+		select {
+		case c.closeErr = <-done:
+		case <-timer.C:
+			c.closeErr = os.ErrDeadlineExceeded
 		}
-
-		_ = c.flush()
-		err = c.transport.Close()
-		// Cancel first: it unblocks any in-flight transport call so the reader
-		// releases rmu instead of making the teardown below wait on the network.
 		c.cancel()
-
-		// Recycling into the shared pool hands this memory to another
-		// connection, so every in-flight user has to be out first. Full lock
-		// order: fmu → wmu → rmu.
-		c.fmu.Lock()
-		c.wmu.Lock()
-		c.rmu.Lock()
-		if c.bufs != nil {
-			c.bufs.Read.Reset()
-			c.bufs.Write.Reset()
-			c.bufs.Noise.Reset()
-			c.bufs.Enc = c.bufs.Enc[:0]
-			c.bufs.Dec = c.bufs.Dec[:0]
-			buffersPool.Put(c.bufs)
-			c.bufs = nil
-		}
-		c.pending = pendingChunk{}
-		c.rmu.Unlock()
-		c.wmu.Unlock()
-		c.fmu.Unlock()
+		c.readDeadline.set(time.Time{})
+		c.writeDeadline.set(time.Time{})
 	})
+	return c.closeErr
+}
+
+func (c *Conn) recycleBuffers() {
+	// Uninterruptible only in the teardown worker: active owners must finish.
+	c.flushGate <- struct{}{}
+	defer func() { <-c.flushGate }()
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	c.rmu.Lock()
+	defer c.rmu.Unlock()
+	if c.bufs != nil {
+		c.bufs.Read.Reset()
+		c.bufs.Write.Reset()
+		c.bufs.Noise.Reset()
+		c.bufs.Enc = c.bufs.Enc[:0]
+		c.bufs.Dec = c.bufs.Dec[:0]
+		buffersPool.Put(c.bufs)
+		c.bufs = nil
+	}
+	c.pending = pendingChunk{}
+}
+
+func (c *Conn) ioError(ctx context.Context, err error) error {
+	if c.closed.Load() == 1 {
+		return net.ErrClosed
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
 	return err
 }
 
@@ -616,18 +676,27 @@ func (c *Conn) LocalAddr() net.Addr  { return c.transport.LocalAddr() }
 func (c *Conn) RemoteAddr() net.Addr { return c.transport.RemoteAddr() }
 
 func (c *Conn) SetDeadline(t time.Time) error {
-	c.readDeadline.Store(&t)
-	c.writeDeadline.Store(&t)
+	if c.closed.Load() == 1 {
+		return net.ErrClosed
+	}
+	c.readDeadline.set(t)
+	c.writeDeadline.set(t)
 	return nil
 }
 
 func (c *Conn) SetReadDeadline(t time.Time) error {
-	c.readDeadline.Store(&t)
+	if c.closed.Load() == 1 {
+		return net.ErrClosed
+	}
+	c.readDeadline.set(t)
 	return nil
 }
 
 func (c *Conn) SetWriteDeadline(t time.Time) error {
-	c.writeDeadline.Store(&t)
+	if c.closed.Load() == 1 {
+		return net.ErrClosed
+	}
+	c.writeDeadline.set(t)
 	return nil
 }
 
@@ -655,7 +724,7 @@ func (c *Conn) keepAlive() {
 			last := c.lastActive.Load()
 			if time.Since(time.Unix(0, last)) >= c.cfg.pingInterval {
 				c.wmu.Lock()
-				if c.bufs == nil {
+				if c.bufs == nil || c.closed.Load() == 1 || c.closedWrite.Load() == 1 {
 					c.wmu.Unlock()
 					return
 				}
@@ -669,8 +738,20 @@ func (c *Conn) keepAlive() {
 }
 
 func (c *Conn) flush() error {
-	c.fmu.Lock()
-	defer c.fmu.Unlock()
+	ctx, finish := c.writeDeadline.operation(c.ctx)
+	defer finish()
+	err := c.flushContext(ctx)
+	if err != nil {
+		return c.ioError(ctx, err)
+	}
+	return nil
+}
+
+func (c *Conn) flushContext(ctx context.Context) error {
+	if err := lockIO(ctx, c.flushGate); err != nil {
+		return err
+	}
+	defer func() { <-c.flushGate }()
 
 	if c.bufs == nil {
 		return net.ErrClosed
@@ -679,7 +760,7 @@ func (c *Conn) flush() error {
 	// Resend a failed chunk before sealing anything new, so chunks stay in nonce
 	// order. Its original seq keeps the resend idempotent at the driver.
 	if c.pending.valid {
-		if err := c.sendChunk(c.pending.data, c.pending.consume, c.pending.rotate, c.pending.seq); err != nil {
+		if err := c.sendChunk(ctx, c.pending.data, c.pending.consume, c.pending.rotate, c.pending.seq); err != nil {
 			return err
 		}
 	}
@@ -688,6 +769,9 @@ func (c *Conn) flush() error {
 	maxChunk := int(c.mtu) + FrameHeaderSize
 
 	for {
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
 		c.wmu.Lock()
 		if c.bufs.Write.Len() == 0 {
 			c.wmu.Unlock()
@@ -708,7 +792,7 @@ func (c *Conn) flush() error {
 			}
 			c.bufs.Enc = sealed[:0]
 
-			if err := c.sendChunk(sealed, 0, true, c.chunkSeq); err != nil {
+			if err := c.sendChunk(ctx, sealed, 0, true, c.chunkSeq); err != nil {
 				return err
 			}
 			continue // Re-check buffer after rotation
@@ -731,7 +815,7 @@ func (c *Conn) flush() error {
 		c.bufs.Enc = sealed[:0]
 		c.wmu.Unlock()
 
-		if err := c.sendChunk(sealed, takeLen, false, c.chunkSeq); err != nil {
+		if err := c.sendChunk(ctx, sealed, takeLen, false, c.chunkSeq); err != nil {
 			return err
 		}
 
@@ -742,18 +826,28 @@ func (c *Conn) flush() error {
 
 // sendChunk writes one sealed chunk, consuming the plaintext it covered and
 // applying any rotation only once the write lands; a failure leaves both queued
-// for retry. Caller must hold fmu and must not hold wmu.
-func (c *Conn) sendChunk(sealed []byte, consume int, rotate bool, seq uint64) error {
-	if err := c.transport.WriteRaw(c.ctx, seq, bytes.NewReader(sealed)); err != nil {
-		if !c.pending.valid {
-			// Copy, because sealed aliases bufs.Enc and the next seal reuses it.
-			c.pending.data = append(c.pending.data[:0], sealed...)
-			c.pending.seq = seq
-			c.pending.consume = consume
-			c.pending.rotate = rotate
-			c.pending.valid = true
+// for retry. Caller must hold flushGate and must not hold wmu.
+func (c *Conn) sendChunk(ctx context.Context, sealed []byte, consume int, rotate bool, seq uint64) (err error) {
+	sent := c.pending.valid && c.pending.sent
+	defer func() {
+		if err != nil {
+			if !c.pending.valid {
+				// Copy only on failure; the next encryption reuses bufs.Enc.
+				c.pending = pendingChunk{data: append(c.pending.data[:0], sealed...), seq: seq, consume: consume, rotate: rotate, valid: true}
+			}
+			c.pending.sent = sent
 		}
-		return err
+	}()
+	if !sent {
+		if err = c.transport.WriteRaw(ctx, seq, bytes.NewReader(sealed)); err != nil {
+			return err
+		}
+		sent = true
+	}
+	if rotate {
+		if err = c.rotator.RotateTX(ctx); err != nil {
+			return err
+		}
 	}
 
 	c.pending.valid = false
@@ -763,9 +857,6 @@ func (c *Conn) sendChunk(sealed []byte, consume int, rotate bool, seq uint64) er
 		c.wmu.Lock()
 		c.bufs.Write.Next(consume)
 		c.wmu.Unlock()
-	}
-	if rotate {
-		return c.rotator.RotateTX(c.ctx)
 	}
 	return nil
 }
@@ -789,39 +880,18 @@ func (c *Conn) nudgeReader() {
 	}
 }
 
-// idleWait blocks after an empty read until the next poll interval elapses, a
-// local send nudges the reader awake, the connection is torn down, or the read
-// deadline expires. It returns false only when the read deadline has passed.
-func (c *Conn) idleWait() bool {
-	d := c.poll.Next()
-	if d <= 0 {
-		return true // post-activity fast path: retry immediately
-	}
-	// Local rather than a Conn field: net.Conn allows concurrent Read.
-	pollTimer := time.NewTimer(d)
-	defer pollTimer.Stop()
-
-	var deadlineCh <-chan time.Time
-	if dl := c.readDeadline.Load(); dl != nil && !dl.IsZero() {
-		remaining := time.Until(*dl)
-		if remaining <= 0 {
-			return false
-		}
-		dt := time.NewTimer(remaining)
-		defer dt.Stop()
-		deadlineCh = dt.C
-	}
-
+// idleWait shares the operation context so deadline updates interrupt polling.
+func (c *Conn) idleWait(ctx context.Context) error {
+	timer := time.NewTimer(c.poll.Next())
+	defer timer.Stop()
 	select {
-	case <-c.ctx.Done():
-		return true // loop observes closed/ctx and returns appropriately
+	case <-ctx.Done():
+		return context.Cause(ctx)
 	case <-c.wake:
 		c.poll.Reset()
-		return true
-	case <-pollTimer.C:
-		return true
-	case <-deadlineCh:
-		return false
+		return nil
+	case <-timer.C:
+		return nil
 	}
 }
 

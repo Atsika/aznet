@@ -338,16 +338,19 @@ func (t *blobTransport) ShouldRotate() bool {
 func (t *blobTransport) RotateTX(ctx context.Context) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.txSeq++
 	prefix := t.cfg.reqPrefix
 	if !t.isInitiator {
 		prefix = t.cfg.resPrefix
 	}
-	t.txBlob = prefix + "-" + strconv.Itoa(t.txSeq)
+	next := prefix + "-" + strconv.Itoa(t.txSeq+1)
+	if _, err := t.containerClient.NewAppendBlobClient(next).Create(ctx, nil); err != nil {
+		return err
+	}
+	t.txSeq++
+	t.txBlob = next
 	t.blocksWritten = 0
 	t.txOffset = 0
-	_, err := t.containerClient.NewAppendBlobClient(t.txBlob).Create(ctx, nil)
-	return err
+	return nil
 }
 
 func (t *blobTransport) RotateRX() error {
