@@ -77,8 +77,8 @@ func (d *tableFactory) NewDriver(ep *Endpoint, cfg *Config) (Driver, error) {
 						continue
 					case aztables.TableBeingDeleted:
 						// Azure holds a deleted table's name for ~40s; surface that as
-						// the shared sentinel so Listen can wait it out.
-						return nil, fmt.Errorf("%w: table %q: %v", ErrResourceBeingDeleted, name, err)
+						// the shared sentinel so callers can decide whether to wait.
+						return nil, fmt.Errorf("%w: table %q: %w", ErrResourceBeingDeleted, name, err)
 					}
 				}
 				// Previously ignored, which reported a healthy listener whose agents
