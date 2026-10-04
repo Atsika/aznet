@@ -250,9 +250,9 @@ func (p *tableDriver) CleanupBootstrap(ctx context.Context) error {
 	if p.client == nil {
 		return nil
 	}
-	_, _ = p.client.DeleteTable(ctx, p.cfg.handshakeEndpoint, nil)
-	_, _ = p.client.DeleteTable(ctx, p.cfg.tokenEndpoint, nil)
-	return nil
+	_, a := p.client.DeleteTable(ctx, p.cfg.handshakeEndpoint, nil)
+	_, b := p.client.DeleteTable(ctx, p.cfg.tokenEndpoint, nil)
+	return errors.Join(missingDelete(a), missingDelete(b))
 }
 
 func (p *tableDriver) CleanupSession(ctx context.Context, connID string) error {
@@ -260,9 +260,9 @@ func (p *tableDriver) CleanupSession(ctx context.Context, connID string) error {
 		return nil
 	}
 	sid := strings.ReplaceAll(connID, "-", "")
-	_, _ = p.client.DeleteTable(ctx, p.cfg.reqPrefix+sid, nil)
-	_, _ = p.client.DeleteTable(ctx, p.cfg.resPrefix+sid, nil)
-	return nil
+	_, a := p.client.DeleteTable(ctx, p.cfg.reqPrefix+sid, nil)
+	_, b := p.client.DeleteTable(ctx, p.cfg.resPrefix+sid, nil)
+	return errors.Join(missingDelete(a), missingDelete(b))
 }
 
 type tableTransport struct {

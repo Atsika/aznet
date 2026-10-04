@@ -49,7 +49,7 @@ Drivers switch to this interval immediately after receiving a chunk.
 func WithConnectTimeout(d time.Duration) Option
 ```
 
-The maximum time `Dial` will wait for the server to acknowledge the handshake.
+The maximum duration of client setup. On a Queue listener, it also sets token-message lifetime, rounded up to whole seconds. Expiring abandoned tokens bounds obstruction of later tokens by the first 32 visible messages; it does not guarantee that arbitrary bursts finish within each dialer's deadline. It does not shorten established session credentials. Zero or negative values leave the default unchanged.
 
 - **Default**: `30s`
 

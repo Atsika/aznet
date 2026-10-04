@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -243,17 +244,17 @@ func (p *blobDriver) CleanupBootstrap(ctx context.Context) error {
 	if p.client == nil {
 		return nil
 	}
-	_, _ = p.client.NewContainerClient(p.cfg.handshakeEndpoint).Delete(ctx, nil)
-	_, _ = p.client.NewContainerClient(p.cfg.tokenEndpoint).Delete(ctx, nil)
-	return nil
+	_, a := p.client.NewContainerClient(p.cfg.handshakeEndpoint).Delete(ctx, nil)
+	_, b := p.client.NewContainerClient(p.cfg.tokenEndpoint).Delete(ctx, nil)
+	return errors.Join(missingDelete(a), missingDelete(b))
 }
 
 func (p *blobDriver) CleanupSession(ctx context.Context, connID string) error {
 	if p.client == nil {
 		return nil
 	}
-	_, _ = p.client.NewContainerClient(connID).Delete(ctx, nil)
-	return nil
+	_, err := p.client.NewContainerClient(connID).Delete(ctx, nil)
+	return missingDelete(err)
 }
 
 type blobTransport struct {
@@ -338,16 +339,19 @@ func (t *blobTransport) ShouldRotate() bool {
 func (t *blobTransport) RotateTX(ctx context.Context) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.txSeq++
 	prefix := t.cfg.reqPrefix
 	if !t.isInitiator {
 		prefix = t.cfg.resPrefix
 	}
-	t.txBlob = prefix + "-" + strconv.Itoa(t.txSeq)
+	next := prefix + "-" + strconv.Itoa(t.txSeq+1)
+	if _, err := t.containerClient.NewAppendBlobClient(next).Create(ctx, nil); err != nil {
+		return err
+	}
+	t.txSeq++
+	t.txBlob = next
 	t.blocksWritten = 0
 	t.txOffset = 0
-	_, err := t.containerClient.NewAppendBlobClient(t.txBlob).Create(ctx, nil)
-	return err
+	return nil
 }
 
 func (t *blobTransport) RotateRX() error {

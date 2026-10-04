@@ -149,7 +149,14 @@ func (p *queueDriver) DeleteHandshake(ctx context.Context, id string) error {
 
 func (p *queueDriver) PostToken(ctx context.Context, connID string, msg []byte) error {
 	txt := connID + ":" + base64.StdEncoding.EncodeToString(msg)
-	resp, err := p.tokenQueue.EnqueueMessage(ctx, txt, nil)
+	// A token is useful only during setup. Expiry also bounds head-of-line
+	// blocking and orphaned messages after an uncertain enqueue response.
+	seconds := p.cfg.connectTimeout / time.Second
+	if p.cfg.connectTimeout%time.Second != 0 {
+		seconds++
+	}
+	ttl := int32(min(max(seconds, 1), 1<<31-1))
+	resp, err := p.tokenQueue.EnqueueMessage(ctx, txt, &azqueue.EnqueueMessageOptions{TimeToLive: &ttl})
 	if err == nil && len(resp.Messages) > 0 {
 		p.receipts.Store(connID, *resp.Messages[0].MessageID+":"+*resp.Messages[0].PopReceipt)
 	}
@@ -170,9 +177,13 @@ func (p *queueDriver) GetToken(ctx context.Context, connID string) ([]byte, erro
 }
 
 func (p *queueDriver) DeleteToken(ctx context.Context, connID string) error {
-	if val, ok := p.receipts.LoadAndDelete(connID); ok {
+	if val, ok := p.receipts.Load(connID); ok {
 		parts := strings.Split(val.(string), ":")
 		_, err := p.tokenQueue.DeleteMessage(ctx, parts[0], parts[1], nil)
+		err = missingDelete(err)
+		if err == nil {
+			p.receipts.CompareAndDelete(connID, val)
+		}
 		return err
 	}
 	return nil
@@ -249,18 +260,18 @@ func (p *queueDriver) CleanupBootstrap(ctx context.Context) error {
 	if p.client == nil {
 		return nil
 	}
-	_, _ = p.client.NewQueueClient(p.cfg.handshakeEndpoint).Delete(ctx, nil)
-	_, _ = p.client.NewQueueClient(p.cfg.tokenEndpoint).Delete(ctx, nil)
-	return nil
+	_, a := p.client.NewQueueClient(p.cfg.handshakeEndpoint).Delete(ctx, nil)
+	_, b := p.client.NewQueueClient(p.cfg.tokenEndpoint).Delete(ctx, nil)
+	return errors.Join(missingDelete(a), missingDelete(b))
 }
 
 func (p *queueDriver) CleanupSession(ctx context.Context, connID string) error {
 	if p.client == nil {
 		return nil
 	}
-	_, _ = p.client.NewQueueClient(p.cfg.reqPrefix+"-"+connID).Delete(ctx, nil)
-	_, _ = p.client.NewQueueClient(p.cfg.resPrefix+"-"+connID).Delete(ctx, nil)
-	return nil
+	_, a := p.client.NewQueueClient(p.cfg.reqPrefix+"-"+connID).Delete(ctx, nil)
+	_, b := p.client.NewQueueClient(p.cfg.resPrefix+"-"+connID).Delete(ctx, nil)
+	return errors.Join(missingDelete(a), missingDelete(b))
 }
 
 type queueTransport struct {

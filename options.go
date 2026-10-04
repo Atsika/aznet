@@ -183,8 +183,8 @@ func WithPing(d time.Duration) Option {
 	}
 }
 
-// WithConnectTimeout sets the maximum duration the client waits for the listener to acknowledge
-// a Dialled connection. Zero or negative disables the timeout.
+// WithConnectTimeout bounds client setup and the lifetime of Queue tokens issued
+// by a listener. Zero or negative values leave the default unchanged.
 func WithConnectTimeout(d time.Duration) Option {
 	return func(c *Config) {
 		if d > 0 {

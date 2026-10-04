@@ -45,9 +45,10 @@ type SessionTokens struct {
 // Transport is the raw byte-exchange interface implemented by drivers.
 type Transport interface {
 	// WriteRaw sends raw bytes to the peer. seq is the chunk number, reused on a
-	// retry so the driver can keep the write idempotent.
+	// retry so the driver can keep the write idempotent. It must honor ctx.
 	WriteRaw(ctx context.Context, seq uint64, data io.ReadSeeker) error
-	// ReadRaw attempts to read raw bytes from the peer.
+	// ReadRaw attempts to read raw bytes from the peer. The request and returned
+	// stream must honor ctx; closing the stream must unblock a pending Read.
 	ReadRaw(ctx context.Context) (io.ReadCloser, error)
 	// Close terminates the transport.
 	Close() error
@@ -91,7 +92,8 @@ type Driver interface {
 	GetToken(ctx context.Context, connID string) ([]byte, error)
 	DeleteToken(ctx context.Context, connID string) error
 
-	// Session lifecycle
+	// Session lifecycle. The listener owns connID before this call and invokes
+	// CleanupSession even when acquisition fails partway through.
 	CreateSession(ctx context.Context, connID string) (SessionTokens, error)
 	CreateBootstrapTokens() (hSAS, tSAS string, err error)
 
@@ -100,7 +102,8 @@ type Driver interface {
 
 	// CleanupBootstrap removes shared bootstrap resources (handshake/token endpoints).
 	CleanupBootstrap(ctx context.Context) error
-	// CleanupSession removes per-connection resources (req/res channels).
+	// CleanupSession removes all per-connection resources, including partial
+	// acquisitions. It must be idempotent and return deletion failures.
 	CleanupSession(ctx context.Context, connID string) error
 }
 
@@ -178,17 +181,20 @@ func initialize(network, address string, opts []Option) (Driver, *Endpoint, *Con
 
 	cfg := applyConfig(opts)
 	if err := cfg.Validate(); err != nil {
+		cfg.cancel()
 		return nil, nil, nil, err
 	}
 
 	u, err := url.Parse(address)
 	if err != nil {
+		cfg.cancel()
 		return nil, nil, nil, err
 	}
 	ep := NewEndpoint(u)
 
 	driver, err := factory.NewDriver(ep, cfg)
 	if err != nil {
+		cfg.cancel()
 		return nil, nil, nil, err
 	}
 
@@ -221,11 +227,19 @@ func Listen(network, address string, opts ...Option) (net.Listener, error) {
 
 // Dial is analogous to net.Dial. It takes a network type (e.g. "azblob")
 // and an address (e.g. "https://account.blob.core.windows.net/?handshake=...").
-func Dial(network, address string, opts ...Option) (net.Conn, error) {
+func Dial(network, address string, opts ...Option) (conn net.Conn, err error) {
 	driver, _, cfg, err := initialize(network, address, opts)
 	if err != nil {
 		return nil, err
 	}
+
+	defer func() {
+		if err != nil {
+			cfg.cancel()
+		}
+	}()
+	dialCtx, dialCancel := context.WithTimeout(cfg.ctx, cfg.connectTimeout)
+	defer dialCancel()
 
 	connID := uuid.New().String()
 	noise, err := NewNoiseClient()
@@ -237,12 +251,9 @@ func Dial(network, address string, opts ...Option) (net.Conn, error) {
 		return nil, fmt.Errorf("%w: %v", ErrNoiseMsgFailed, err)
 	}
 
-	if err := driver.PostHandshake(cfg.ctx, connID, msg1); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrHandshakeExchangeFailed, err)
+	if err := driver.PostHandshake(dialCtx, connID, msg1); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrHandshakeExchangeFailed, err)
 	}
-
-	dialCtx, dialCancel := context.WithTimeout(cfg.ctx, cfg.connectTimeout)
-	defer dialCancel()
 
 	var encryptedTokens []byte
 	for {
@@ -276,51 +287,54 @@ func Dial(network, address string, opts ...Option) (net.Conn, error) {
 		return nil, ErrHandshakeIncomplete
 	}
 
-	transport, err := driver.NewTransport(cfg.ctx, connID, tokens, true)
+	transport, err := driver.NewTransport(dialCtx, connID, tokens, true)
+	if err == nil {
+		err = dialCtx.Err()
+	}
 	if err != nil {
+		if transport != nil {
+			err = errors.Join(err, disposeTransport(transport))
+		}
 		return nil, err
 	}
 
-	ctx, cancel := context.WithCancel(cfg.ctx)
-	return newConn(ctx, cancel, transport, cfg, noise, driver, connID), nil
+	return newConn(cfg.ctx, cfg.cancel, transport, cfg, noise, driver, connID), nil
 }
 
 // Conn implements net.Conn.
 type Conn struct {
-	transport Transport
-	rotator   Rotator // nil if transport doesn't support rotation
-	driver    Driver
-	ctx       context.Context
-	cancel    context.CancelFunc
-
-	bufs     *Buffers
-	cfg      *Config
-	noise    *Noise
-	pending  pendingChunk // sealed chunk awaiting a write retry; guarded by fmu
-	chunkSeq uint64       // next chunk seq to assign; guarded by fmu
-	poll     *AdaptivePoll
-	wake     chan struct{} // buffered(1) nudge from flush() to wake an idle reader
-
-	readDeadline  atomic.Pointer[time.Time]
-	writeDeadline atomic.Pointer[time.Time]
-
-	id string
+	transport     Transport
+	rotator       Rotator // nil if transport doesn't support rotation
+	driver        Driver
+	ctx           context.Context
+	closeErr      error
+	id            string
+	cancel        context.CancelFunc
+	bufs          *Buffers
+	cfg           *Config
+	noise         *Noise
+	poll          *AdaptivePoll
+	wake          chan struct{} // buffered(1) nudge from flush() to wake an idle reader
+	readGate      chan struct{}
+	flushGate     chan struct{} // owns encryption and pending chunks; acquire before wmu
+	readDeadline  ioDeadline
+	writeDeadline ioDeadline
+	pending       pendingChunk // sealed chunk awaiting write or rotation retry; guarded by flushGate
+	chunkSeq      uint64       // next chunk sequence; guarded by flushGate
 
 	lastActive   atomic.Int64
 	peerLastSeen atomic.Int64
 	lastNudge    atomic.Int64 // UnixNano of last reader nudge; rate-limits wakes
 
+	session      *sessionOwner
 	cleanupToken sync.Once
 	closeOnce    sync.Once
 	// wmu guards the write buffer (bufs.Write). Acquired briefly inside flush()
 	// to drain the buffer, then released before the transport.WriteRaw call.
 	wmu sync.Mutex
-	// rmu guards the read buffer (bufs.Read), readRemain, and the Noise decryption
-	// buffer. Never held while calling transport methods.
+	// rmu protects read buffers from recycling. readGate serializes the entire
+	// receive operation, including transport calls and polling.
 	rmu sync.Mutex
-	// fmu serializes flush() calls so only one goroutine encrypts and sends at a
-	// time. Lock order: fmu → wmu (never reverse).
-	fmu sync.Mutex
 
 	closed      atomic.Uint32
 	closedRead  atomic.Uint32
@@ -331,13 +345,14 @@ type Conn struct {
 
 // pendingChunk holds a sealed chunk whose write failed, for verbatim resend.
 // Re-sealing is not an option: Noise nonces advance per seal, so a second seal
-// of the same plaintext would desync the peer permanently. Guarded by fmu.
+// of the same plaintext would desync the peer permanently. Guarded by flushGate.
 type pendingChunk struct {
 	data    []byte // sealed ciphertext, owned copy
 	seq     uint64 // chunk sequence, reused so the retry is idempotent
 	consume int    // bytes of bufs.Write this chunk covers (0 for control chunks)
 	rotate  bool   // call RotateTX once the write lands
 	valid   bool   // data holds a chunk still owed to the peer
+	sent    bool   // ciphertext landed, but rotation may still need committing
 }
 
 // Buffers encapsulates the internal bytes.Buffer instances used by a connection.
@@ -371,6 +386,8 @@ func newConn(ctx context.Context, cancel context.CancelFunc, t Transport, cfg *C
 		cfg:       cfg,
 		noise:     noise,
 		wake:      make(chan struct{}, 1),
+		readGate:  make(chan struct{}, 1),
+		flushGate: make(chan struct{}, 1),
 		bufs:      buffersPool.Get().(*Buffers),
 		mtu:       t.MaxRawSize() - NoiseOverhead - FrameHeaderSize,
 	}
@@ -387,7 +404,21 @@ func newConn(ctx context.Context, cancel context.CancelFunc, t Transport, cfg *C
 	return c
 }
 
-func (c *Conn) Read(p []byte) (int, error) {
+func (c *Conn) Read(p []byte) (n int, err error) {
+	ctx, finish := c.readDeadline.operation(c.ctx)
+	defer finish()
+	defer func() {
+		if err != nil {
+			err = c.ioError(ctx, err)
+		}
+	}()
+	if err := lockIO(ctx, c.readGate); err != nil {
+		return 0, err
+	}
+	defer func() { <-c.readGate }()
+	if len(p) == 0 {
+		return 0, nil
+	}
 	for {
 		if c.closed.Load() == 1 {
 			return 0, net.ErrClosed
@@ -406,10 +437,9 @@ func (c *Conn) Read(p []byte) (int, error) {
 			return 0, net.ErrClosed
 		}
 
-		deadline := c.readDeadline.Load()
-		if deadline != nil && !deadline.IsZero() && time.Now().After(*deadline) {
+		if err := context.Cause(ctx); err != nil {
 			c.rmu.Unlock()
-			return 0, os.ErrDeadlineExceeded
+			return 0, err
 		}
 
 		// Drain leftover payload from a previous partial read.
@@ -460,41 +490,10 @@ func (c *Conn) Read(p []byte) (int, error) {
 			}
 		}
 
-		c.rmu.Unlock()
-
-		// Fetch more data
-		rawStream, err := c.transport.ReadRaw(c.ctx)
-		if err != nil {
-			if errors.Is(err, ErrNoData) {
-				if !c.idleWait() {
-					return 0, os.ErrDeadlineExceeded
-				}
-				continue
-			}
-			if errors.Is(err, context.Canceled) && c.closed.Load() == 1 {
-				return 0, net.ErrClosed
-			}
-			return 0, err
-		}
-
-		// Read directly from the stream into the Noise buffer, then decrypt.
-		// Both touch bufs, so they run under rmu; the blocking ReadRaw above
-		// deliberately does not.
-		c.rmu.Lock()
-		if c.bufs == nil {
-			c.rmu.Unlock()
-			rawStream.Close()
-			return 0, net.ErrClosed
-		}
-
-		_, err = c.bufs.Noise.ReadFrom(rawStream)
-		rawStream.Close()
-		if err != nil && err != io.EOF {
-			c.rmu.Unlock()
-			return 0, err
-		}
-
+		// A previous operation may have received ciphertext before its deadline
+		// interrupted decryption. Process that owned data before polling again.
 		maxChunk := c.transport.MaxRawSize()
+		decoded := false
 		for {
 			decrypted, rest, err := c.noise.UnsealData(c.bufs.Dec, c.bufs.Noise.Bytes(), maxChunk)
 			if err != nil {
@@ -508,36 +507,91 @@ func (c *Conn) Read(p []byte) (int, error) {
 			c.bufs.Dec = decrypted[:0]
 
 			c.cleanupToken.Do(func() {
-				if !c.noise.IsInitiator() && c.driver != nil {
-					go func() {
-						ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-						defer cancel()
-						_ = c.driver.DeleteToken(ctx, c.id)
-					}()
+				if c.session != nil {
+					go c.session.deleteToken()
 				}
 			})
 
 			c.bufs.Read.Write(decrypted)
+			decoded = true
 			used := c.bufs.Noise.Len() - len(rest)
 			c.bufs.Noise.Next(used)
 		}
+		if decoded {
+			// Parsing above ran before this decryption pass. Revisit newly
+			// decrypted frames without waiting for another storage response.
+			c.rmu.Unlock()
+			continue
+		}
+		c.rmu.Unlock()
+
+		// Fetch more data
+		rawStream, err := c.transport.ReadRaw(ctx)
+		if err != nil {
+			if errors.Is(err, ErrNoData) {
+				if err := c.idleWait(ctx); err != nil {
+					return 0, err
+				}
+				continue
+			}
+			if errors.Is(err, context.Canceled) && c.closed.Load() == 1 {
+				return 0, net.ErrClosed
+			}
+			return 0, err
+		}
+
+		// Read directly from the stream into the Noise buffer, then decrypt.
+		// readGate covers fetching, body consumption, decryption and frame parsing.
+		// rmu additionally protects buffer recycling during teardown.
+		c.rmu.Lock()
+		if c.bufs == nil {
+			c.rmu.Unlock()
+			rawStream.Close()
+			return 0, net.ErrClosed
+		}
+
+		// Closing the response body interrupts a blocked stream read as well
+		// as canceling the context passed to ReadRaw.
+		bodyClosed := make(chan struct{})
+		stopClose := context.AfterFunc(ctx, func() {
+			rawStream.Close()
+			close(bodyClosed)
+		})
+		_, err = c.bufs.Noise.ReadFrom(rawStream)
+		if stopClose() {
+			rawStream.Close()
+		} else {
+			<-bodyClosed
+		}
+		if cause := context.Cause(ctx); cause != nil {
+			err = cause
+		}
+		if err != nil && err != io.EOF {
+			c.rmu.Unlock()
+			return 0, err
+		}
+
 		c.rmu.Unlock()
 		c.poll.Reset()
 	}
 }
 
+// Write reports bytes accepted into the connection, including when flushing
+// fails. The connection owns those bytes and retains their ciphertext for retry;
+// callers must only resubmit p[n:].
 func (c *Conn) Write(p []byte) (int, error) {
 	if c.closed.Load() == 1 || c.closedWrite.Load() == 1 {
 		return 0, io.ErrClosedPipe
 	}
-	deadline := c.writeDeadline.Load()
-	if deadline != nil && !deadline.IsZero() && time.Now().After(*deadline) {
-		return 0, os.ErrDeadlineExceeded
+	ctx, finish := c.writeDeadline.operation(c.ctx)
+	defer finish()
+	if err := context.Cause(ctx); err != nil {
+		return 0, c.ioError(ctx, err)
 	}
 
 	total := len(p)
 	c.wmu.Lock()
-	if c.bufs == nil {
+	if c.bufs == nil || c.closed.Load() == 1 || c.closedWrite.Load() == 1 {
 		c.wmu.Unlock()
 		return 0, io.ErrClosedPipe
 	}
@@ -548,50 +602,94 @@ func (c *Conn) Write(p []byte) (int, error) {
 	}
 	c.wmu.Unlock()
 
-	if err := c.flush(); err != nil {
-		return 0, err
+	if err := c.flushContext(ctx); err != nil {
+		return total, c.ioError(ctx, err)
 	}
 	return total, nil
 }
 
+// closeGracePeriod bounds the entire best-effort graceful close, including a
+// backend that fails to honor cancellation. Such a backend retains ownership of
+// its buffers until it returns; teardown must never recycle them prematurely.
+const closeGracePeriod = 250 * time.Millisecond
+
+// Close attempts accepted data followed by FIN within 250 ms, then cancels I/O.
+// Session cleanup then has two independently bounded two-second operations.
+// A timeout means delivery, transport teardown or resource cleanup is unconfirmed.
+// On an accepted connection, Close deletes session storage: uploading bytes does
+// not acknowledge peer consumption. Use CloseWrite and wait for application-level
+// completion before Close when the peer must receive the final response.
 func (c *Conn) Close() error {
-	var err error
 	c.closeOnce.Do(func() {
 		c.closed.Store(1)
-		_ = c.flush()
-
-		if c.closedWrite.Load() == 0 {
+		timer := time.NewTimer(closeGracePeriod)
+		defer timer.Stop()
+		done := make(chan error, 1)
+		go func() {
 			c.wmu.Lock()
-			BuildFrame(&c.bufs.Write, Frame{Type: MsgTypeFin})
+			hadBuffered := c.bufs != nil && c.bufs.Write.Len() > 0
+			if c.closedWrite.Swap(1) == 0 && c.bufs != nil {
+				BuildFrame(&c.bufs.Write, Frame{Type: MsgTypeFin})
+			}
 			c.wmu.Unlock()
+			ctx, finish := c.writeDeadline.operation(c.ctx)
+			err := c.flushContext(ctx)
+			if cause := context.Cause(ctx); cause != nil {
+				err = cause
+			}
+			// Listener shutdown deliberately cancels idle connections. Report
+			// interrupted delivery only when accepted bytes were still buffered.
+			if !hadBuffered && errors.Is(err, context.Canceled) {
+				err = nil
+			}
+			finish()
+			c.cancel()
+			err = errors.Join(err, c.transport.Close())
+			c.recycleBuffers()
+			done <- err
+		}()
+		select {
+		case c.closeErr = <-done:
+		case <-timer.C:
+			c.closeErr = os.ErrDeadlineExceeded
 		}
-
-		_ = c.flush()
-		err = c.transport.Close()
-		// Cancel first: it unblocks any in-flight transport call so the reader
-		// releases rmu instead of making the teardown below wait on the network.
 		c.cancel()
-
-		// Recycling into the shared pool hands this memory to another
-		// connection, so every in-flight user has to be out first. Full lock
-		// order: fmu → wmu → rmu.
-		c.fmu.Lock()
-		c.wmu.Lock()
-		c.rmu.Lock()
-		if c.bufs != nil {
-			c.bufs.Read.Reset()
-			c.bufs.Write.Reset()
-			c.bufs.Noise.Reset()
-			c.bufs.Enc = c.bufs.Enc[:0]
-			c.bufs.Dec = c.bufs.Dec[:0]
-			buffersPool.Put(c.bufs)
-			c.bufs = nil
+		c.readDeadline.set(time.Time{})
+		c.writeDeadline.set(time.Time{})
+		if c.session != nil {
+			c.closeErr = errors.Join(c.closeErr, c.session.close())
 		}
-		c.pending = pendingChunk{}
-		c.rmu.Unlock()
-		c.wmu.Unlock()
-		c.fmu.Unlock()
 	})
+	return c.closeErr
+}
+
+func (c *Conn) recycleBuffers() {
+	// Uninterruptible only in the teardown worker: active owners must finish.
+	c.flushGate <- struct{}{}
+	defer func() { <-c.flushGate }()
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	c.rmu.Lock()
+	defer c.rmu.Unlock()
+	if c.bufs != nil {
+		c.bufs.Read.Reset()
+		c.bufs.Write.Reset()
+		c.bufs.Noise.Reset()
+		c.bufs.Enc = c.bufs.Enc[:0]
+		c.bufs.Dec = c.bufs.Dec[:0]
+		buffersPool.Put(c.bufs)
+		c.bufs = nil
+	}
+	c.pending = pendingChunk{}
+}
+
+func (c *Conn) ioError(ctx context.Context, err error) error {
+	if c.closed.Load() == 1 {
+		return net.ErrClosed
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
 	return err
 }
 
@@ -616,18 +714,27 @@ func (c *Conn) LocalAddr() net.Addr  { return c.transport.LocalAddr() }
 func (c *Conn) RemoteAddr() net.Addr { return c.transport.RemoteAddr() }
 
 func (c *Conn) SetDeadline(t time.Time) error {
-	c.readDeadline.Store(&t)
-	c.writeDeadline.Store(&t)
+	if c.closed.Load() == 1 {
+		return net.ErrClosed
+	}
+	c.readDeadline.set(t)
+	c.writeDeadline.set(t)
 	return nil
 }
 
 func (c *Conn) SetReadDeadline(t time.Time) error {
-	c.readDeadline.Store(&t)
+	if c.closed.Load() == 1 {
+		return net.ErrClosed
+	}
+	c.readDeadline.set(t)
 	return nil
 }
 
 func (c *Conn) SetWriteDeadline(t time.Time) error {
-	c.writeDeadline.Store(&t)
+	if c.closed.Load() == 1 {
+		return net.ErrClosed
+	}
+	c.writeDeadline.set(t)
 	return nil
 }
 
@@ -655,7 +762,7 @@ func (c *Conn) keepAlive() {
 			last := c.lastActive.Load()
 			if time.Since(time.Unix(0, last)) >= c.cfg.pingInterval {
 				c.wmu.Lock()
-				if c.bufs == nil {
+				if c.bufs == nil || c.closed.Load() == 1 || c.closedWrite.Load() == 1 {
 					c.wmu.Unlock()
 					return
 				}
@@ -669,8 +776,20 @@ func (c *Conn) keepAlive() {
 }
 
 func (c *Conn) flush() error {
-	c.fmu.Lock()
-	defer c.fmu.Unlock()
+	ctx, finish := c.writeDeadline.operation(c.ctx)
+	defer finish()
+	err := c.flushContext(ctx)
+	if err != nil {
+		return c.ioError(ctx, err)
+	}
+	return nil
+}
+
+func (c *Conn) flushContext(ctx context.Context) error {
+	if err := lockIO(ctx, c.flushGate); err != nil {
+		return err
+	}
+	defer func() { <-c.flushGate }()
 
 	if c.bufs == nil {
 		return net.ErrClosed
@@ -679,7 +798,7 @@ func (c *Conn) flush() error {
 	// Resend a failed chunk before sealing anything new, so chunks stay in nonce
 	// order. Its original seq keeps the resend idempotent at the driver.
 	if c.pending.valid {
-		if err := c.sendChunk(c.pending.data, c.pending.consume, c.pending.rotate, c.pending.seq); err != nil {
+		if err := c.sendChunk(ctx, c.pending.data, c.pending.consume, c.pending.rotate, c.pending.seq); err != nil {
 			return err
 		}
 	}
@@ -688,6 +807,9 @@ func (c *Conn) flush() error {
 	maxChunk := int(c.mtu) + FrameHeaderSize
 
 	for {
+		if err := context.Cause(ctx); err != nil {
+			return err
+		}
 		c.wmu.Lock()
 		if c.bufs.Write.Len() == 0 {
 			c.wmu.Unlock()
@@ -708,7 +830,7 @@ func (c *Conn) flush() error {
 			}
 			c.bufs.Enc = sealed[:0]
 
-			if err := c.sendChunk(sealed, 0, true, c.chunkSeq); err != nil {
+			if err := c.sendChunk(ctx, sealed, 0, true, c.chunkSeq); err != nil {
 				return err
 			}
 			continue // Re-check buffer after rotation
@@ -731,7 +853,7 @@ func (c *Conn) flush() error {
 		c.bufs.Enc = sealed[:0]
 		c.wmu.Unlock()
 
-		if err := c.sendChunk(sealed, takeLen, false, c.chunkSeq); err != nil {
+		if err := c.sendChunk(ctx, sealed, takeLen, false, c.chunkSeq); err != nil {
 			return err
 		}
 
@@ -742,18 +864,28 @@ func (c *Conn) flush() error {
 
 // sendChunk writes one sealed chunk, consuming the plaintext it covered and
 // applying any rotation only once the write lands; a failure leaves both queued
-// for retry. Caller must hold fmu and must not hold wmu.
-func (c *Conn) sendChunk(sealed []byte, consume int, rotate bool, seq uint64) error {
-	if err := c.transport.WriteRaw(c.ctx, seq, bytes.NewReader(sealed)); err != nil {
-		if !c.pending.valid {
-			// Copy, because sealed aliases bufs.Enc and the next seal reuses it.
-			c.pending.data = append(c.pending.data[:0], sealed...)
-			c.pending.seq = seq
-			c.pending.consume = consume
-			c.pending.rotate = rotate
-			c.pending.valid = true
+// for retry. Caller must hold flushGate and must not hold wmu.
+func (c *Conn) sendChunk(ctx context.Context, sealed []byte, consume int, rotate bool, seq uint64) (err error) {
+	sent := c.pending.valid && c.pending.sent
+	defer func() {
+		if err != nil {
+			if !c.pending.valid {
+				// Copy only on failure; the next encryption reuses bufs.Enc.
+				c.pending = pendingChunk{data: append(c.pending.data[:0], sealed...), seq: seq, consume: consume, rotate: rotate, valid: true}
+			}
+			c.pending.sent = sent
 		}
-		return err
+	}()
+	if !sent {
+		if err = c.transport.WriteRaw(ctx, seq, bytes.NewReader(sealed)); err != nil {
+			return err
+		}
+		sent = true
+	}
+	if rotate {
+		if err = c.rotator.RotateTX(ctx); err != nil {
+			return err
+		}
 	}
 
 	c.pending.valid = false
@@ -763,9 +895,6 @@ func (c *Conn) sendChunk(sealed []byte, consume int, rotate bool, seq uint64) er
 		c.wmu.Lock()
 		c.bufs.Write.Next(consume)
 		c.wmu.Unlock()
-	}
-	if rotate {
-		return c.rotator.RotateTX(c.ctx)
 	}
 	return nil
 }
@@ -789,184 +918,18 @@ func (c *Conn) nudgeReader() {
 	}
 }
 
-// idleWait blocks after an empty read until the next poll interval elapses, a
-// local send nudges the reader awake, the connection is torn down, or the read
-// deadline expires. It returns false only when the read deadline has passed.
-func (c *Conn) idleWait() bool {
-	d := c.poll.Next()
-	if d <= 0 {
-		return true // post-activity fast path: retry immediately
-	}
-	// Local rather than a Conn field: net.Conn allows concurrent Read.
-	pollTimer := time.NewTimer(d)
-	defer pollTimer.Stop()
-
-	var deadlineCh <-chan time.Time
-	if dl := c.readDeadline.Load(); dl != nil && !dl.IsZero() {
-		remaining := time.Until(*dl)
-		if remaining <= 0 {
-			return false
-		}
-		dt := time.NewTimer(remaining)
-		defer dt.Stop()
-		deadlineCh = dt.C
-	}
-
+// idleWait shares the operation context so deadline updates interrupt polling.
+func (c *Conn) idleWait(ctx context.Context) error {
+	timer := time.NewTimer(c.poll.Next())
+	defer timer.Stop()
 	select {
-	case <-c.ctx.Done():
-		return true // loop observes closed/ctx and returns appropriately
+	case <-ctx.Done():
+		return context.Cause(ctx)
 	case <-c.wake:
 		c.poll.Reset()
-		return true
-	case <-pollTimer.C:
-		return true
-	case <-deadlineCh:
-		return false
-	}
-}
-
-// Listener implements net.Listener.
-type Listener struct {
-	network string
-	ep      *Endpoint
-	driver  Driver
-	cfg     *Config
-	conns   sync.Map // map[string]*Conn
-}
-
-func (l *Listener) Accept() (net.Conn, error) {
-	for {
-		select {
-		case <-l.cfg.ctx.Done():
-			return nil, net.ErrClosed
-		default:
-		}
-
-		handshakes, err := l.driver.GetHandshakes(l.cfg.ctx)
-		if err != nil {
-			time.Sleep(l.cfg.acceptPoll)
-			continue
-		}
-
-		for _, hs := range handshakes {
-			noise, err := NewNoiseServer()
-			if err != nil {
-				continue
-			}
-			payload, err := noise.ReadMessage(hs.Payload)
-			if err != nil {
-				continue
-			}
-
-			// The payload contains the actual connID from the client.
-			connID := string(payload)
-			if connID == "" {
-				continue
-			}
-
-			// Check if we already have this connection
-			if _, ok := l.conns.Load(connID); ok {
-				continue
-			}
-
-			// Generate tokens (driver specific tokens via Provider)
-			tokens, err := l.driver.CreateSession(l.cfg.ctx, connID)
-			if err != nil {
-				continue
-			}
-			encodedTokens, err := json.Marshal(tokens)
-			if err != nil {
-				continue
-			}
-
-			msg2, err := noise.WriteMessage(encodedTokens)
-			if err != nil {
-				continue
-			}
-
-			if err := l.driver.PostToken(l.cfg.ctx, connID, msg2); err != nil {
-				continue
-			}
-
-			if !noise.IsComplete() {
-				continue
-			}
-
-			// Inform Provider we are done and want a transport
-			transport, err := l.driver.NewTransport(l.cfg.ctx, connID, tokens, false)
-			if err != nil {
-				continue
-			}
-
-			_ = l.driver.DeleteHandshake(l.cfg.ctx, hs.ID)
-			ctx, cancel := context.WithCancel(l.cfg.ctx)
-			conn := newConn(ctx, cancel, transport, l.cfg, noise, l.driver, connID)
-			l.conns.Store(connID, conn)
-			return conn, nil
-		}
-		time.Sleep(l.cfg.acceptPoll)
-	}
-}
-
-// ConnectionString returns the connection string for this listener.
-func (l *Listener) ConnectionString() (string, error) {
-	hSAS, tSAS, err := l.driver.CreateBootstrapTokens()
-	if err != nil {
-		return "", err
-	}
-
-	return l.ep.BuildConnURL(l.cfg, hSAS, tSAS), nil
-}
-
-func (l *Listener) Close() error {
-	l.cfg.cancel()
-
-	// Gracefully close all connections
-	l.conns.Range(func(key, value any) bool {
-		conn := value.(*Conn)
-		_ = conn.Close()
-		return true
-	})
-
-	// Cleanup shared bootstrap endpoints
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	return l.driver.CleanupBootstrap(ctx)
-}
-
-func (l *Listener) Addr() net.Addr {
-	return ServiceAddr{l.network, l.ep.ServiceURL(), l.cfg.handshakeEndpoint}
-}
-
-func (l *Listener) janitor() {
-	ticker := time.NewTicker(l.cfg.idleTimeout / 2)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-l.cfg.ctx.Done():
-			return
-		case <-ticker.C:
-			l.conns.Range(func(key, value any) bool {
-				id := key.(string)
-				conn := value.(*Conn)
-
-				closed := conn.closed.Load() == 1
-				closedRead := conn.closedRead.Load() == 1
-				peerLastSeen := time.Unix(0, conn.peerLastSeen.Load())
-
-				if (closed && closedRead) || time.Since(peerLastSeen) > l.cfg.idleTimeout {
-					_ = conn.Close()
-					// Final cleanup of driver resources
-					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-					_ = l.driver.DeleteToken(ctx, id)
-					_ = l.driver.CleanupSession(ctx, id)
-					cancel()
-					l.conns.Delete(id)
-				}
-				return true
-			})
-		}
+		return nil
+	case <-timer.C:
+		return nil
 	}
 }
 

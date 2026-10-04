@@ -71,7 +71,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create listener: %v", err)
 	}
-	defer l.Close() // This will cleanup handshake/token endpoints
+	defer l.Close() // Bootstrap resources outlive this connection-string generator.
 
 	connStr, err := l.(*aznet.Listener).ConnectionString()
 	if err != nil {
