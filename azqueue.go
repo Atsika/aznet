@@ -65,6 +65,11 @@ func (d *queueFactory) NewDriver(ep *Endpoint, cfg *Config) (Driver, error) {
 	if client != nil {
 		for _, name := range []string{cfg.handshakeEndpoint, cfg.tokenEndpoint} {
 			if _, err := client.CreateQueue(cfg.ctx, name, nil); err != nil && !queueerror.HasCode(err, queueerror.QueueAlreadyExists) {
+				// Azure holds a deleted queue's name for ~40s; surface that as the
+				// shared sentinel so callers can decide whether to wait.
+				if queueerror.HasCode(err, queueerror.QueueBeingDeleted) {
+					return nil, fmt.Errorf("%w: queue %q: %w", ErrResourceBeingDeleted, name, err)
+				}
 				return nil, err
 			}
 		}
