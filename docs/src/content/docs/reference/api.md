@@ -91,7 +91,7 @@ type Driver interface {
 }
 ```
 
-Handles the full connection lifecycle: handshake posting/polling, token exchange, session creation, and transport instantiation.
+Handles the full connection lifecycle: handshake posting/polling, token exchange, session creation, and transport instantiation. The listener owns the session ID before calling `CreateSession` and calls `CleanupSession` even after partial acquisition failure. Custom drivers must make resource deletion idempotent, report failures, and honor operation contexts. If `NewTransport` returns a partial transport with an error, aznet closes that transport once.
 
 ### Transport
 
@@ -123,8 +123,8 @@ Optionally implemented by transports that need resource rotation (e.g., blob app
 `aznet.Conn` (returned by `Dial` or `Accept`) implements the standard `net.Conn` interface:
 
 - `Read(b []byte) (n int, err error)`
-- `Write(b []byte) (n int, err error)`
-- `Close() error`
+- `Write(b []byte) (n int, err error)`: Reports bytes accepted into the connection, including when flushing fails. Retry only `b[n:]`; aznet retains pending ciphertext for retry.
+- `Close() error`: Attempts buffered data and FIN for up to 250 ms, cancels I/O, and closes the transport. Accepted connections also delete their session resources with bounded cleanup. Repeated calls return the original result.
 - `LocalAddr() net.Addr`
 - `RemoteAddr() net.Addr`
 - `SetDeadline(t time.Time) error`
@@ -137,4 +137,14 @@ Optionally implemented by transports that need resource rotation (e.g., blob app
 The `net.Listener` implementation returned by `Listen` also provides:
 
 - `ConnectionString() (string, error)`: Returns a connection URL with embedded SAS tokens that can be shared with clients.
-- `Close() error`: Gracefully closes all active connections and removes shared bootstrap endpoints from Azure Storage.
+- `Accept() (net.Conn, error)`: Retains unprocessed batch entries. Empty polls wait normally; backend and setup failures return `*aznet.AcceptError`, whose `Op`, `Unwrap`, `Temporary`, and `Timeout` methods let callers inspect and classify failures. Callers own retry/backoff decisions.
+- `Close() error`: Cancels acceptance and closes all owned sessions, independently of the janitor. Returns cleanup failures or a timeout if teardown remains incomplete. Repeated calls return the original result. Shared bootstrap endpoints remain intact.
+- `CleanupBootstrap(ctx context.Context) error`: Explicitly deletes the shared handshake/token namespace. Its administrator should call this only after every namespace user has stopped, with an uncancelled cleanup context. Deletion failures are returned.
+
+### Closing and resource ownership
+
+A successful storage upload is not an acknowledgement that the peer consumed the bytes. Full `Close` on an accepted connection deletes session storage and can discard data the peer has not read. For delivery-sensitive responses, call `CloseWrite`, wait for application-level completion from the peer, then call `Close`.
+
+Each session cleanup operation has a two-second deadline and at most three core attempts for transient errors; SDK attempts share that deadline. Partial transports are closed once. Connection Close retains its 250 ms graceful bound followed by bounded token and session cleanup. Listener Close returns within 10.25 s. A custom backend that ignores cancellation can retain its worker until it returns; a timeout does not confirm resource reclamation.
+
+**Migration:** listener Close previously removed shared bootstrap resources. Namespace administrators must now request `CleanupBootstrap` explicitly. This prevents session teardown from destroying discovery resources shared with another listener generation. These additional methods are available on `*aznet.Listener`, obtained by type assertion from the `net.Listener` returned by `Listen`.

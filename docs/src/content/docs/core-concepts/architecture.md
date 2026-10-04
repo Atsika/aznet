@@ -107,10 +107,10 @@ Data is split into chunks, encrypted locally, and uploaded to Azure.
 The other party **polls** Azure for new chunks, downloads them, decrypts them, and presents them to the application.
 
 ### 3. Closure Phase
-- When a party calls `Close()`, a `MsgTypeFin` message is sent.
-- The connection supports half-close via `CloseWrite()`.
-- The **Janitor** (a background process on the server) identifies closed or timed-out connections and
-  deletes the associated Azure Storage resources.
+- `CloseWrite()` sends `MsgTypeFin` while preserving the reading side and session resources.
+- `Close()` attempts buffered data and FIN within a bounded interval, then cancels I/O. On an accepted connection it also deletes session resources; applications requiring final-response delivery should half-close and wait for application-level completion before full Close.
+- The **Janitor** closes idle sessions through the same cleanup owner. Listener Close reclaims sessions without depending on the janitor and reports cleanup failures.
+- Shared bootstrap resources outlive listener Close. Their administrator explicitly calls `CleanupBootstrap(ctx)` after all namespace users have stopped.
 
 ## Internal Components
 
