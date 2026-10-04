@@ -36,6 +36,7 @@ func (t *reviewTransport) LocalAddr() net.Addr  { return ServiceAddr{} }
 func (t *reviewTransport) RemoteAddr() net.Addr { return ServiceAddr{} }
 func (t *reviewTransport) MaxRawSize() int      { return 1024 }
 func reviewNoise(t *testing.T) (*Noise, *Noise) {
+	t.Helper()
 	a, _ := NewNoiseClient()
 	b, _ := NewNoiseServer()
 	m, e := a.WriteMessage(nil)
@@ -96,7 +97,11 @@ func TestUpdatedDeadlineInterruptsIO(t *testing.T) {
 		t.Run(map[bool]string{false: "write", true: "read"}[read], func(t *testing.T) {
 			a, _ := reviewNoise(t)
 			entered := make(chan struct{})
-			block := func(ctx context.Context) error { close(entered); <-ctx.Done(); return ctx.Err() }
+			block := func(ctx context.Context) error {
+				close(entered)
+				<-ctx.Done()
+				return ctx.Err()
+			}
 			tr := &reviewTransport{write: func(ctx context.Context, _ uint64, _ io.ReadSeeker) error { return block(ctx) }, read: func(ctx context.Context) (io.ReadCloser, error) { return nil, block(ctx) }}
 			c := reviewConn(tr, a)
 			defer c.cancel()
@@ -136,10 +141,16 @@ func TestCloseInterruptsWrite(t *testing.T) {
 	}}
 	c := reviewConn(tr, a)
 	wd := make(chan struct{})
-	go func() { c.Write([]byte("x")); close(wd) }()
+	go func() {
+		c.Write([]byte("x"))
+		close(wd)
+	}()
 	<-entered
 	done := make(chan struct{})
-	go func() { c.Close(); close(done) }()
+	go func() {
+		c.Close()
+		close(done)
+	}()
 	select {
 	case <-done:
 	case <-time.After(time.Second):
@@ -181,9 +192,15 @@ func TestConcurrentReadPreservesOrder(t *testing.T) {
 	c := reviewConn(tr, b)
 	defer c.cancel()
 	done := make(chan error, 2)
-	go func() { _, e := c.Read(make([]byte, 1)); done <- e }()
+	go func() {
+		_, e := c.Read(make([]byte, 1))
+		done <- e
+	}()
 	<-entered
-	go func() { _, e := c.Read(make([]byte, 1)); done <- e }()
+	go func() {
+		_, e := c.Read(make([]byte, 1))
+		done <- e
+	}()
 	select {
 	case <-second:
 		t.Error("concurrent receive overtook first fetch")
@@ -323,7 +340,10 @@ func TestDeadlineExtensionAndClear(t *testing.T) {
 			defer c.cancel()
 			c.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
 			done := make(chan error, 1)
-			go func() { _, err := c.Write([]byte("x")); done <- err }()
+			go func() {
+				_, err := c.Write([]byte("x"))
+				done <- err
+			}()
 			<-entered
 			if clear {
 				c.SetWriteDeadline(time.Time{})
@@ -354,7 +374,10 @@ func TestCloseBoundWithUncooperativeBackend(t *testing.T) {
 	}}
 	c := reviewConn(tr, a)
 	done := make(chan struct{})
-	go func() { c.Write([]byte("x")); close(done) }()
+	go func() {
+		c.Write([]byte("x"))
+		close(done)
+	}()
 	<-entered
 	start := time.Now()
 	err := c.Close()
@@ -404,14 +427,20 @@ func (b *blockingBody) Read([]byte) (int, error) {
 	<-b.closed
 	return 0, io.ErrClosedPipe
 }
-func (b *blockingBody) Close() error { close(b.closed); return nil }
+func (b *blockingBody) Close() error {
+	close(b.closed)
+	return nil
+}
 func TestReadDeadlineInterruptsBody(t *testing.T) {
 	a, _ := reviewNoise(t)
 	body := &blockingBody{entered: make(chan struct{}), closed: make(chan struct{})}
 	c := reviewConn(&reviewTransport{read: func(context.Context) (io.ReadCloser, error) { return body, nil }}, a)
 	defer c.cancel()
 	done := make(chan error, 1)
-	go func() { _, err := c.Read(make([]byte, 1)); done <- err }()
+	go func() {
+		_, err := c.Read(make([]byte, 1))
+		done <- err
+	}()
 	<-body.entered
 	c.SetReadDeadline(time.Now().Add(-time.Second))
 	select {
@@ -435,7 +464,10 @@ func TestUpdatedDeadlineInterruptsPollAndWaiters(t *testing.T) {
 	c.poll = NewAdaptivePoll(time.Hour, time.Hour)
 	done := make(chan error, 2)
 	for range 2 {
-		go func() { _, err := c.Read(make([]byte, 1)); done <- err }()
+		go func() {
+			_, err := c.Read(make([]byte, 1))
+			done <- err
+		}()
 	}
 	<-entered
 	c.SetReadDeadline(time.Now().Add(-time.Second))
@@ -462,7 +494,11 @@ type blockingCloseTransport struct {
 	finished chan struct{}
 }
 
-func (tr *blockingCloseTransport) Close() error { <-tr.release; close(tr.finished); return nil }
+func (tr *blockingCloseTransport) Close() error {
+	<-tr.release
+	close(tr.finished)
+	return nil
+}
 func TestCloseBoundsTransportClose(t *testing.T) {
 	a, _ := reviewNoise(t)
 	tr := &blockingCloseTransport{release: make(chan struct{}), finished: make(chan struct{})}

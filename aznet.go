@@ -293,7 +293,7 @@ func Dial(network, address string, opts ...Option) (conn net.Conn, err error) {
 	}
 	if err != nil {
 		if transport != nil {
-			err = errors.Join(err, cleanup("close dial transport", func(context.Context) error { return transport.Close() }))
+			err = errors.Join(err, disposeTransport(transport))
 		}
 		return nil, err
 	}
@@ -490,6 +490,39 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 			}
 		}
 
+		// A previous operation may have received ciphertext before its deadline
+		// interrupted decryption. Process that owned data before polling again.
+		maxChunk := c.transport.MaxRawSize()
+		decoded := false
+		for {
+			decrypted, rest, err := c.noise.UnsealData(c.bufs.Dec, c.bufs.Noise.Bytes(), maxChunk)
+			if err != nil {
+				if err != io.ErrShortBuffer {
+					c.rmu.Unlock()
+					return 0, err
+				}
+				break
+			}
+
+			c.bufs.Dec = decrypted[:0]
+
+			c.cleanupToken.Do(func() {
+				if c.session != nil {
+					go c.session.deleteToken()
+				}
+			})
+
+			c.bufs.Read.Write(decrypted)
+			decoded = true
+			used := c.bufs.Noise.Len() - len(rest)
+			c.bufs.Noise.Next(used)
+		}
+		if decoded {
+			// Parsing above ran before this decryption pass. Revisit newly
+			// decrypted frames without waiting for another storage response.
+			c.rmu.Unlock()
+			continue
+		}
 		c.rmu.Unlock()
 
 		// Fetch more data
@@ -520,7 +553,10 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 		// Closing the response body interrupts a blocked stream read as well
 		// as canceling the context passed to ReadRaw.
 		bodyClosed := make(chan struct{})
-		stopClose := context.AfterFunc(ctx, func() { rawStream.Close(); close(bodyClosed) })
+		stopClose := context.AfterFunc(ctx, func() {
+			rawStream.Close()
+			close(bodyClosed)
+		})
 		_, err = c.bufs.Noise.ReadFrom(rawStream)
 		if stopClose() {
 			rawStream.Close()
@@ -535,29 +571,6 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 			return 0, err
 		}
 
-		maxChunk := c.transport.MaxRawSize()
-		for {
-			decrypted, rest, err := c.noise.UnsealData(c.bufs.Dec, c.bufs.Noise.Bytes(), maxChunk)
-			if err != nil {
-				if err != io.ErrShortBuffer {
-					c.rmu.Unlock()
-					return 0, err
-				}
-				break
-			}
-
-			c.bufs.Dec = decrypted[:0]
-
-			c.cleanupToken.Do(func() {
-				if c.session != nil {
-					go c.session.deleteToken()
-				}
-			})
-
-			c.bufs.Read.Write(decrypted)
-			used := c.bufs.Noise.Len() - len(rest)
-			c.bufs.Noise.Next(used)
-		}
 		c.rmu.Unlock()
 		c.poll.Reset()
 	}
@@ -603,6 +616,9 @@ const closeGracePeriod = 250 * time.Millisecond
 // Close attempts accepted data followed by FIN within 250 ms, then cancels I/O.
 // Session cleanup then has two independently bounded two-second operations.
 // A timeout means delivery, transport teardown or resource cleanup is unconfirmed.
+// On an accepted connection, Close deletes session storage: uploading bytes does
+// not acknowledge peer consumption. Use CloseWrite and wait for application-level
+// completion before Close when the peer must receive the final response.
 func (c *Conn) Close() error {
 	c.closeOnce.Do(func() {
 		c.closed.Store(1)

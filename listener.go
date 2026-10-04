@@ -99,7 +99,7 @@ func (l *Listener) acceptHandshake(hs Handshake) (conn net.Conn, err error) {
 		if err != nil {
 			var rollback error
 			if transport != nil {
-				rollback = cleanup("close transport", func(context.Context) error { return transport.Close() })
+				rollback = disposeTransport(transport)
 			}
 			if owner != nil {
 				rollback = errors.Join(rollback, owner.close())
@@ -193,7 +193,11 @@ func (l *Listener) Close() error {
 				var wg sync.WaitGroup
 				l.conns.Range(func(key, value any) bool {
 					wg.Add(1)
-					go func() { defer wg.Done(); l.recordCleanup(value.(*Conn).Close()); l.conns.Delete(key) }()
+					go func() {
+						defer wg.Done()
+						l.recordCleanup(value.(*Conn).Close())
+						l.conns.Delete(key)
+					}()
 					return true
 				})
 				wg.Wait()

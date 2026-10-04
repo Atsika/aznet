@@ -69,9 +69,11 @@ func TestAzuriteBatchedSessionLifecycle(t *testing.T) {
 				}
 				accepted = append(accepted, c.(*Conn))
 			}
+			var dialed []net.Conn
 			for j := 0; j < count; j++ {
 				select {
 				case c := <-clients:
+					dialed = append(dialed, c)
 					defer c.Close()
 					if _, err := c.Write([]byte("ready")); err != nil {
 						t.Fatal(err)
@@ -86,6 +88,31 @@ func TestAzuriteBatchedSessionLifecycle(t *testing.T) {
 				buf := make([]byte, 5)
 				if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "ready" {
 					t.Fatal(string(buf), err)
+				}
+			}
+			// Full accepted Close destroys storage. Half-close first, then wait
+			// for application completion to establish final response delivery.
+			for _, c := range accepted {
+				if _, err := c.Write([]byte("reply")); err != nil {
+					t.Fatal(err)
+				}
+				if err := c.CloseWrite(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, c := range dialed {
+				reply, err := io.ReadAll(c)
+				if err != nil || string(reply) != "reply" {
+					t.Fatalf("half-close reply: %q %v", reply, err)
+				}
+				if _, err := c.Write([]byte("done")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, c := range accepted {
+				ack := make([]byte, 4)
+				if _, err := io.ReadFull(c, ack); err != nil || string(ack) != "done" {
+					t.Fatalf("application completion: %q %v", ack, err)
 				}
 			}
 			// No janitor tick has elapsed. Close must reclaim all accepted sessions.

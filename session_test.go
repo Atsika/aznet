@@ -61,7 +61,10 @@ func (d *sessionDriver) DeleteHandshake(ctx context.Context, _ string) error {
 	}
 	return nil
 }
-func (d *sessionDriver) DeleteToken(context.Context, string) error { d.tokens.Add(1); return nil }
+func (d *sessionDriver) DeleteToken(context.Context, string) error {
+	d.tokens.Add(1)
+	return nil
+}
 func (d *sessionDriver) CleanupSession(ctx context.Context, _ string) error {
 	d.sessions.Add(1)
 	if d.sessionCleanup != nil {
@@ -69,7 +72,10 @@ func (d *sessionDriver) CleanupSession(ctx context.Context, _ string) error {
 	}
 	return nil
 }
-func (d *sessionDriver) CleanupBootstrap(context.Context) error { d.bootstraps.Add(1); return nil }
+func (d *sessionDriver) CleanupBootstrap(context.Context) error {
+	d.bootstraps.Add(1)
+	return nil
+}
 func sessionListener(t *testing.T, d *sessionDriver, n int) *Listener {
 	t.Helper()
 	for i := 0; i < n; i++ {
@@ -156,7 +162,10 @@ func TestAcceptFailureClassification(t *testing.T) {
 			if d.polls.Load() != 1 {
 				t.Fatal("implicit retry")
 			}
-			d.poll = func(context.Context) ([]Handshake, error) { l.cfg.cancel(); return nil, ErrNoData }
+			d.poll = func(context.Context) ([]Handshake, error) {
+				l.cfg.cancel()
+				return nil, ErrNoData
+			}
 			if _, err = l.Accept(); !errors.Is(err, net.ErrClosed) {
 				t.Fatal(err)
 			}
@@ -169,7 +178,10 @@ func TestEmptyAcceptPollingCancellation(t *testing.T) {
 		l := sessionListener(t, d, 0)
 		l.cfg.acceptPoll = time.Hour
 		done := make(chan error, 1)
-		go func() { _, err := l.Accept(); done <- err }()
+		go func() {
+			_, err := l.Accept()
+			done <- err
+		}()
 		for d.polls.Load() == 0 {
 			time.Sleep(time.Millisecond)
 		}
@@ -188,7 +200,11 @@ func TestShutdownDuringAcquisition(t *testing.T) {
 	for _, stage := range []string{"create", "transport", "post"} {
 		t.Run(stage, func(t *testing.T) {
 			entered := make(chan struct{})
-			block := func(ctx context.Context) error { close(entered); <-ctx.Done(); return ctx.Err() }
+			block := func(ctx context.Context) error {
+				close(entered)
+				<-ctx.Done()
+				return ctx.Err()
+			}
 			d := &sessionDriver{}
 			l := sessionListener(t, d, 1)
 			switch stage {
@@ -200,12 +216,18 @@ func TestShutdownDuringAcquisition(t *testing.T) {
 				d.post = block
 			}
 			accepted := make(chan error, 1)
-			go func() { _, err := l.Accept(); accepted <- err }()
+			go func() {
+				_, err := l.Accept()
+				accepted <- err
+			}()
 			<-entered
 			var wg sync.WaitGroup
 			for i := 0; i < 8; i++ {
 				wg.Add(1)
-				go func() { defer wg.Done(); l.Close() }()
+				go func() {
+					defer wg.Done()
+					l.Close()
+				}()
 			}
 			wg.Wait()
 			if err := <-accepted; !errors.Is(err, net.ErrClosed) {
@@ -234,7 +256,10 @@ func TestSessionCloseCleanupFailuresBoundedAndStable(t *testing.T) {
 			errs := make(chan error, 12)
 			for i := 0; i < 12; i++ {
 				wg.Add(1)
-				go func() { defer wg.Done(); errs <- c.Close() }()
+				go func() {
+					defer wg.Done()
+					errs <- c.Close()
+				}()
 			}
 			wg.Wait()
 			close(errs)
@@ -257,7 +282,11 @@ func TestCleanupUncooperativeDriverBound(t *testing.T) {
 	defer close(release)
 	var calls atomic.Int32
 	started := time.Now()
-	err := cleanup("blocked", func(context.Context) error { calls.Add(1); <-release; return nil })
+	err := cleanup("blocked", func(context.Context) error {
+		calls.Add(1)
+		<-release
+		return nil
+	})
 	if !errors.Is(err, context.DeadlineExceeded) || time.Since(started) > 3*time.Second || calls.Load() != 1 {
 		t.Fatal(err, calls.Load(), time.Since(started))
 	}
@@ -281,7 +310,10 @@ func TestTransientAcceptCanRecover(t *testing.T) {
 func TestJanitorCleanupFailureSurvivesShutdown(t *testing.T) {
 	failure := errors.New("cannot delete session")
 	done := make(chan struct{}, 1)
-	d := &sessionDriver{sessionCleanup: func(context.Context) error { done <- struct{}{}; return failure }}
+	d := &sessionDriver{sessionCleanup: func(context.Context) error {
+		done <- struct{}{}
+		return failure
+	}}
 	l := sessionListener(t, d, 1)
 	l.cfg.idleTimeout = 2 * time.Millisecond
 	c, err := l.Accept()
@@ -367,7 +399,10 @@ type countedTransport struct {
 	closes atomic.Int32
 }
 
-func (t *countedTransport) Close() error { t.closes.Add(1); return nil }
+func (t *countedTransport) Close() error {
+	t.closes.Add(1)
+	return nil
+}
 func TestDialFailureOwnership(t *testing.T) {
 	for _, stage := range []string{"post", "token", "transport", "cancel"} {
 		t.Run(stage, func(t *testing.T) {
@@ -417,9 +452,15 @@ func TestCloseCleansActiveSessionsBeforeBlockedSetupReturns(t *testing.T) {
 		<-release
 		return SessionTokens{}, nil
 	}
-	d.sessionCleanup = func(context.Context) error { cleaned <- struct{}{}; return nil }
+	d.sessionCleanup = func(context.Context) error {
+		cleaned <- struct{}{}
+		return nil
+	}
 	acceptDone := make(chan error, 1)
-	go func() { _, err := l.Accept(); acceptDone <- err }()
+	go func() {
+		_, err := l.Accept()
+		acceptDone <- err
+	}()
 	<-entered
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- l.Close() }()
