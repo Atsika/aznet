@@ -137,7 +137,8 @@ func (d *metricsDriver) CreateSession(ctx context.Context, connID string) (Sessi
 func (d *metricsDriver) NewTransport(ctx context.Context, connID string, tokens SessionTokens, isInitiator bool) (Transport, error) {
 	t, err := d.Driver.NewTransport(ctx, connID, tokens, isInitiator)
 	if err != nil {
-		return nil, err
+		// Preserve partial acquisitions so the core can close them on rollback.
+		return t, err
 	}
 	return newMetricsTransport(t, d.m), nil
 }

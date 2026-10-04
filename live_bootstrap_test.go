@@ -120,6 +120,9 @@ func TestLiveBootstrapDeletionWindow(t *testing.T) {
 			if err := listener.Close(); err != nil {
 				t.Fatalf("initial Close: %s", describe(err))
 			}
+			if err := listener.(*Listener).CleanupBootstrap(ctx); err != nil {
+				t.Fatalf("explicit bootstrap cleanup: %s", describe(err))
+			}
 			start := time.Now()
 			deleting := 0
 			for {

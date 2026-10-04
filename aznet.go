@@ -92,7 +92,8 @@ type Driver interface {
 	GetToken(ctx context.Context, connID string) ([]byte, error)
 	DeleteToken(ctx context.Context, connID string) error
 
-	// Session lifecycle
+	// Session lifecycle. The listener owns connID before this call and invokes
+	// CleanupSession even when acquisition fails partway through.
 	CreateSession(ctx context.Context, connID string) (SessionTokens, error)
 	CreateBootstrapTokens() (hSAS, tSAS string, err error)
 
@@ -101,7 +102,8 @@ type Driver interface {
 
 	// CleanupBootstrap removes shared bootstrap resources (handshake/token endpoints).
 	CleanupBootstrap(ctx context.Context) error
-	// CleanupSession removes per-connection resources (req/res channels).
+	// CleanupSession removes all per-connection resources, including partial
+	// acquisitions. It must be idempotent and return deletion failures.
 	CleanupSession(ctx context.Context, connID string) error
 }
 
@@ -179,17 +181,20 @@ func initialize(network, address string, opts []Option) (Driver, *Endpoint, *Con
 
 	cfg := applyConfig(opts)
 	if err := cfg.Validate(); err != nil {
+		cfg.cancel()
 		return nil, nil, nil, err
 	}
 
 	u, err := url.Parse(address)
 	if err != nil {
+		cfg.cancel()
 		return nil, nil, nil, err
 	}
 	ep := NewEndpoint(u)
 
 	driver, err := factory.NewDriver(ep, cfg)
 	if err != nil {
+		cfg.cancel()
 		return nil, nil, nil, err
 	}
 
@@ -222,11 +227,19 @@ func Listen(network, address string, opts ...Option) (net.Listener, error) {
 
 // Dial is analogous to net.Dial. It takes a network type (e.g. "azblob")
 // and an address (e.g. "https://account.blob.core.windows.net/?handshake=...").
-func Dial(network, address string, opts ...Option) (net.Conn, error) {
+func Dial(network, address string, opts ...Option) (conn net.Conn, err error) {
 	driver, _, cfg, err := initialize(network, address, opts)
 	if err != nil {
 		return nil, err
 	}
+
+	defer func() {
+		if err != nil {
+			cfg.cancel()
+		}
+	}()
+	dialCtx, dialCancel := context.WithTimeout(cfg.ctx, cfg.connectTimeout)
+	defer dialCancel()
 
 	connID := uuid.New().String()
 	noise, err := NewNoiseClient()
@@ -238,12 +251,9 @@ func Dial(network, address string, opts ...Option) (net.Conn, error) {
 		return nil, fmt.Errorf("%w: %v", ErrNoiseMsgFailed, err)
 	}
 
-	if err := driver.PostHandshake(cfg.ctx, connID, msg1); err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrHandshakeExchangeFailed, err)
+	if err := driver.PostHandshake(dialCtx, connID, msg1); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrHandshakeExchangeFailed, err)
 	}
-
-	dialCtx, dialCancel := context.WithTimeout(cfg.ctx, cfg.connectTimeout)
-	defer dialCancel()
 
 	var encryptedTokens []byte
 	for {
@@ -277,13 +287,18 @@ func Dial(network, address string, opts ...Option) (net.Conn, error) {
 		return nil, ErrHandshakeIncomplete
 	}
 
-	transport, err := driver.NewTransport(cfg.ctx, connID, tokens, true)
+	transport, err := driver.NewTransport(dialCtx, connID, tokens, true)
+	if err == nil {
+		err = dialCtx.Err()
+	}
 	if err != nil {
+		if transport != nil {
+			err = errors.Join(err, cleanup("close dial transport", func(context.Context) error { return transport.Close() }))
+		}
 		return nil, err
 	}
 
-	ctx, cancel := context.WithCancel(cfg.ctx)
-	return newConn(ctx, cancel, transport, cfg, noise, driver, connID), nil
+	return newConn(cfg.ctx, cfg.cancel, transport, cfg, noise, driver, connID), nil
 }
 
 // Conn implements net.Conn.
@@ -311,6 +326,7 @@ type Conn struct {
 	peerLastSeen atomic.Int64
 	lastNudge    atomic.Int64 // UnixNano of last reader nudge; rate-limits wakes
 
+	session      *sessionOwner
 	cleanupToken sync.Once
 	closeOnce    sync.Once
 	// wmu guards the write buffer (bufs.Write). Acquired briefly inside flush()
@@ -533,12 +549,8 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 			c.bufs.Dec = decrypted[:0]
 
 			c.cleanupToken.Do(func() {
-				if !c.noise.IsInitiator() && c.driver != nil {
-					go func() {
-						ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-						defer cancel()
-						_ = c.driver.DeleteToken(ctx, c.id)
-					}()
+				if c.session != nil {
+					go c.session.deleteToken()
 				}
 			})
 
@@ -589,7 +601,8 @@ func (c *Conn) Write(p []byte) (int, error) {
 const closeGracePeriod = 250 * time.Millisecond
 
 // Close attempts accepted data followed by FIN within 250 ms, then cancels I/O.
-// A timeout means delivery and transport teardown are not confirmed.
+// Session cleanup then has two independently bounded two-second operations.
+// A timeout means delivery, transport teardown or resource cleanup is unconfirmed.
 func (c *Conn) Close() error {
 	c.closeOnce.Do(func() {
 		c.closed.Store(1)
@@ -598,6 +611,7 @@ func (c *Conn) Close() error {
 		done := make(chan error, 1)
 		go func() {
 			c.wmu.Lock()
+			hadBuffered := c.bufs != nil && c.bufs.Write.Len() > 0
 			if c.closedWrite.Swap(1) == 0 && c.bufs != nil {
 				BuildFrame(&c.bufs.Write, Frame{Type: MsgTypeFin})
 			}
@@ -606,6 +620,11 @@ func (c *Conn) Close() error {
 			err := c.flushContext(ctx)
 			if cause := context.Cause(ctx); cause != nil {
 				err = cause
+			}
+			// Listener shutdown deliberately cancels idle connections. Report
+			// interrupted delivery only when accepted bytes were still buffered.
+			if !hadBuffered && errors.Is(err, context.Canceled) {
+				err = nil
 			}
 			finish()
 			c.cancel()
@@ -621,6 +640,9 @@ func (c *Conn) Close() error {
 		c.cancel()
 		c.readDeadline.set(time.Time{})
 		c.writeDeadline.set(time.Time{})
+		if c.session != nil {
+			c.closeErr = errors.Join(c.closeErr, c.session.close())
+		}
 	})
 	return c.closeErr
 }
@@ -892,151 +914,6 @@ func (c *Conn) idleWait(ctx context.Context) error {
 		return nil
 	case <-timer.C:
 		return nil
-	}
-}
-
-// Listener implements net.Listener.
-type Listener struct {
-	network string
-	ep      *Endpoint
-	driver  Driver
-	cfg     *Config
-	conns   sync.Map // map[string]*Conn
-}
-
-func (l *Listener) Accept() (net.Conn, error) {
-	for {
-		select {
-		case <-l.cfg.ctx.Done():
-			return nil, net.ErrClosed
-		default:
-		}
-
-		handshakes, err := l.driver.GetHandshakes(l.cfg.ctx)
-		if err != nil {
-			time.Sleep(l.cfg.acceptPoll)
-			continue
-		}
-
-		for _, hs := range handshakes {
-			noise, err := NewNoiseServer()
-			if err != nil {
-				continue
-			}
-			payload, err := noise.ReadMessage(hs.Payload)
-			if err != nil {
-				continue
-			}
-
-			// The payload contains the actual connID from the client.
-			connID := string(payload)
-			if connID == "" {
-				continue
-			}
-
-			// Check if we already have this connection
-			if _, ok := l.conns.Load(connID); ok {
-				continue
-			}
-
-			// Generate tokens (driver specific tokens via Provider)
-			tokens, err := l.driver.CreateSession(l.cfg.ctx, connID)
-			if err != nil {
-				continue
-			}
-			encodedTokens, err := json.Marshal(tokens)
-			if err != nil {
-				continue
-			}
-
-			msg2, err := noise.WriteMessage(encodedTokens)
-			if err != nil {
-				continue
-			}
-
-			if err := l.driver.PostToken(l.cfg.ctx, connID, msg2); err != nil {
-				continue
-			}
-
-			if !noise.IsComplete() {
-				continue
-			}
-
-			// Inform Provider we are done and want a transport
-			transport, err := l.driver.NewTransport(l.cfg.ctx, connID, tokens, false)
-			if err != nil {
-				continue
-			}
-
-			_ = l.driver.DeleteHandshake(l.cfg.ctx, hs.ID)
-			ctx, cancel := context.WithCancel(l.cfg.ctx)
-			conn := newConn(ctx, cancel, transport, l.cfg, noise, l.driver, connID)
-			l.conns.Store(connID, conn)
-			return conn, nil
-		}
-		time.Sleep(l.cfg.acceptPoll)
-	}
-}
-
-// ConnectionString returns the connection string for this listener.
-func (l *Listener) ConnectionString() (string, error) {
-	hSAS, tSAS, err := l.driver.CreateBootstrapTokens()
-	if err != nil {
-		return "", err
-	}
-
-	return l.ep.BuildConnURL(l.cfg, hSAS, tSAS), nil
-}
-
-func (l *Listener) Close() error {
-	l.cfg.cancel()
-
-	// Gracefully close all connections
-	l.conns.Range(func(key, value any) bool {
-		conn := value.(*Conn)
-		_ = conn.Close()
-		return true
-	})
-
-	// Cleanup shared bootstrap endpoints
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	return l.driver.CleanupBootstrap(ctx)
-}
-
-func (l *Listener) Addr() net.Addr {
-	return ServiceAddr{l.network, l.ep.ServiceURL(), l.cfg.handshakeEndpoint}
-}
-
-func (l *Listener) janitor() {
-	ticker := time.NewTicker(l.cfg.idleTimeout / 2)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-l.cfg.ctx.Done():
-			return
-		case <-ticker.C:
-			l.conns.Range(func(key, value any) bool {
-				id := key.(string)
-				conn := value.(*Conn)
-
-				closed := conn.closed.Load() == 1
-				closedRead := conn.closedRead.Load() == 1
-				peerLastSeen := time.Unix(0, conn.peerLastSeen.Load())
-
-				if (closed && closedRead) || time.Since(peerLastSeen) > l.cfg.idleTimeout {
-					_ = conn.Close()
-					// Final cleanup of driver resources
-					ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-					_ = l.driver.DeleteToken(ctx, id)
-					_ = l.driver.CleanupSession(ctx, id)
-					cancel()
-					l.conns.Delete(id)
-				}
-				return true
-			})
-		}
 	}
 }
 

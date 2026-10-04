@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -243,17 +244,17 @@ func (p *blobDriver) CleanupBootstrap(ctx context.Context) error {
 	if p.client == nil {
 		return nil
 	}
-	_, _ = p.client.NewContainerClient(p.cfg.handshakeEndpoint).Delete(ctx, nil)
-	_, _ = p.client.NewContainerClient(p.cfg.tokenEndpoint).Delete(ctx, nil)
-	return nil
+	_, a := p.client.NewContainerClient(p.cfg.handshakeEndpoint).Delete(ctx, nil)
+	_, b := p.client.NewContainerClient(p.cfg.tokenEndpoint).Delete(ctx, nil)
+	return errors.Join(missingDelete(a), missingDelete(b))
 }
 
 func (p *blobDriver) CleanupSession(ctx context.Context, connID string) error {
 	if p.client == nil {
 		return nil
 	}
-	_, _ = p.client.NewContainerClient(connID).Delete(ctx, nil)
-	return nil
+	_, err := p.client.NewContainerClient(connID).Delete(ctx, nil)
+	return missingDelete(err)
 }
 
 type blobTransport struct {
