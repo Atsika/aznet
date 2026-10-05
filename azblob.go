@@ -317,8 +317,22 @@ func (t *blobTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 		resp.Body.Close()
 		return nil, ErrNoData
 	}
-	t.rxOffset += contentLen
-	return resp.Body, nil
+	return &blobReadBody{ReadCloser: resp.Body, transport: t}, nil
+}
+
+// The connection retains every returned byte, including n > 0 with an error.
+// Commit only those bytes so a later poll resumes interrupted ciphertext.
+type blobReadBody struct {
+	io.ReadCloser
+	transport *blobTransport
+}
+
+func (b *blobReadBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	b.transport.mu.Lock()
+	b.transport.rxOffset += int64(n)
+	b.transport.mu.Unlock()
+	return n, err
 }
 
 func (t *blobTransport) Close() error    { return nil }
