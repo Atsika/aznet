@@ -30,6 +30,10 @@ const (
 	MsgTypeRotate byte = 0x03
 )
 
+// ErrBufferLimit is a terminal connection failure: retaining more bytes would
+// exceed a configured allowance. Close still owns transport/session cleanup.
+var ErrBufferLimit = errors.New("aznet: byte buffer limit exceeded")
+
 // Handshake represents a discovered connection request.
 type Handshake struct {
 	ID      string // handshake identifier (used for cleanup)
@@ -61,6 +65,14 @@ type Transport interface {
 	// MaxRawSize returns the maximum raw capacity of the transport in bytes.
 	// It must be constant for the lifetime of the transport.
 	MaxRawSize() int
+}
+
+// limitedRawReader is an optional response-budget capability. Drivers such as
+// Blob can stop a response mid-chunk and resume at the consumed byte offset.
+// The base Transport interface remains sufficient; oversized base responses
+// are rejected by the core's finite receive allowance.
+type limitedRawReader interface {
+	ReadRawLimit(context.Context, int) (io.ReadCloser, error)
 }
 
 // Rotator is optionally implemented by transports that need resource rotation
@@ -533,10 +545,17 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 			// Drain framed plaintext before decrypting the next chunk.
 			continue
 		}
+		receiveBudget := c.cfg.limits().Pending - c.bufs.Noise.Len()
 		c.rmu.Unlock()
 
 		// Fetch more data
-		rawStream, err := c.transport.ReadRaw(ctx)
+		var rawStream io.ReadCloser
+		var err error
+		if reader, ok := c.transport.(limitedRawReader); ok {
+			rawStream, err = reader.ReadRawLimit(ctx, receiveBudget)
+		} else {
+			rawStream, err = c.transport.ReadRaw(ctx)
+		}
 		if err != nil {
 			if errors.Is(err, ErrBufferLimit) {
 				return 0, c.overflow("transport receive")
@@ -995,10 +1014,18 @@ type metricsTransport struct {
 	m   Metrics
 }
 
-func newMetricsTransport(t Transport, m Metrics) *metricsTransport {
+type metricsLimitedTransport struct {
+	*metricsTransport
+	reader limitedRawReader
+}
+
+func newMetricsTransport(t Transport, m Metrics) Transport {
 	mt := &metricsTransport{Transport: t, m: m}
 	if r, ok := t.(Rotator); ok {
 		mt.rot = r
+	}
+	if reader, ok := t.(limitedRawReader); ok {
+		return &metricsLimitedTransport{metricsTransport: mt, reader: reader}
 	}
 	return mt
 }
@@ -1021,6 +1048,15 @@ func (t *metricsTransport) WriteRaw(ctx context.Context, seq uint64, data io.Rea
 
 func (t *metricsTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 	rc, err := t.Transport.ReadRaw(ctx)
+	return t.recordRead(rc, err)
+}
+
+func (t *metricsLimitedTransport) ReadRawLimit(ctx context.Context, limit int) (io.ReadCloser, error) {
+	rc, err := t.reader.ReadRawLimit(ctx, limit)
+	return t.recordRead(rc, err)
+}
+
+func (t *metricsTransport) recordRead(rc io.ReadCloser, err error) (io.ReadCloser, error) {
 	if err == nil {
 		t.m.IncrementReadTransaction()
 		return &metricsReadCloser{ReadCloser: rc, m: t.m}, nil

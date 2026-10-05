@@ -30,7 +30,8 @@ func TestBoundedWriteBatchesAndCiphertextRetry(t *testing.T) {
 	var seqs []uint64
 	var c *Conn
 	var plain []byte
-	c = reviewConn(&reviewTransport{write: func(_ context.Context, seq uint64, r io.ReadSeeker) error {
+	cfg := applyConfig([]Option{WithPing(0), WithBufferLimits(BufferLimits{Write: 64, Retry: 40})})
+	c = newConn(cfg.ctx, cfg.cancel, &reviewTransport{write: func(_ context.Context, seq uint64, r io.ReadSeeker) error {
 		raw, err := io.ReadAll(r)
 		if err != nil {
 			return err
@@ -46,11 +47,8 @@ func TestBoundedWriteBatchesAndCiphertextRetry(t *testing.T) {
 		p, _, err := b.UnsealData(nil, raw, 40)
 		plain = append(plain, p...)
 		return err
-	}}, a)
+	}}, cfg, a, nil, "bounded")
 	defer c.cancel()
-	WithBufferLimits(BufferLimits{Write: 64, Retry: 40})(c.cfg)
-	// Construct as Dial would, after options have been applied.
-	c.mtu = 40 - NoiseOverhead - FrameHeaderSize
 	want := bytes.Repeat([]byte("0123456789"), 100)
 	n, err := c.Write(want)
 	if !errors.Is(err, io.ErrUnexpectedEOF) || n <= 0 || n >= len(want) {
@@ -149,7 +147,8 @@ func TestQueuePendingByteAccounting(t *testing.T) {
 func TestRepeatedWriteFailuresStayBounded(t *testing.T) {
 	a, _ := reviewNoise(t)
 	var first []byte
-	c := reviewConn(&reviewTransport{write: func(_ context.Context, seq uint64, r io.ReadSeeker) error {
+	cfg := applyConfig([]Option{WithPing(0), WithBufferLimits(BufferLimits{Write: 64, Retry: 40})})
+	c := newConn(cfg.ctx, cfg.cancel, &reviewTransport{write: func(_ context.Context, seq uint64, r io.ReadSeeker) error {
 		data, _ := io.ReadAll(r)
 		if first == nil {
 			first = data
@@ -158,10 +157,8 @@ func TestRepeatedWriteFailuresStayBounded(t *testing.T) {
 			t.Fatal("failed retry changed ciphertext")
 		}
 		return io.ErrUnexpectedEOF
-	}}, a)
+	}}, cfg, a, nil, "retry")
 	defer c.cancel()
-	WithBufferLimits(BufferLimits{Write: 64, Retry: 40})(c.cfg)
-	c.mtu = 40 - NoiseOverhead - FrameHeaderSize
 	for range 10 {
 		if _, err := c.Write(make([]byte, 100)); !errors.Is(err, io.ErrUnexpectedEOF) {
 			t.Fatal(err)
