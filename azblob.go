@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/streaming"
@@ -170,8 +171,8 @@ func (p *blobDriver) DeleteToken(ctx context.Context, connID string) error {
 	return err
 }
 
-func (p *blobDriver) makeSAS(name string, permissions sas.ContainerPermissions) (string, error) {
-	start, end := p.cfg.SASTimes()
+func (p *blobDriver) makeSAS(name string, permissions sas.ContainerPermissions, duration time.Duration) (string, error) {
+	start, end := p.cfg.sasTimes(duration)
 	sv := sas.BlobSignatureValues{
 		Protocol: sas.ProtocolHTTPSandHTTP, ContainerName: name,
 		Permissions: permissions.String(), StartTime: start, ExpiryTime: end,
@@ -190,15 +191,22 @@ func (p *blobDriver) makeSAS(name string, permissions sas.ContainerPermissions) 
 }
 
 func (p *blobDriver) CreateBootstrapTokens() (string, string, error) {
+	return p.CreateBootstrapTokensFor(p.cfg.sasExpiry)
+}
+
+func (p *blobDriver) CreateBootstrapTokensFor(duration time.Duration) (string, string, error) {
+	if err := validateCredentialDuration(duration); err != nil {
+		return "", "", err
+	}
 	if p.ep.Account == "" || p.ep.Key == "" {
 		return "", "", ErrSASGenerationFailed
 	}
 
-	hSAS, err := p.makeSAS(p.cfg.handshakeEndpoint, sas.ContainerPermissions{Add: true, Create: true, Write: true})
+	hSAS, err := p.makeSAS(p.cfg.handshakeEndpoint, sas.ContainerPermissions{Add: true, Create: true, Write: true}, duration)
 	if err != nil {
 		return "", "", fmt.Errorf("%w: %v", ErrSASGenerationFailed, err)
 	}
-	tSAS, err := p.makeSAS(p.cfg.tokenEndpoint, sas.ContainerPermissions{Read: true, List: true})
+	tSAS, err := p.makeSAS(p.cfg.tokenEndpoint, sas.ContainerPermissions{Read: true, List: true}, duration)
 	if err != nil {
 		return "", "", fmt.Errorf("%w: %v", ErrSASGenerationFailed, err)
 	}
@@ -210,11 +218,11 @@ func (p *blobDriver) CreateSession(ctx context.Context, connID string) (SessionT
 	if _, err := p.client.CreateContainer(ctx, connID, nil); err != nil && !bloberror.HasCode(err, bloberror.ContainerAlreadyExists) {
 		return SessionTokens{}, fmt.Errorf("create session container: %w", err)
 	}
-	tokenSAS, err := p.makeSAS(connID, sas.ContainerPermissions{Read: true, List: true, Add: true, Create: true, Write: true})
+	tokenSAS, err := p.makeSAS(connID, sas.ContainerPermissions{Read: true, List: true, Add: true, Create: true, Write: true}, p.cfg.sessionDuration)
 	if err != nil {
 		return SessionTokens{}, fmt.Errorf("%w: %v", ErrSASGenerationFailed, err)
 	}
-	return SessionTokens{Req: tokenSAS, Res: tokenSAS}, nil
+	return issuedSessionTokens(tokenSAS, tokenSAS)
 }
 
 func (p *blobDriver) NewTransport(ctx context.Context, connID string, tokens SessionTokens, isInitiator bool) (Transport, error) {

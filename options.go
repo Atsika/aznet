@@ -52,7 +52,9 @@ type Config struct {
 	reqPrefix         string
 	resPrefix         string
 
-	sasExpiry time.Duration
+	sasExpiry       time.Duration
+	sessionDuration time.Duration
+	now             func() time.Time
 
 	fastPoll time.Duration
 	dataPoll time.Duration
@@ -67,6 +69,12 @@ type Config struct {
 
 // Validate checks if the configuration is sane and valid.
 func (c *Config) Validate() error {
+	if err := validateCredentialDuration(c.sasExpiry); err != nil {
+		return err
+	}
+	if err := validateCredentialDuration(c.sessionDuration); err != nil {
+		return err
+	}
 	if c.handshakeEndpoint == c.tokenEndpoint {
 		return ErrInvalidConfig
 	}
@@ -88,6 +96,8 @@ func defaultConfig() *Config {
 		reqPrefix:         DefaultReqPrefix,
 		resPrefix:         DefaultResPrefix,
 		sasExpiry:         DefaultSASExpiry,
+		sessionDuration:   DefaultSASExpiry,
+		now:               time.Now,
 		fastPoll:          DefaultFastPoll,
 		dataPoll:          DefaultDataPoll,
 		acceptPoll:        DefaultAcceptPoll,
@@ -107,10 +117,18 @@ func applyConfig(opts []Option) *Config {
 	return cfg
 }
 
-// SASTimes returns the start and end times for a SAS token based on config.
+// SASTimes returns issuance times for session credentials. Custom drivers can
+// use this policy while exposing unknown expiry if they cannot report exact issuance.
 func (c *Config) SASTimes() (start, end time.Time) {
+	return c.sasTimes(c.sessionDuration)
+}
+
+func (c *Config) sasTimes(duration time.Duration) (start, end time.Time) {
 	now := time.Now().UTC()
-	return now.Add(-5 * time.Minute), now.Add(c.sasExpiry)
+	if c.now != nil {
+		now = c.now().UTC()
+	}
+	return now.Add(-5 * time.Minute), now.Add(duration)
 }
 
 // WithEndpoints allows overriding the default handshake and token endpoints
@@ -139,14 +157,21 @@ func WithPrefixes(reqPrefix, resPrefix string) Option {
 	}
 }
 
-// WithSASExpiry sets the validity time for SAS tokens. The token cannot be revoked
-// once generated, so be careful and don't set it too long.
+// WithSASExpiry sets both legacy default bootstrap and session durations.
+// Prefer WithSessionDuration plus ConnectionStringFor for independent policies.
+// Durations below one second fail configuration validation.
 func WithSASExpiry(d time.Duration) Option {
 	return func(c *Config) {
-		if d > 0 {
-			c.sasExpiry = d
-		}
+		c.sasExpiry = d
+		c.sessionDuration = d
 	}
+}
+
+// WithSessionDuration sets the validity of newly issued session credentials.
+// It does not change default bootstrap validity or existing sessions. The default
+// is 24 hours. Durations below one second fail configuration validation.
+func WithSessionDuration(d time.Duration) Option {
+	return func(c *Config) { c.sessionDuration = d }
 }
 
 // WithAcceptPoll sets how frequently the listener scans for new connections.

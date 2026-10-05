@@ -189,8 +189,8 @@ func (p *queueDriver) DeleteToken(ctx context.Context, connID string) error {
 	return nil
 }
 
-func (p *queueDriver) makeSAS(name string, permissions sas.QueuePermissions) (string, error) {
-	start, end := p.cfg.SASTimes()
+func (p *queueDriver) makeSAS(name string, permissions sas.QueuePermissions, duration time.Duration) (string, error) {
+	start, end := p.cfg.sasTimes(duration)
 	sv := sas.QueueSignatureValues{Protocol: sas.ProtocolHTTPSandHTTP, QueueName: name, Permissions: permissions.String(), StartTime: start, ExpiryTime: end}
 	cred, err := azqueue.NewSharedKeyCredential(p.ep.Account, p.ep.Key)
 	if err != nil {
@@ -204,14 +204,21 @@ func (p *queueDriver) makeSAS(name string, permissions sas.QueuePermissions) (st
 }
 
 func (p *queueDriver) CreateBootstrapTokens() (string, string, error) {
+	return p.CreateBootstrapTokensFor(p.cfg.sasExpiry)
+}
+
+func (p *queueDriver) CreateBootstrapTokensFor(duration time.Duration) (string, string, error) {
+	if err := validateCredentialDuration(duration); err != nil {
+		return "", "", err
+	}
 	if p.ep.Account == "" || p.ep.Key == "" {
 		return "", "", ErrSASGenerationFailed
 	}
-	hSAS, err := p.makeSAS(p.cfg.handshakeEndpoint, sas.QueuePermissions{Add: true})
+	hSAS, err := p.makeSAS(p.cfg.handshakeEndpoint, sas.QueuePermissions{Add: true}, duration)
 	if err != nil {
 		return "", "", fmt.Errorf("%w: %v", ErrSASGenerationFailed, err)
 	}
-	tSAS, err := p.makeSAS(p.cfg.tokenEndpoint, sas.QueuePermissions{Read: true})
+	tSAS, err := p.makeSAS(p.cfg.tokenEndpoint, sas.QueuePermissions{Read: true}, duration)
 	if err != nil {
 		return "", "", fmt.Errorf("%w: %v", ErrSASGenerationFailed, err)
 	}
@@ -226,15 +233,15 @@ func (p *queueDriver) CreateSession(ctx context.Context, connID string) (Session
 	if _, err := p.client.CreateQueue(ctx, resName, nil); err != nil && !queueerror.HasCode(err, queueerror.QueueAlreadyExists) {
 		return SessionTokens{}, fmt.Errorf("create session queue %s: %w", resName, err)
 	}
-	reqSAS, err := p.makeSAS(reqName, sas.QueuePermissions{Add: true})
+	reqSAS, err := p.makeSAS(reqName, sas.QueuePermissions{Add: true}, p.cfg.sessionDuration)
 	if err != nil {
 		return SessionTokens{}, fmt.Errorf("%w: %v", ErrSASGenerationFailed, err)
 	}
-	resSAS, err := p.makeSAS(resName, sas.QueuePermissions{Read: true, Process: true})
+	resSAS, err := p.makeSAS(resName, sas.QueuePermissions{Read: true, Process: true}, p.cfg.sessionDuration)
 	if err != nil {
 		return SessionTokens{}, fmt.Errorf("%w: %v", ErrSASGenerationFailed, err)
 	}
-	return SessionTokens{Req: reqSAS, Res: resSAS}, nil
+	return issuedSessionTokens(reqSAS, resSAS)
 }
 
 func (p *queueDriver) NewTransport(_ context.Context, connID string, tokens SessionTokens, isInitiator bool) (Transport, error) {

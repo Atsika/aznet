@@ -13,6 +13,7 @@ import (
 
 // Conn implements net.Conn.
 type Conn struct {
+	sessionExpiry time.Time // immutable issuance metadata; zero means unknown
 	transport     Transport
 	rotator       Rotator // nil if transport doesn't support rotation
 	driver        Driver
