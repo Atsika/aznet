@@ -40,7 +40,7 @@ func init() {
 type blobFactory struct{}
 
 func (d *blobFactory) NewDriver(ep *Endpoint, cfg *Config) (Driver, error) {
-	client, err := newBlobClient(ep)
+	client, err := newBlobClient(ep, cfg.metrics)
 	if err != nil {
 		return nil, err
 	}
@@ -63,11 +63,11 @@ func (d *blobFactory) NewDriver(ep *Endpoint, cfg *Config) (Driver, error) {
 		hSAS, tSAS, _ = ep.ParseSAS(cfg)
 	}
 
-	hc, err := resolveContainerClient(client, ep, cfg.handshakeEndpoint, hSAS)
+	hc, err := resolveContainerClient(client, ep, cfg.handshakeEndpoint, hSAS, cfg.metrics)
 	if err != nil {
 		return nil, err
 	}
-	tc, err := resolveContainerClient(client, ep, cfg.tokenEndpoint, tSAS)
+	tc, err := resolveContainerClient(client, ep, cfg.tokenEndpoint, tSAS, cfg.metrics)
 	if err != nil {
 		return nil, err
 	}
@@ -81,11 +81,11 @@ func (d *blobFactory) NewDriver(ep *Endpoint, cfg *Config) (Driver, error) {
 	}, nil
 }
 
-func resolveContainerClient(client *service.Client, ep *Endpoint, name, sasToken string) (*container.Client, error) {
+func resolveContainerClient(client *service.Client, ep *Endpoint, name, sasToken string, metrics Metrics) (*container.Client, error) {
 	if client != nil && sasToken == "" {
 		return client.NewContainerClient(name), nil
 	}
-	c, err := container.NewClientWithNoCredential(ep.JoinURL(name, sasToken), nil)
+	c, err := container.NewClientWithNoCredential(ep.JoinURL(name, sasToken), &container.ClientOptions{ClientOptions: sdkClientOptions(blobDriverName, metrics)})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
 	}
@@ -218,7 +218,7 @@ func (p *blobDriver) CreateSession(ctx context.Context, connID string) (SessionT
 }
 
 func (p *blobDriver) NewTransport(ctx context.Context, connID string, tokens SessionTokens, isInitiator bool) (Transport, error) {
-	client, err := service.NewClientWithNoCredential(p.ep.JoinURL("", tokens.Req), nil)
+	client, err := service.NewClientWithNoCredential(p.ep.JoinURL("", tokens.Req), &service.ClientOptions{ClientOptions: sdkClientOptions(blobDriverName, p.cfg.metrics)})
 	if err != nil {
 		return nil, err
 	}
@@ -388,13 +388,13 @@ func (t *blobTransport) RotateRX() error {
 	return nil
 }
 
-func newBlobClient(ep *Endpoint) (*service.Client, error) {
+func newBlobClient(ep *Endpoint, metrics Metrics) (*service.Client, error) {
 	if ep.Account != "" && ep.Key != "" {
 		cred, err := azblob.NewSharedKeyCredential(ep.Account, ep.Key)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
 		}
-		c, err := azblob.NewClientWithSharedKeyCredential(ep.ServiceURL(), cred, nil)
+		c, err := azblob.NewClientWithSharedKeyCredential(ep.ServiceURL(), cred, &azblob.ClientOptions{ClientOptions: sdkClientOptions(blobDriverName, metrics)})
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
 		}

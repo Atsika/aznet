@@ -37,7 +37,6 @@ func (t *metricsTransport) WriteRaw(ctx context.Context, seq uint64, data io.Rea
 	}
 	err := t.Transport.WriteRaw(ctx, seq, data)
 	if err == nil {
-		t.m.IncrementWriteTransaction()
 		t.m.IncrementBytesSent(size)
 	}
 	return err
@@ -55,7 +54,6 @@ func (t *metricsLimitedTransport) ReadRawLimit(ctx context.Context, limit int) (
 
 func (t *metricsTransport) recordRead(rc io.ReadCloser, err error) (io.ReadCloser, error) {
 	if err == nil {
-		t.m.IncrementReadTransaction()
 		return &metricsReadCloser{ReadCloser: rc, m: t.m}, nil
 	}
 	return nil, err

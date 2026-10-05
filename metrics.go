@@ -7,7 +7,9 @@ import (
 )
 
 // Metrics is an interface for tracking connection statistics.
-// Drivers call Increment* and collectors read via Get*.
+// Azure adapters count every SDK attempt, including failures and retries.
+// Byte counters track successful transport payload writes and consumed reads,
+// including framing/handshakes; they are neither HTTP wire bytes nor billed usage.
 type Metrics interface {
 	IncrementWriteTransaction()
 	IncrementReadTransaction()
@@ -24,8 +26,9 @@ type Metrics interface {
 	GetBytesReceived() int64
 }
 
-// DefaultMetrics implements the Metrics interface with atomic counters.
+// DefaultMetrics uses atomic aggregate counters and a synchronized attempt map.
 type DefaultMetrics struct {
+	requests           requestCounts
 	writeTransactions  int64
 	readTransactions   int64
 	listTransactions   int64
@@ -77,25 +80,7 @@ type metricsDriver struct {
 func (d *metricsDriver) PostHandshake(ctx context.Context, connID string, data []byte) error {
 	err := d.Driver.PostHandshake(ctx, connID, data)
 	if err == nil {
-		d.m.IncrementWriteTransaction()
 		d.m.IncrementBytesSent(int64(len(data)))
-	}
-	return err
-}
-
-func (d *metricsDriver) GetHandshakes(ctx context.Context) ([]Handshake, error) {
-	h, err := d.Driver.GetHandshakes(ctx)
-	if err == nil {
-		d.m.IncrementReadTransaction()
-		d.m.IncrementListTransaction()
-	}
-	return h, err
-}
-
-func (d *metricsDriver) DeleteHandshake(ctx context.Context, id string) error {
-	err := d.Driver.DeleteHandshake(ctx, id)
-	if err == nil {
-		d.m.IncrementDeleteTransaction()
 	}
 	return err
 }
@@ -103,7 +88,6 @@ func (d *metricsDriver) DeleteHandshake(ctx context.Context, id string) error {
 func (d *metricsDriver) PostToken(ctx context.Context, connID string, data []byte) error {
 	err := d.Driver.PostToken(ctx, connID, data)
 	if err == nil {
-		d.m.IncrementWriteTransaction()
 		d.m.IncrementBytesSent(int64(len(data)))
 	}
 	return err
@@ -112,26 +96,9 @@ func (d *metricsDriver) PostToken(ctx context.Context, connID string, data []byt
 func (d *metricsDriver) GetToken(ctx context.Context, connID string) ([]byte, error) {
 	data, err := d.Driver.GetToken(ctx, connID)
 	if err == nil {
-		d.m.IncrementReadTransaction()
 		d.m.IncrementBytesReceived(int64(len(data)))
 	}
 	return data, err
-}
-
-func (d *metricsDriver) DeleteToken(ctx context.Context, connID string) error {
-	err := d.Driver.DeleteToken(ctx, connID)
-	if err == nil {
-		d.m.IncrementDeleteTransaction()
-	}
-	return err
-}
-
-func (d *metricsDriver) CreateSession(ctx context.Context, connID string) (SessionTokens, error) {
-	t, err := d.Driver.CreateSession(ctx, connID)
-	if err == nil {
-		d.m.IncrementWriteTransaction()
-	}
-	return t, err
 }
 
 func (d *metricsDriver) NewTransport(ctx context.Context, connID string, tokens SessionTokens, isInitiator bool) (Transport, error) {
@@ -141,21 +108,4 @@ func (d *metricsDriver) NewTransport(ctx context.Context, connID string, tokens 
 		return t, err
 	}
 	return newMetricsTransport(t, d.m), nil
-}
-
-func (d *metricsDriver) CleanupBootstrap(ctx context.Context) error {
-	err := d.Driver.CleanupBootstrap(ctx)
-	if err == nil {
-		d.m.IncrementDeleteTransaction()
-		d.m.IncrementDeleteTransaction()
-	}
-	return err
-}
-
-func (d *metricsDriver) CleanupSession(ctx context.Context, connID string) error {
-	err := d.Driver.CleanupSession(ctx, connID)
-	if err == nil {
-		d.m.IncrementDeleteTransaction()
-	}
-	return err
 }
