@@ -80,21 +80,21 @@ func TestLiveBootstrapDeletionWindow(t *testing.T) {
 			remove := func(ctx context.Context, name string) error {
 				switch network {
 				case "azblob":
-					c, err := newBlobClient(ep)
+					c, err := newBlobClient(ep, nil)
 					if err != nil {
 						return err
 					}
 					_, err = c.NewContainerClient(name).Delete(ctx, nil)
 					return err
 				case "azqueue":
-					c, err := newQueueClient(ep)
+					c, err := newQueueClient(ep, nil)
 					if err != nil {
 						return err
 					}
 					_, err = c.NewQueueClient(name).Delete(ctx, nil)
 					return err
 				default:
-					c, err := newTableClient(ep)
+					c, err := newTableClient(ep, nil)
 					if err != nil {
 						return err
 					}

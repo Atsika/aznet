@@ -141,7 +141,7 @@ func TestLiveTableReclamation(t *testing.T) {
 			defer cancel()
 			cfg := applyConfig([]Option{WithContext(ctx), WithPing(0)})
 			defer cfg.cancel()
-			svc, err := newTableClient(ep)
+			svc, err := newTableClient(ep, nil)
 			check(t, "service client", err)
 			driver := &tableDriver{client: svc, ep: ep, cfg: cfg}
 			id := uuid.NewString()
