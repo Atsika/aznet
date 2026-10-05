@@ -123,6 +123,38 @@ func TestReceiveByteOverflowIsTerminal(t *testing.T) {
 	}
 }
 
+type zeroBeforeLastByte struct {
+	*bytes.Reader
+	paused bool
+}
+
+func (r *zeroBeforeLastByte) Read(p []byte) (int, error) {
+	if r.Len() == 1 && !r.paused {
+		r.paused = true
+		return 0, nil
+	}
+	return r.Reader.Read(p)
+}
+
+func TestReceiveOverflowProbeDoesNotDiscardUnreadByte(t *testing.T) {
+	a, b := reviewNoise(t)
+	var frame bytes.Buffer
+	BuildFrame(&frame, Frame{Type: MsgTypeData, Payload: make([]byte, 103)})
+	raw, err := a.SealData(nil, frame.Bytes())
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = append(raw, 42) // Exactly 128 valid bytes followed by one excess byte.
+	c := reviewConn(&reviewTransport{read: func(context.Context) (io.ReadCloser, error) {
+		return io.NopCloser(&zeroBeforeLastByte{Reader: bytes.NewReader(raw)}), nil
+	}}, b)
+	defer c.cancel()
+	WithBufferLimits(BufferLimits{Pending: 128})(c.cfg)
+	if _, err := c.Read(make([]byte, 1)); !errors.Is(err, ErrBufferLimit) {
+		t.Fatal(err)
+	}
+}
+
 func TestQueuePendingByteAccounting(t *testing.T) {
 	cfg := applyConfig([]Option{WithBufferLimits(BufferLimits{Pending: 8})})
 	defer cfg.cancel()

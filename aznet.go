@@ -593,7 +593,7 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 		_, err = c.bufs.Noise.ReadFrom(io.LimitReader(rawStream, int64(remaining)))
 		if err == nil {
 			var extra [1]byte
-			n, probeErr := rawStream.Read(extra[:])
+			n, probeErr := io.ReadFull(rawStream, extra[:])
 			if n > 0 {
 				err = c.overflow("pending ciphertext")
 			} else if probeErr != io.EOF {
