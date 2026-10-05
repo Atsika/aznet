@@ -250,3 +250,27 @@ func (l *Listener) janitor() {
 		}
 	}
 }
+
+// Listen is analogous to net.Listen. It takes a network type (e.g. "azblob")
+// and an address (e.g. "account.blob.core.windows.net").
+//
+// Listen fails with ErrResourceBeingDeleted when Azure is still deleting
+// resources left by a previous listener of the same name. That is a transient
+// condition, but waiting it out is the caller's decision, not the library's.
+func Listen(network, address string, opts ...Option) (net.Listener, error) {
+	driver, ep, cfg, err := initialize(network, address, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	l := &Listener{
+		network: network,
+		ep:      ep,
+		driver:  driver,
+		cfg:     cfg,
+	}
+
+	go l.janitor()
+
+	return l, nil
+}
