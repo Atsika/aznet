@@ -55,8 +55,9 @@ func (m *DefaultMetrics) RequestCounts() map[RequestAttempt]int64 {
 }
 
 type requestMetricsPolicy struct {
-	driver  string
-	metrics Metrics
+	driver         string
+	metrics        Metrics
+	resourceOffset int
 }
 type requestAttemptNumber struct{ count int }
 
@@ -67,8 +68,12 @@ func (requestAttemptPolicy) Do(req *policy.Request) (*http.Response, error) {
 	return req.Next()
 }
 
-func sdkClientOptions(driver string, m Metrics) azcore.ClientOptions {
-	return azcore.ClientOptions{PerCallPolicies: []policy.Policy{requestAttemptPolicy{}}, PerRetryPolicies: []policy.Policy{&requestMetricsPolicy{driver: driver, metrics: m}}}
+func sdkClientOptions(driver string, m Metrics, ep *Endpoint) azcore.ClientOptions {
+	offset := 0
+	if !ep.IsAzure {
+		offset = 1
+	}
+	return azcore.ClientOptions{PerCallPolicies: []policy.Policy{requestAttemptPolicy{}}, PerRetryPolicies: []policy.Policy{&requestMetricsPolicy{driver: driver, metrics: m, resourceOffset: offset}}}
 
 }
 
@@ -80,7 +85,7 @@ func (p *requestMetricsPolicy) Do(req *policy.Request) (*http.Response, error) {
 		req.SetOperationValue(number)
 	}
 	number.count++
-	attempt := RequestAttempt{Driver: p.driver, Operation: requestOperation(p.driver, req.Raw()), Method: req.Raw().Method, Retry: number.count > 1}
+	attempt := RequestAttempt{Driver: p.driver, Operation: requestOperation(p.driver, req.Raw(), p.resourceOffset), Method: req.Raw().Method, Retry: number.count > 1}
 	resp, err := req.Next()
 	if resp != nil {
 		attempt.StatusCode = resp.StatusCode
@@ -104,7 +109,7 @@ func (p *requestMetricsPolicy) Do(req *policy.Request) (*http.Response, error) {
 	return resp, err
 }
 
-func requestOperation(driver string, r *http.Request) string {
+func requestOperation(driver string, r *http.Request, resourceOffset int) string {
 	q := r.URL.Query()
 	switch driver {
 	case blobDriverName:
@@ -131,7 +136,8 @@ func requestOperation(driver string, r *http.Request) string {
 			return "GetBlobProperties"
 		}
 	case queueDriverName:
-		if strings.Contains(r.URL.Path, "/messages") {
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) > resourceOffset+1 && parts[resourceOffset+1] == "messages" {
 			switch r.Method {
 			case http.MethodGet:
 				if q.Get("peekonly") == "true" {

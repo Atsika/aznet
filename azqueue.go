@@ -102,7 +102,7 @@ func resolveQueueClient(client *azqueue.ServiceClient, ep *Endpoint, name, sasTo
 	if client != nil && sasToken == "" {
 		return client.NewQueueClient(name), nil
 	}
-	c, err := azqueue.NewQueueClientWithNoCredential(ep.JoinURL(name, sasToken), &azqueue.ClientOptions{ClientOptions: sdkClientOptions(queueDriverName, metrics)})
+	c, err := azqueue.NewQueueClientWithNoCredential(ep.JoinURL(name, sasToken), &azqueue.ClientOptions{ClientOptions: sdkClientOptions(queueDriverName, metrics, ep)})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
 	}
@@ -242,11 +242,11 @@ func (p *queueDriver) NewTransport(_ context.Context, connID string, tokens Sess
 	var tx, rx *azqueue.QueueClient
 	if isInitiator {
 		var err error
-		tx, err = azqueue.NewQueueClientWithNoCredential(p.ep.JoinURL(reqName, tokens.Req), &azqueue.ClientOptions{ClientOptions: sdkClientOptions(queueDriverName, p.cfg.metrics)})
+		tx, err = azqueue.NewQueueClientWithNoCredential(p.ep.JoinURL(reqName, tokens.Req), &azqueue.ClientOptions{ClientOptions: sdkClientOptions(queueDriverName, p.cfg.metrics, p.ep)})
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
 		}
-		rx, err = azqueue.NewQueueClientWithNoCredential(p.ep.JoinURL(resName, tokens.Res), &azqueue.ClientOptions{ClientOptions: sdkClientOptions(queueDriverName, p.cfg.metrics)})
+		rx, err = azqueue.NewQueueClientWithNoCredential(p.ep.JoinURL(resName, tokens.Res), &azqueue.ClientOptions{ClientOptions: sdkClientOptions(queueDriverName, p.cfg.metrics, p.ep)})
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
 		}
@@ -489,7 +489,7 @@ func newQueueClient(ep *Endpoint, metrics Metrics) (*azqueue.ServiceClient, erro
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
 		}
-		return azqueue.NewServiceClientWithSharedKeyCredential(ep.ServiceURL(), cred, &azqueue.ClientOptions{ClientOptions: sdkClientOptions(queueDriverName, metrics)})
+		return azqueue.NewServiceClientWithSharedKeyCredential(ep.ServiceURL(), cred, &azqueue.ClientOptions{ClientOptions: sdkClientOptions(queueDriverName, metrics, ep)})
 	}
 	return nil, nil
 }

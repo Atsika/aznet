@@ -156,7 +156,7 @@ func resolveTableClient(client *aztables.ServiceClient, ep *Endpoint, name, sasT
 	if client != nil && sasToken == "" {
 		return client.NewClient(name), nil
 	}
-	c, err := aztables.NewClientWithNoCredential(ep.JoinURL(name, sasToken), &aztables.ClientOptions{ClientOptions: sdkClientOptions(tableDriverName, metrics)})
+	c, err := aztables.NewClientWithNoCredential(ep.JoinURL(name, sasToken), &aztables.ClientOptions{ClientOptions: sdkClientOptions(tableDriverName, metrics, ep)})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
 	}
@@ -275,11 +275,11 @@ func (p *tableDriver) NewTransport(_ context.Context, connID string, tokens Sess
 	var tx, rx *aztables.Client
 	if isInitiator {
 		var err error
-		tx, err = aztables.NewClientWithNoCredential(p.ep.JoinURL(reqName, tokens.Req), &aztables.ClientOptions{ClientOptions: sdkClientOptions(tableDriverName, p.cfg.metrics)})
+		tx, err = aztables.NewClientWithNoCredential(p.ep.JoinURL(reqName, tokens.Req), &aztables.ClientOptions{ClientOptions: sdkClientOptions(tableDriverName, p.cfg.metrics, p.ep)})
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
 		}
-		rx, err = aztables.NewClientWithNoCredential(p.ep.JoinURL(resName, tokens.Res), &aztables.ClientOptions{ClientOptions: sdkClientOptions(tableDriverName, p.cfg.metrics)})
+		rx, err = aztables.NewClientWithNoCredential(p.ep.JoinURL(resName, tokens.Res), &aztables.ClientOptions{ClientOptions: sdkClientOptions(tableDriverName, p.cfg.metrics, p.ep)})
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
 		}
@@ -521,7 +521,7 @@ func newTableClient(ep *Endpoint, metrics Metrics) (*aztables.ServiceClient, err
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
 		}
-		return aztables.NewServiceClientWithSharedKey(ep.ServiceURL(), cred, &aztables.ClientOptions{ClientOptions: sdkClientOptions(tableDriverName, metrics)})
+		return aztables.NewServiceClientWithSharedKey(ep.ServiceURL(), cred, &aztables.ClientOptions{ClientOptions: sdkClientOptions(tableDriverName, metrics, ep)})
 	}
 	return nil, nil
 }

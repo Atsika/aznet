@@ -133,7 +133,7 @@ func TestSDKMetricsEmptyPollPaginationAndCleanup(t *testing.T) {
 			m := NewDefaultMetrics()
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			driver, _, cfg, err := initialize(network, u.String(), []Option{WithContext(ctx), WithMetrics(m), WithEndpoints("handshake", "token")})
+			driver, _, cfg, err := initialize(network, u.String(), []Option{WithContext(ctx), WithMetrics(m), WithEndpoints("messages", "messagestoken")})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -154,6 +154,20 @@ func TestSDKMetricsEmptyPollPaginationAndCleanup(t *testing.T) {
 			}
 			if m.GetBytesReceived() != 0 || m.GetBytesSent() != 0 {
 				t.Fatal("empty polls/resources counted as payload")
+			}
+			if network == "azqueue" {
+				counts := m.RequestCounts()
+				for _, operation := range []string{"CreateQueue", "DeleteQueue"} {
+					var found int64
+					for attempt, count := range counts {
+						if attempt.Operation == operation {
+							found += count
+						}
+					}
+					if found != 2 {
+						t.Errorf("%s attempts=%d want2 for queues whose names begin with messages", operation, found)
+					}
+				}
 			}
 			var total int64
 			for attempt, n := range m.RequestCounts() {
