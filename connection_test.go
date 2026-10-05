@@ -523,33 +523,18 @@ func TestWriteDeadlineInterruptsFlushWaiter(t *testing.T) {
 	c := reviewConn(tr, a)
 	defer c.cancel()
 	done := make(chan error, 2)
-	write := func() {
+	write := func(want int) {
 		n, err := c.Write([]byte("x"))
-		if n != 1 {
+		if n != want {
 			done <- fmt.Errorf("accepted %d bytes", n)
 			return
 		}
 		done <- err
 	}
-	go write()
+	go write(1)
 	<-entered
-	go write()
-	// Wait until the second writer has accepted its frame behind the first.
-	limit := time.After(time.Second)
-	for {
-		c.wmu.Lock()
-		queued := c.bufs.Write.Len()
-		c.wmu.Unlock()
-		if queued == 2*(FrameHeaderSize+1) {
-			break
-		}
-		select {
-		case <-limit:
-			t.Fatal("second writer did not queue")
-		default:
-			time.Sleep(time.Millisecond)
-		}
-	}
+	go write(0)
+	// The second writer waits for ownership without accepting unbounded data.
 	c.SetWriteDeadline(time.Now().Add(-time.Second))
 	for range 2 {
 		select {

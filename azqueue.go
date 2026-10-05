@@ -33,7 +33,7 @@ const (
 	// queue ceiling. See MaxRawSize: base64 expands by 4/3, and the encoded form
 	// of (seqHeaderSize + sealed chunk) must stay <= MaxQueueTextMessageSize.
 	queueSizeMargin = 64
-	// maxPendingMessages caps the reassembly buffer's memory footprint. Liveness
+	// maxPendingMessages caps the reassembly map's entry overhead. Liveness
 	// is not tied to it: the stall clock in ReadRaw fails a missing sequence.
 	maxPendingMessages = 256
 	// defaultReassemblyStall bounds the wait for a missing sequence when the
@@ -42,7 +42,7 @@ const (
 )
 
 // ErrReassemblyOverflow is returned when the azqueue reassembly buffer exceeds
-// maxPendingMessages, indicating a sequence gap that will not resolve.
+// its byte allowance or maxPendingMessages. The failure is terminal.
 var ErrReassemblyOverflow = errors.New("azqueue: reassembly buffer overflow")
 
 // ErrReassemblyStalled is returned when a sequence gap in the azqueue receive
@@ -298,7 +298,8 @@ type queueTransport struct {
 	connID         string
 	txName, rxName string
 
-	rxSeq uint64 // next contiguous sequence expected
+	pendingBytes int
+	rxSeq        uint64 // next contiguous sequence expected
 }
 
 // encodeQueueMessage prepends the big-endian sequence to raw and base64-encodes
@@ -332,8 +333,12 @@ func (t *queueTransport) ingestLocked(seq uint64, payload []byte) (overflow bool
 	if _, dup := t.pending[seq]; dup {
 		return false
 	}
+	if len(payload) > t.cfg.limits().Pending-t.pendingBytes || len(t.pending) >= maxPendingMessages {
+		return true
+	}
 	t.pending[seq] = payload
-	return len(t.pending) > maxPendingMessages
+	t.pendingBytes += len(payload)
+	return false
 }
 
 // drainLocked returns the contiguous in-order run starting at rxSeq, advancing
@@ -346,7 +351,11 @@ func (t *queueTransport) drainLocked() []byte {
 		if !ok {
 			break
 		}
+		if len(payload) > t.cfg.limits().Pending-len(out) {
+			break
+		}
 		out = append(out, payload...)
+		t.pendingBytes -= len(payload)
 		delete(t.pending, t.rxSeq)
 		t.rxSeq++
 	}
@@ -365,7 +374,10 @@ func (t *queueTransport) stallLimit() time.Duration {
 }
 
 func (t *queueTransport) WriteRaw(ctx context.Context, seq uint64, data io.ReadSeeker) error {
-	raw, err := io.ReadAll(data)
+	raw, err := io.ReadAll(io.LimitReader(data, int64(t.MaxRawSize())+1))
+	if len(raw) > t.MaxRawSize() {
+		return ErrBufferLimit
+	}
 	if err != nil {
 		return err
 	}
@@ -403,6 +415,9 @@ func (t *queueTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 				continue
 			}
 			overflow = t.ingestLocked(seq, payload)
+			if overflow {
+				break
+			}
 
 			// Delete only now the message is accounted for; redeliveries are
 			// deduped by ingestLocked. Spawned under rmu, waited on after.
@@ -412,9 +427,6 @@ func (t *queueTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 				_, _ = t.rxQueue.DeleteMessage(ctx, id, receipt, nil)
 			}(*msg.MessageID, *msg.PopReceipt)
 
-			if overflow {
-				break
-			}
 		}
 		t.rmu.Unlock()
 
@@ -427,7 +439,7 @@ func (t *queueTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 	// Terminal: pending is waiting on a sequence that is not coming, so retries
 	// would just ingest one more message per call forever.
 	if overflow {
-		t.rxErr = ErrReassemblyOverflow
+		t.rxErr = errors.Join(ErrReassemblyOverflow, ErrBufferLimit)
 		return nil, t.rxErr
 	}
 

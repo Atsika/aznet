@@ -87,6 +87,39 @@ The duration for which generated Shared Access Signature (SAS) tokens remain val
 
 ## Advanced Configuration
 
+### WithBufferLimits
+
+```go
+func WithBufferLimits(limits BufferLimits) Option
+```
+
+`BufferLimits` sets finite live-byte allowances per connection:
+
+| Field | Default | Ownership |
+| --- | --- | --- |
+| `Pending` | 8 MiB | Received ciphertext; a separate allowance also bounds Queue reassembly and Table prefetch |
+| `Decrypted` | 8 MiB | Decrypted framed bytes awaiting application reads |
+| `Write` | 4 MiB | Accepted framed plaintext, including control frames |
+| `Retry` | 4 MiB | One sealed outgoing chunk retained for an uncertain write |
+
+Large `Write` calls flush in bounded batches. Concurrent writers wait interruptibly before accepting bytes. On failure, the returned count identifies bytes owned by the connection; retry only `p[n:]`. Failed chunks retain their exact ciphertext and sequence. The effective MTU is also constrained by the write and retry allowances. One FIN header is reserved; redundant pings may be skipped when the buffer is full.
+
+Receive overflow returns `ErrBufferLimit`, cancels connection I/O, and remains terminal on subsequent operations. Call `Close` to dispose of the transport and session. Smaller receive limits can reject valid larger chunks from a peer; configure both endpoints accordingly. Nonpositive fields leave defaults unchanged; `Write` must fit two frame headers plus one byte and `Retry` must fit a framed byte plus encryption overhead.
+
+These are live-byte allowances, not a process-heap quota: buffer allocator capacity, encryption/decryption scratch, SDK JSON/base64 responses, and other connection state require additional finite memory. They do not bound unread cloud storage or implement ProxyBlob logical-stream flow control.
+
+### WithTableReadRows
+
+```go
+func WithTableReadRows(rows int) Option
+```
+
+Caps each Table fetch at 1–100 rows (default 4). The `Pending` allowance further reduces prefetch based on the maximum 960 KiB entity size. With a smaller allowance, one row is fetched and its decoded size checked. Four rows allow up to 3.75 MiB of decoded prefetch while amortizing query requests; eight rows double that allowance for only one fewer query per eight continuously available rows. Each reclaimed row adds one delete request, excluding SDK retries. These are operation counts, not Azure billing estimates.
+
+Table rows are reclaimed only after their bytes **and a successor row's bytes** have been consumed by the connection. The newest consumed row remains as the receipt for an uncertain write. Cleanup occurs on the next fetch; failures are returned and retried from the failed row on a later read. At an idle frontier, one receipt plus at most one consumed page remains until the next fetch or session cleanup. Unread rows remain in storage.
+
+Table session receive SAS now includes `Delete`. Upgrade the listener before creating sessions with a new client; older read-only session tokens cannot perform reclamation. There is no token refresh or resumed-session protocol. Sequence keys retain the existing nine-digit format and fail explicitly before wrapping.
+
 ### WithContext
 
 ```go

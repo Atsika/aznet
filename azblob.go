@@ -302,7 +302,7 @@ func (t *blobTransport) WriteRaw(ctx context.Context, seq uint64, data io.ReadSe
 func (t *blobTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	resp, err := t.containerClient.NewBlobClient(t.rxBlob).DownloadStream(ctx, &blob.DownloadStreamOptions{Range: blob.HTTPRange{Offset: t.rxOffset}})
+	resp, err := t.containerClient.NewBlobClient(t.rxBlob).DownloadStream(ctx, &blob.DownloadStreamOptions{Range: blob.HTTPRange{Offset: t.rxOffset, Count: int64(min(t.MaxRawSize(), max(1, t.cfg.limits().Pending/2)))}})
 	if err != nil {
 		if re, ok := err.(*azcore.ResponseError); ok && (re.StatusCode == http.StatusNotFound || re.StatusCode == http.StatusRequestedRangeNotSatisfiable) {
 			return nil, ErrNoData

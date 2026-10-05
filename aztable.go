@@ -1,7 +1,6 @@
 package aznet
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -58,6 +57,43 @@ func extractTableData(raw []byte) []byte {
 		res = append(res, chunk...)
 	}
 	return res
+}
+
+// Session data is bounded before base64 decoding. Bootstrap parsing has a
+// separate lifetime; session rows must not bypass the receive byte allowance.
+func extractSessionTableData(raw []byte, limit int) ([]byte, error) {
+	var properties map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &properties); err != nil {
+		return nil, err
+	}
+	limit = min(limit, MaxTableEntitySize)
+	var data []byte
+	for _, key := range dataKeys {
+		value, ok := properties[key]
+		if !ok {
+			break
+		}
+		var encoded string
+		if err := json.Unmarshal(value, &encoded); err != nil {
+			return nil, err
+		}
+		// DecodedLen includes up to two padding bytes, checked exactly below.
+		if base64.StdEncoding.DecodedLen(len(encoded)) > min(MaxTableBinaryPropertySize, limit-len(data))+2 {
+			return nil, ErrBufferLimit
+		}
+		chunk, err := base64.StdEncoding.DecodeString(encoded)
+		if err != nil {
+			return nil, err
+		}
+		if len(chunk) > MaxTableBinaryPropertySize || len(chunk) > limit-len(data) {
+			return nil, ErrBufferLimit
+		}
+		data = append(data, chunk...)
+	}
+	if len(data) == 0 {
+		return nil, errors.New("empty session row")
+	}
+	return data, nil
 }
 
 type tableFactory struct{}
@@ -219,7 +255,7 @@ func (p *tableDriver) CreateSession(ctx context.Context, connID string) (Session
 	if err != nil {
 		return SessionTokens{}, fmt.Errorf("%w: %v", ErrSASGenerationFailed, err)
 	}
-	resSAS, err := p.makeSAS(resName, aztables.SASPermissions{Read: true})
+	resSAS, err := p.makeSAS(resName, aztables.SASPermissions{Read: true, Delete: true})
 	if err != nil {
 		return SessionTokens{}, fmt.Errorf("%w: %v", ErrSASGenerationFailed, err)
 	}
@@ -266,59 +302,168 @@ func (p *tableDriver) CleanupSession(ctx context.Context, connID string) error {
 }
 
 type tableTransport struct {
+	rxErr              error
 	txClient, rxClient *aztables.Client
 	ep                 *Endpoint
 	cfg                *Config
-
-	connID         string
-	txName, rxName string
-	mu             sync.Mutex
-	rxSeq          int
+	connID             string
+	txName, rxName     string
+	pending            []byte
+	ends               []int
+	rxSeq              int
+	reclaimSeq         int
+	position           int
+	txConfirmed        uint64
+	mu                 sync.Mutex
+	txMu               sync.Mutex
+	active             bool
+	txHasConfirmed     bool
 }
 
+// WriteRaw is serialized by Conn. Keep the confirmed high-water mark locally so
+// an explicitly repeated older call cannot recreate a row already reclaimed by
+// the receiver. An uncertain current write still retries AddEntity verbatim.
 func (t *tableTransport) WriteRaw(ctx context.Context, seq uint64, data io.ReadSeeker) error {
-	raw, _ := io.ReadAll(data)
-	edata, _ := buildTableEntity("data", formatRowKey(int(seq)), raw)
-	_, err := t.txClient.AddEntity(ctx, edata, nil)
-	// seq is the row key; a resend collides (409) and is the idempotent success.
+	t.txMu.Lock()
+	defer t.txMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if t.txHasConfirmed && seq <= t.txConfirmed {
+		return nil
+	}
+	// Nine-digit row keys are the existing wire format. Never wrap or reorder.
+	if seq >= 1_000_000_000 {
+		return fmt.Errorf("table sequence exhausted: %w", ErrBufferLimit)
+	}
+	raw, err := io.ReadAll(io.LimitReader(data, MaxTableEntitySize+1))
+	if err != nil {
+		return fmt.Errorf("read table write: %w", err)
+	}
+	if len(raw) > MaxTableEntitySize {
+		return ErrBufferLimit
+	}
+	edata, err := buildTableEntity("data", formatRowKey(int(seq)), raw)
+	if err != nil {
+		return err
+	}
+	_, err = t.txClient.AddEntity(ctx, edata, nil)
 	var respErr *azcore.ResponseError
 	if errors.As(err, &respErr) && respErr.ErrorCode == "EntityAlreadyExists" {
-		return nil
+		err = nil
+	}
+	if err == nil {
+		t.txConfirmed, t.txHasConfirmed = seq, true
 	}
 	return err
 }
 
 func (t *tableTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 	t.mu.Lock()
-	seq := t.rxSeq
-	t.mu.Unlock()
-	pager := t.rxClient.NewListEntitiesPager(&aztables.ListEntitiesOptions{Filter: to.Ptr("PartitionKey eq 'data' and RowKey ge '" + formatRowKey(seq) + "'"), Top: to.Ptr(int32(100))})
-	if pager.More() {
-		resp, err := pager.NextPage(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("read table entities: %w", err)
+	defer t.mu.Unlock()
+	if t.rxErr != nil {
+		return nil, t.rxErr
+	}
+	if t.active {
+		return nil, errors.New("table response still open")
+	}
+	if t.position < len(t.pending) {
+		t.active = true
+		return &tableBody{t: t, ctx: ctx}, nil
+	}
+	// Consumption alone is insufficient: keep the newest row as the retry
+	// receipt. Consuming its successor proves the serialized writer advanced
+	// beyond it, so that row can no longer be the uncertain outgoing chunk.
+	// A failed deletion leaves this cursor unchanged, including an uncertain
+	// successful delete; 404 on the next attempt counts as success.
+	for t.reclaimSeq < t.rxSeq-1 {
+		_, err := t.rxClient.DeleteEntity(ctx, "data", formatRowKey(t.reclaimSeq), nil)
+		if err = missingDelete(err); err != nil {
+			return nil, fmt.Errorf("reclaim table row %d: %w", t.reclaimSeq, err)
 		}
-		if len(resp.Entities) > 0 {
-			var combined bytes.Buffer
-			processed := 0
-			for _, e := range resp.Entities {
-				var meta struct{ RowKey string }
-				json.Unmarshal(e, &meta)
-				if meta.RowKey != formatRowKey(seq+processed) {
-					break
-				}
-				combined.Write(extractTableData(e))
-				processed++
-			}
-			if processed > 0 {
-				t.mu.Lock()
-				t.rxSeq += processed
-				t.mu.Unlock()
-				return io.NopCloser(bytes.NewReader(combined.Bytes())), nil
-			}
+		t.reclaimSeq++
+	}
+	if t.rxSeq >= 1_000_000_000 {
+		return nil, fmt.Errorf("table receive sequence exhausted: %w", ErrBufferLimit)
+	}
+	rows := 4
+	if t.cfg != nil && t.cfg.tableReadRows > 0 {
+		rows = t.cfg.tableReadRows
+	}
+	rows = min(rows, max(1, t.cfg.limits().Pending/MaxTableEntitySize))
+	pager := t.rxClient.NewListEntitiesPager(&aztables.ListEntitiesOptions{Filter: to.Ptr("PartitionKey eq 'data' and RowKey ge '" + formatRowKey(t.rxSeq) + "'"), Top: to.Ptr(int32(rows))})
+	if !pager.More() {
+		return nil, ErrNoData
+	}
+	resp, err := pager.NextPage(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("read table entities: %w", err)
+	}
+	t.pending, t.ends, t.position = nil, nil, 0
+	for _, e := range resp.Entities {
+		var meta struct{ RowKey string }
+		if err := json.Unmarshal(e, &meta); err != nil {
+			return nil, fmt.Errorf("decode table row: %w", err)
+		}
+		if meta.RowKey != formatRowKey(t.rxSeq+len(t.ends)) {
+			break
+		}
+		data, err := extractSessionTableData(e, t.cfg.limits().Pending-len(t.pending))
+		if err != nil || len(t.ends) >= rows {
+			t.rxErr = fmt.Errorf("%w: table receive page: %v", ErrBufferLimit, err)
+			t.pending, t.ends = nil, nil
+			return nil, t.rxErr
+		}
+		t.pending = append(t.pending, data...)
+		t.ends = append(t.ends, len(t.pending))
+	}
+	if len(t.pending) == 0 {
+		return nil, ErrNoData
+	}
+	t.active = true
+	return &tableBody{t: t, ctx: ctx}, nil
+}
+
+// tableBody transfers ownership incrementally. Closing early preserves the
+// unread suffix, and fetching never advances consumption or deletes rows.
+type tableBody struct {
+	t      *tableTransport
+	ctx    context.Context
+	closed bool
+}
+
+func (b *tableBody) Read(p []byte) (int, error) {
+	b.t.mu.Lock()
+	defer b.t.mu.Unlock()
+	if b.closed {
+		return 0, io.ErrClosedPipe
+	}
+	if err := b.ctx.Err(); err != nil {
+		return 0, err
+	}
+	n := copy(p, b.t.pending[b.t.position:])
+	b.t.position += n
+	for len(b.t.ends) > 0 && b.t.position >= b.t.ends[0] {
+		b.t.rxSeq++
+		b.t.ends = b.t.ends[1:]
+	}
+	if b.t.position == len(b.t.pending) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (b *tableBody) Close() error {
+	b.t.mu.Lock()
+	defer b.t.mu.Unlock()
+	if !b.closed {
+		b.closed = true
+		b.t.active = false
+		if b.t.position == len(b.t.pending) {
+			b.t.pending, b.t.ends, b.t.position = nil, nil, 0
 		}
 	}
-	return nil, ErrNoData
+	return nil
 }
 
 func (t *tableTransport) Close() error    { return nil }

@@ -62,6 +62,8 @@ type Config struct {
 
 	connectTimeout time.Duration
 	idleTimeout    time.Duration
+	bufferLimits   BufferLimits
+	tableReadRows  int
 }
 
 // Validate checks if the configuration is sane and valid.
@@ -93,6 +95,8 @@ func defaultConfig() *Config {
 		pingInterval:      DefaultPingInterval,
 		connectTimeout:    DefaultConnectTimeout,
 		idleTimeout:       DefaultIdleTimeout,
+		bufferLimits:      DefaultBufferLimits(),
+		tableReadRows:     4,
 	}
 }
 
