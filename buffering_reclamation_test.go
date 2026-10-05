@@ -3,6 +3,7 @@ package aznet
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -205,6 +206,44 @@ func TestRepeatedWriteFailuresStayBounded(t *testing.T) {
 	}
 	if c.bufs.Write.Len() > 64 {
 		t.Fatal("FIN exceeded allowance")
+	}
+}
+
+func TestTableDecodeErrorsPreserveCause(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		data string
+	}{
+		{"base64", `"!!!!"`},
+		{"json_type", `123`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, rx := newTableStore(t)
+			key := formatRowKey(0)
+			s.rows[key] = json.RawMessage(fmt.Sprintf(`{"PartitionKey":"data","RowKey":%q,"Data":%s}`, key, tc.data))
+			var first error
+			for range 2 {
+				body, err := rx.ReadRaw(context.Background())
+				if body != nil || err == nil {
+					t.Fatalf("ReadRaw = %v, %v; want decode error", body, err)
+				}
+				if errors.Is(err, ErrBufferLimit) {
+					t.Errorf("malformed row classified as overflow: %v", err)
+				}
+				var corrupt base64.CorruptInputError
+				var wrongType *json.UnmarshalTypeError
+				if tc.name == "base64" && !errors.As(err, &corrupt) || tc.name == "json_type" && !errors.As(err, &wrongType) {
+					t.Errorf("typed decode cause lost: %v", err)
+				}
+				if first != nil && err != first {
+					t.Fatal("decode failure was not retained")
+				}
+				first = err
+			}
+			if s.requests[http.MethodGet] != 1 || rx.rxSeq != 0 || len(rx.pending) != 0 {
+				t.Fatal("malformed row retried or consumed data")
+			}
+		})
 	}
 }
 

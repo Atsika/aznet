@@ -437,8 +437,11 @@ func (t *tableTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 			break
 		}
 		data, err := extractSessionTableData(e, t.cfg.limits().Pending-len(t.pending))
-		if err != nil || len(t.ends) >= rows {
-			t.rxErr = fmt.Errorf("%w: table receive page: %v", ErrBufferLimit, err)
+		if err == nil && len(t.ends) >= rows {
+			err = ErrBufferLimit
+		}
+		if err != nil {
+			t.rxErr = fmt.Errorf("table receive page: %w", err)
 			t.pending, t.ends = nil, nil
 			return nil, t.rxErr
 		}
