@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"sort"
+	"time"
 )
 
 const (
@@ -35,6 +36,9 @@ type Handshake struct {
 type SessionTokens struct {
 	Req string `json:"req"`
 	Res string `json:"res"`
+	// ExpiresAt is the earliest expiry of all required session credentials.
+	// Zero means unknown; drivers must not infer it from connection creation time.
+	ExpiresAt time.Time `json:"expires_at,omitzero"`
 }
 
 // Transport is the raw byte-exchange interface implemented by drivers.

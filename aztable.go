@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
@@ -220,8 +221,8 @@ func (p *tableDriver) DeleteToken(ctx context.Context, connID string) error {
 	return err
 }
 
-func (p *tableDriver) makeSAS(name string, permissions aztables.SASPermissions) (string, error) {
-	start, end := p.cfg.SASTimes()
+func (p *tableDriver) makeSAS(name string, permissions aztables.SASPermissions, duration time.Duration) (string, error) {
+	start, end := p.cfg.sasTimes(duration)
 	sv := aztables.SASSignatureValues{Protocol: aztables.SASProtocolHTTPSandHTTP, TableName: name, Permissions: permissions.String(), StartTime: start, ExpiryTime: end}
 	cred, err := aztables.NewSharedKeyCredential(p.ep.Account, p.ep.Key)
 	if err != nil {
@@ -235,14 +236,21 @@ func (p *tableDriver) makeSAS(name string, permissions aztables.SASPermissions) 
 }
 
 func (p *tableDriver) CreateBootstrapTokens() (string, string, error) {
+	return p.CreateBootstrapTokensFor(p.cfg.sasExpiry)
+}
+
+func (p *tableDriver) CreateBootstrapTokensFor(duration time.Duration) (string, string, error) {
+	if err := validateCredentialDuration(duration); err != nil {
+		return "", "", err
+	}
 	if p.ep.Account == "" || p.ep.Key == "" {
 		return "", "", ErrSASGenerationFailed
 	}
-	hSAS, err := p.makeSAS(p.cfg.handshakeEndpoint, aztables.SASPermissions{Add: true})
+	hSAS, err := p.makeSAS(p.cfg.handshakeEndpoint, aztables.SASPermissions{Add: true}, duration)
 	if err != nil {
 		return "", "", fmt.Errorf("%w: %v", ErrSASGenerationFailed, err)
 	}
-	tSAS, err := p.makeSAS(p.cfg.tokenEndpoint, aztables.SASPermissions{Read: true})
+	tSAS, err := p.makeSAS(p.cfg.tokenEndpoint, aztables.SASPermissions{Read: true}, duration)
 	if err != nil {
 		return "", "", fmt.Errorf("%w: %v", ErrSASGenerationFailed, err)
 	}
@@ -258,15 +266,15 @@ func (p *tableDriver) CreateSession(ctx context.Context, connID string) (Session
 	if _, err := p.client.CreateTable(ctx, resName, nil); err != nil {
 		return SessionTokens{}, fmt.Errorf("create session table %s: %w", resName, err)
 	}
-	reqSAS, err := p.makeSAS(name, aztables.SASPermissions{Add: true})
+	reqSAS, err := p.makeSAS(name, aztables.SASPermissions{Add: true}, p.cfg.sessionDuration)
 	if err != nil {
 		return SessionTokens{}, fmt.Errorf("%w: %v", ErrSASGenerationFailed, err)
 	}
-	resSAS, err := p.makeSAS(resName, aztables.SASPermissions{Read: true, Delete: true})
+	resSAS, err := p.makeSAS(resName, aztables.SASPermissions{Read: true, Delete: true}, p.cfg.sessionDuration)
 	if err != nil {
 		return SessionTokens{}, fmt.Errorf("%w: %v", ErrSASGenerationFailed, err)
 	}
-	return SessionTokens{Req: reqSAS, Res: resSAS}, nil
+	return issuedSessionTokens(reqSAS, resSAS)
 }
 
 func (p *tableDriver) NewTransport(_ context.Context, connID string, tokens SessionTokens, isInitiator bool) (Transport, error) {

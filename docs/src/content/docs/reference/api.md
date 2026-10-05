@@ -148,3 +148,26 @@ A successful storage upload is not an acknowledgement that the peer consumed the
 Each session cleanup operation has a two-second deadline and at most three core attempts for transient errors; SDK attempts share that deadline. Partial transports are closed once. Connection Close retains its 250 ms graceful bound followed by bounded token and session cleanup. Listener Close returns within 10.25 s. A custom backend that ignores cancellation can retain its worker until it returns; a timeout does not confirm resource reclamation.
 
 **Migration:** listener Close previously removed shared bootstrap resources. Namespace administrators must now request `CleanupBootstrap` explicitly. This prevents session teardown from destroying discovery resources shared with another listener generation. These additional methods are available on `*aznet.Listener`, obtained by type assertion from the `net.Listener` returned by `Listen`.
+
+## Session authorization expiry
+
+`GetSessionExpiry(conn)` returns `(time.Time, bool)` through the optional connection
+`SessionExpiry` capability. False means unknown. Built-in adapters record the exact
+earliest expiration encoded in the required request/response credentials and carry
+it in the encrypted session-token exchange, so both the accepted and dialed
+connection report the same timestamp. Callers do not need access to credentials.
+
+Custom drivers may populate `SessionTokens.ExpiresAt` with trustworthy issuance
+metadata. Its zero value means unknown and is omitted from the exchange. Older
+peers that omit expiry also yield unknown; no connection-time estimate is invented.
+The original Driver/Transport interfaces remain unchanged.
+
+Expiry is informational. There is no automatic renewal, expiry timer, or forced
+close at the displayed timestamp. Bootstrap expiry governs discovery/joining; it
+does not by itself expire an established session. Session authorization can fail
+for other reasons or stop at a backend-specific boundary. SDK errors remain
+inspectable with `errors.As`/`errors.Is`: an authorization or permission failure is
+not automatically relabeled as expiration. In particular, `AuthenticationFailed`
+may describe signature validity while `AuthorizationPermissionMismatch` identifies
+permissions. Inspect the preserved service response rather than infer cause from
+HTTP 403 or a countdown alone. Metadata is not a liveness guarantee.

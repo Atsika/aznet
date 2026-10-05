@@ -28,7 +28,7 @@ func TestAzuriteBatchedSessionLifecycle(t *testing.T) {
 			suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
 			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 			defer cancel()
-			opts := []Option{WithContext(ctx), WithEndpoints("h"+suffix, "t"+suffix), WithPing(0), WithDataPoll(5 * time.Millisecond), WithAcceptPoll(5 * time.Millisecond)}
+			opts := []Option{WithContext(ctx), WithEndpoints("h"+suffix, "t"+suffix), WithSessionDuration(2 * time.Hour), WithPing(0), WithDataPoll(5 * time.Millisecond), WithAcceptPoll(5 * time.Millisecond)}
 			listener, err := Listen(network, u.String(), opts...)
 			if err != nil {
 				t.Fatal(err)
@@ -42,7 +42,8 @@ func TestAzuriteBatchedSessionLifecycle(t *testing.T) {
 					t.Error(err)
 				}
 			}()
-			address, err := l.ConnectionString()
+			issuedBefore := time.Now().UTC().Truncate(time.Second)
+			address, err := l.ConnectionStringFor(time.Hour)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -82,6 +83,25 @@ func TestAzuriteBatchedSessionLifecycle(t *testing.T) {
 					t.Fatal(err)
 				case <-ctx.Done():
 					t.Fatal(ctx.Err())
+				}
+			}
+			for _, client := range dialed {
+				expiry, known := GetSessionExpiry(client)
+				if !known || expiry.Before(issuedBefore.Add(2*time.Hour)) || expiry.After(time.Now().UTC().Add(2*time.Hour)) {
+					t.Fatalf("dial expiry=%v known=%v", expiry, known)
+				}
+				matched := false
+				for _, server := range accepted {
+					if server.id == client.(*Conn).id {
+						other, ok := GetSessionExpiry(server)
+						if !ok || !other.Equal(expiry) {
+							t.Fatal("dial/accept metadata differs")
+						}
+						matched = true
+					}
+				}
+				if !matched {
+					t.Fatal("session metadata peer missing")
 				}
 			}
 			for _, c := range accepted {

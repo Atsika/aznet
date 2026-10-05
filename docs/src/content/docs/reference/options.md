@@ -139,3 +139,33 @@ func WithEndpoints(handshake, token string) Option
 ```
 
 Overrides the default endpoint names (`handshake` and `token`) used during connection bootstrap.
+
+## Independent credential lifetimes
+
+`WithSessionDuration(d)` sets the authorization duration of newly created sessions;
+the default remains 24 hours. It does not change default bootstrap validity or
+renew already issued credentials. `Listener.ConnectionStringFor(d)` issues one
+bootstrap URL for the requested duration without mutating listener policy, and may
+run concurrently with `Accept` or other connection-string calls. Expiry is computed
+when credentials are signed, not when a connection becomes visible.
+
+The existing `WithSASExpiry(d)` remains a legacy option setting both default
+bootstrap and session durations. Prefer the independent APIs for new callers.
+Option order follows the usual last-setting-wins rule; `WithSessionDuration` changes
+only session duration. `ConnectionString()` retains the configured default bootstrap
+duration. Durations shorter than one second, including zero/negative values, fail
+with `ErrInvalidConfig`, instead of silently falling back to defaults. Fractional
+seconds are represented at the Azure SAS timestamp's whole-second precision.
+
+```go
+listener, err := aznet.Listen(network, address,
+    aznet.WithSessionDuration(24*time.Hour))
+// Handle err before using listener.
+bootstrap, err := listener.(*aznet.Listener).ConnectionStringFor(7*24*time.Hour)
+```
+
+`BootstrapTokenIssuer` is an optional driver capability. Custom drivers can retain
+the original Driver method set: their ordinary `ConnectionString()` still works;
+explicit per-string duration returns `ErrBootstrapDurationUnsupported` until the
+capability is implemented. Implementations must not mutate shared configuration to
+satisfy a single issuance request.

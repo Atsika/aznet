@@ -76,6 +76,7 @@ func (l *Listener) Accept() (net.Conn, error) {
 
 func (l *Listener) acceptHandshake(hs Handshake) (conn net.Conn, err error) {
 	var owner *sessionOwner
+	var tokens SessionTokens
 	var transport Transport
 	var noise *Noise
 	handshakeAttempted := false
@@ -113,6 +114,7 @@ func (l *Listener) acceptHandshake(hs Handshake) (conn net.Conn, err error) {
 			ctx, cancel := context.WithCancel(l.cfg.ctx)
 			c := newConn(ctx, cancel, transport, l.cfg, noise, l.driver, owner.id)
 			c.session = owner
+			c.sessionExpiry = tokens.ExpiresAt
 			l.conns.Store(owner.id, c)
 			conn = c
 		}
@@ -134,7 +136,7 @@ func (l *Listener) acceptHandshake(hs Handshake) (conn net.Conn, err error) {
 	}
 	owner = &sessionOwner{driver: l.driver, id: id}
 	op = "create session"
-	tokens, e := l.driver.CreateSession(l.cfg.ctx, id)
+	tokens, e = l.driver.CreateSession(l.cfg.ctx, id)
 	if e != nil {
 		return nil, e
 	}

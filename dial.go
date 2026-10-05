@@ -83,5 +83,7 @@ func Dial(network, address string, opts ...Option) (conn net.Conn, err error) {
 		return nil, err
 	}
 
-	return newConn(cfg.ctx, cfg.cancel, transport, cfg, noise, driver, connID), nil
+	c := newConn(cfg.ctx, cfg.cancel, transport, cfg, noise, driver, connID)
+	c.sessionExpiry = tokens.ExpiresAt
+	return c, nil
 }
