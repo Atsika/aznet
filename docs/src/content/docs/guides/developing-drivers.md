@@ -138,7 +138,7 @@ The `Transport` handles **Phase 2**: the actual exchange of raw, encrypted data.
 
 ```go
 type Transport interface {
-    WriteRaw(ctx context.Context, data io.ReadSeeker) error
+    WriteRaw(ctx context.Context, seq uint64, data io.ReadSeeker) error
     ReadRaw(ctx context.Context) (io.ReadCloser, error)
     Close() error
     LocalAddr() net.Addr
@@ -149,9 +149,9 @@ type Transport interface {
 
 ### Key Considerations
 
-- **WriteRaw**: Accepts an `io.ReadSeeker` (not `[]byte`). The `ReadSeeker` allows retrying uploads on transient failures without re-buffering.
+- **WriteRaw**: Accepts an `io.ReadSeeker` and chunk sequence. Calls are serialized, start at sequence zero, and advance only after success. Retries reuse identical ciphertext and sequence; drivers must deduplicate them even if an earlier attempt committed but returned an error.
 - **ReadRaw**: Returns an `io.ReadCloser` (not `[]byte`). If no data is available, return `aznet.ErrNoData`. The core `aznet.Conn` handles adaptive polling for you.
-- **MaxRawSize**: Return the absolute maximum capacity of a single data unit for the underlying service (e.g., 4 MB for Blob, 64 KB for Queue). The core automatically subtracts encryption overhead (`NoiseOverhead = 20 bytes`) and framing overhead (`FrameHeaderSize = 5 bytes`) to determine the application-level MTU.
+- **MaxRawSize**: Return the maximum sealed chunk size for the underlying service. The core subtracts encryption overhead (`NoiseOverhead = 20 bytes`) and framing overhead (`FrameHeaderSize = 5 bytes`), and applies configured write/retry allowances, to determine the application-level MTU. This is a chunk limit, not a bound on a multi-chunk response body.
 - **LocalAddr / RemoteAddr**: Use the provided `aznet.ServiceAddr` struct which implements `net.Addr`.
 
 ### ServiceAddr
@@ -180,6 +180,18 @@ type Rotator interface {
 
 The core detects this interface and handles rotation signaling automatically by sending `MsgTypeRotate` control frames to the peer.
 
+### Optional: bounded response reads
+
+A transport that can resume at the consumed byte offset may implement:
+
+```go
+ReadRawLimit(ctx context.Context, limit int) (io.ReadCloser, error)
+```
+
+The core supplies the remaining ciphertext allowance. Return at most `limit` bytes, preserving the unread suffix for the next call, including when a response ends inside an encrypted chunk. Blob uses this capability to bound range downloads. Wrappers must preserve this optional method when the underlying transport supports it; the built-in metrics wrapper does so.
+
+Existing transports can continue implementing only `ReadRaw`. Their response bodies must fit the configured receive allowance; overflow is terminal and cancels connection I/O. See [buffer limits](/reference/options#withbufferlimits). Reading a response transfers ownership to the connection; merely fetching it does not establish consumption. Table additionally retains the newest consumed row until successor consumption proves the sender advanced beyond any uncertain retry.
+
 ## Best Practices
 
 1. **Use Adaptive Polling**: Don't implement your own polling loops in `ReadRaw`. Return `aznet.ErrNoData` and let the core `aznet.Conn` manage the sleep intervals.
@@ -187,4 +199,3 @@ The core detects this interface and handles rotation signaling automatically by 
 3. **Respect Context**: Always pass the `context.Context` from the interface methods to your underlying SDK calls to support cancellation.
 4. **Error Wrapping**: Wrap SDK errors with `fmt.Errorf("context: %w", err)` to help users debug connection issues.
 5. **SAS Tokens**: Use `cfg.SASTimes()` to get consistent start/end times for SAS token generation (includes 5-minute clock skew tolerance).
-

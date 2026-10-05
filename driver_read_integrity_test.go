@@ -74,12 +74,12 @@ func TestBlobReadInterruptedCiphertextRetry(t *testing.T) {
 				calls++
 				switch calls {
 				case 1:
-					if got := blobRequestRange(r); got != "" && got != "bytes=0-" {
+					if got := blobRequestRange(r); got != "" && got != "bytes=0-4194303" {
 						t.Errorf("initial range = %q", got)
 					}
 					return blobReadResponse(r, broken, len(ciphertext)), nil
 				case 2:
-					if got := blobRequestRange(r); got != "bytes=7-" {
+					if got := blobRequestRange(r); got != "bytes=7-4194310" {
 						t.Errorf("retry range = %q, want bytes=7-", got)
 					}
 					return blobReadResponse(r, io.NopCloser(bytes.NewReader(ciphertext[cut:])), len(ciphertext)-cut), nil
@@ -119,7 +119,7 @@ func TestBlobReadEarlyCloseResumesConsumedBytes(t *testing.T) {
 			offset = 3
 		}
 		calls++
-		if offset > 0 && blobRequestRange(r) != "bytes=3-" {
+		if offset > 0 && blobRequestRange(r) != "bytes=3-4194306" {
 			t.Errorf("resume range = %q", blobRequestRange(r))
 		}
 		return blobReadResponse(r, io.NopCloser(strings.NewReader(want[offset:])), len(want)-offset), nil
@@ -241,6 +241,9 @@ func TestTableReadEmptyAndGappedPollingPreservesOrder(t *testing.T) {
 	calls := 0
 	client, err := aztables.NewClientWithNoCredential("https://read.invalid/session", &aztables.ClientOptions{ClientOptions: azcore.ClientOptions{
 		Retry: policy.RetryOptions{MaxRetries: -1}, Transport: rotationHTTP(func(r *http.Request) (*http.Response, error) {
+			if r.Method == http.MethodDelete {
+				return tableReadResponse(r, 204, ""), nil
+			}
 			if calls >= len(pages) {
 				return nil, errors.New("unexpected poll")
 			}
@@ -287,7 +290,7 @@ func TestBlobReadEmptyPollingPreservesProgress(t *testing.T) {
 			empty := &interruptedBlobBody{err: io.EOF}
 			tr := newReadTestBlob(t, func(r *http.Request) (*http.Response, error) {
 				calls++
-				if calls > 1 && blobRequestRange(r) != "bytes=5-" {
+				if calls > 1 && blobRequestRange(r) != "bytes=5-4194308" {
 					t.Errorf("range after poll = %q", blobRequestRange(r))
 				}
 				switch calls {

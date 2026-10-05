@@ -62,6 +62,7 @@ type Config struct {
 
 	connectTimeout time.Duration
 	idleTimeout    time.Duration
+	bufferLimits   BufferLimits
 }
 
 // Validate checks if the configuration is sane and valid.
@@ -93,6 +94,7 @@ func defaultConfig() *Config {
 		pingInterval:      DefaultPingInterval,
 		connectTimeout:    DefaultConnectTimeout,
 		idleTimeout:       DefaultIdleTimeout,
+		bufferLimits:      DefaultBufferLimits(),
 	}
 }
 
@@ -219,6 +221,26 @@ func WithMetrics(metrics Metrics) Option {
 	return func(c *Config) {
 		if metrics != nil {
 			c.metrics = metrics
+		}
+	}
+}
+
+// WithBufferLimits replaces positive allowances. Write reserves one FIN header;
+// Write and Retry must each fit a framed byte (plus encryption for Retry).
+// Smaller receive allowances may reject a peer's larger chunks terminally.
+func WithBufferLimits(limits BufferLimits) Option {
+	return func(c *Config) {
+		if limits.Pending > 0 {
+			c.bufferLimits.Pending = limits.Pending
+		}
+		if limits.Decrypted > 0 {
+			c.bufferLimits.Decrypted = limits.Decrypted
+		}
+		if limits.Write >= 2*FrameHeaderSize+1 {
+			c.bufferLimits.Write = limits.Write
+		}
+		if limits.Retry >= NoiseOverhead+FrameHeaderSize+1 {
+			c.bufferLimits.Retry = limits.Retry
 		}
 	}
 }

@@ -30,6 +30,10 @@ const (
 	MsgTypeRotate byte = 0x03
 )
 
+// ErrBufferLimit is a terminal connection failure: retaining more bytes would
+// exceed a configured allowance. Close still owns transport/session cleanup.
+var ErrBufferLimit = errors.New("aznet: byte buffer limit exceeded")
+
 // Handshake represents a discovered connection request.
 type Handshake struct {
 	ID      string // handshake identifier (used for cleanup)
@@ -45,7 +49,9 @@ type SessionTokens struct {
 // Transport is the raw byte-exchange interface implemented by drivers.
 type Transport interface {
 	// WriteRaw sends raw bytes to the peer. seq is the chunk number, reused on a
-	// retry so the driver can keep the write idempotent. It must honor ctx.
+	// retry so the driver can keep the write idempotent. Conn serializes calls,
+	// starts at zero, and advances only after success; retries use identical bytes.
+	// It must honor ctx.
 	WriteRaw(ctx context.Context, seq uint64, data io.ReadSeeker) error
 	// ReadRaw attempts to read raw bytes from the peer. The request and returned
 	// stream must honor ctx; closing the stream must unblock a pending Read.
@@ -59,6 +65,14 @@ type Transport interface {
 	// MaxRawSize returns the maximum raw capacity of the transport in bytes.
 	// It must be constant for the lifetime of the transport.
 	MaxRawSize() int
+}
+
+// limitedRawReader is an optional response-budget capability. Drivers such as
+// Blob can stop a response mid-chunk and resume at the consumed byte offset.
+// The base Transport interface remains sufficient; oversized base responses
+// are rejected by the core's finite receive allowance.
+type limitedRawReader interface {
+	ReadRawLimit(context.Context, int) (io.ReadCloser, error)
 }
 
 // Rotator is optionally implemented by transports that need resource rotation
@@ -308,6 +322,8 @@ type Conn struct {
 	driver        Driver
 	ctx           context.Context
 	closeErr      error
+	limitFailure  atomic.Pointer[bufferFailure]
+	writeGate     chan struct{}
 	id            string
 	cancel        context.CancelFunc
 	bufs          *Buffers
@@ -388,8 +404,9 @@ func newConn(ctx context.Context, cancel context.CancelFunc, t Transport, cfg *C
 		wake:      make(chan struct{}, 1),
 		readGate:  make(chan struct{}, 1),
 		flushGate: make(chan struct{}, 1),
+		writeGate: make(chan struct{}, 1),
 		bufs:      buffersPool.Get().(*Buffers),
-		mtu:       t.MaxRawSize() - NoiseOverhead - FrameHeaderSize,
+		mtu:       min(t.MaxRawSize()-NoiseOverhead, cfg.limits().Retry-NoiseOverhead, cfg.limits().Write-FrameHeaderSize) - FrameHeaderSize,
 	}
 	if r, ok := t.(Rotator); ok {
 		c.rotator = r
@@ -454,7 +471,12 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 		if c.bufs.Read.Len() >= FrameHeaderSize {
 			header := c.bufs.Read.Bytes()[:FrameHeaderSize]
 			fType := header[4]
-			fLen := int(binary.BigEndian.Uint32(header[:4]))
+			fLen64 := uint64(binary.BigEndian.Uint32(header[:4]))
+			if fLen64+FrameHeaderSize > uint64(c.cfg.limits().Decrypted) {
+				c.rmu.Unlock()
+				return 0, c.overflow("decrypted frame")
+			}
+			fLen := int(fLen64)
 
 			if c.bufs.Read.Len() >= FrameHeaderSize+fLen {
 				c.peerLastSeen.Store(time.Now().UnixNano())
@@ -492,42 +514,52 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 
 		// A previous operation may have received ciphertext before its deadline
 		// interrupted decryption. Process that owned data before polling again.
-		maxChunk := c.transport.MaxRawSize()
-		decoded := false
-		for {
-			decrypted, rest, err := c.noise.UnsealData(c.bufs.Dec, c.bufs.Noise.Bytes(), maxChunk)
-			if err != nil {
-				if err != io.ErrShortBuffer {
-					c.rmu.Unlock()
-					return 0, err
-				}
-				break
+		maxChunk := min(c.transport.MaxRawSize(), c.cfg.limits().Pending)
+		if c.bufs.Noise.Len() >= 4 {
+			sealedSize := uint64(binary.BigEndian.Uint32(c.bufs.Noise.Bytes()[:4])) + 4
+			available := c.cfg.limits().Decrypted - c.bufs.Read.Len()
+			if sealedSize > uint64(available)+NoiseOverhead {
+				c.rmu.Unlock()
+				return 0, c.overflow("decrypted chunk")
 			}
-
+		}
+		decrypted, rest, decodeErr := c.noise.UnsealData(c.bufs.Dec, c.bufs.Noise.Bytes(), maxChunk)
+		if decodeErr != nil && decodeErr != io.ErrShortBuffer {
+			c.rmu.Unlock()
+			if errors.Is(decodeErr, ErrChunkTooLarge) {
+				return 0, c.overflow("ciphertext chunk")
+			}
+			return 0, decodeErr
+		}
+		if decodeErr == nil {
 			c.bufs.Dec = decrypted[:0]
-
 			c.cleanupToken.Do(func() {
 				if c.session != nil {
 					go c.session.deleteToken()
 				}
 			})
-
 			c.bufs.Read.Write(decrypted)
-			decoded = true
 			used := c.bufs.Noise.Len() - len(rest)
 			c.bufs.Noise.Next(used)
-		}
-		if decoded {
-			// Parsing above ran before this decryption pass. Revisit newly
-			// decrypted frames without waiting for another storage response.
 			c.rmu.Unlock()
+			// Drain framed plaintext before decrypting the next chunk.
 			continue
 		}
+		receiveBudget := c.cfg.limits().Pending - c.bufs.Noise.Len()
 		c.rmu.Unlock()
 
 		// Fetch more data
-		rawStream, err := c.transport.ReadRaw(ctx)
+		var rawStream io.ReadCloser
+		var err error
+		if reader, ok := c.transport.(limitedRawReader); ok {
+			rawStream, err = reader.ReadRawLimit(ctx, receiveBudget)
+		} else {
+			rawStream, err = c.transport.ReadRaw(ctx)
+		}
 		if err != nil {
+			if errors.Is(err, ErrBufferLimit) {
+				return 0, c.overflow("transport receive")
+			}
 			if errors.Is(err, ErrNoData) {
 				if err := c.idleWait(ctx); err != nil {
 					return 0, err
@@ -557,7 +589,17 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 			rawStream.Close()
 			close(bodyClosed)
 		})
-		_, err = c.bufs.Noise.ReadFrom(rawStream)
+		remaining := c.cfg.limits().Pending - c.bufs.Noise.Len()
+		_, err = c.bufs.Noise.ReadFrom(io.LimitReader(rawStream, int64(remaining)))
+		if err == nil {
+			var extra [1]byte
+			n, probeErr := io.ReadFull(rawStream, extra[:])
+			if n > 0 {
+				err = c.overflow("pending ciphertext")
+			} else if probeErr != io.EOF {
+				err = probeErr
+			}
+		}
 		if stopClose() {
 			rawStream.Close()
 		} else {
@@ -589,23 +631,42 @@ func (c *Conn) Write(p []byte) (int, error) {
 		return 0, c.ioError(ctx, err)
 	}
 
-	total := len(p)
-	c.wmu.Lock()
-	if c.bufs == nil || c.closed.Load() == 1 || c.closedWrite.Load() == 1 {
-		c.wmu.Unlock()
-		return 0, io.ErrClosedPipe
+	if err := lockIO(ctx, c.writeGate); err != nil {
+		return 0, c.ioError(ctx, err)
 	}
+	defer func() { <-c.writeGate }()
+	if len(p) == 0 {
+		return 0, c.ioError(ctx, c.flushContext(ctx))
+	}
+	accepted := 0
 	for len(p) > 0 {
-		chunkSize := min(len(p), int(c.mtu))
-		BuildFrame(&c.bufs.Write, Frame{Type: MsgTypeData, Payload: p[:chunkSize]})
-		p = p[chunkSize:]
+		c.wmu.Lock()
+		if c.bufs == nil || c.closed.Load() == 1 || c.closedWrite.Load() == 1 {
+			c.wmu.Unlock()
+			return accepted, io.ErrClosedPipe
+		}
+		if c.mtu <= 0 {
+			c.wmu.Unlock()
+			return accepted, c.overflow("transport capacity")
+		}
+		// Reserve a FIN header so shutdown never needs to exceed the allowance.
+		available := c.cfg.limits().Write - FrameHeaderSize - c.bufs.Write.Len()
+		for len(p) > 0 && available > FrameHeaderSize {
+			size := min(len(p), c.mtu)
+			if size+FrameHeaderSize > available {
+				break
+			}
+			BuildFrame(&c.bufs.Write, Frame{Type: MsgTypeData, Payload: p[:size]})
+			p = p[size:]
+			accepted += size
+			available -= size + FrameHeaderSize
+		}
+		c.wmu.Unlock()
+		if err := c.flushContext(ctx); err != nil {
+			return accepted, c.ioError(ctx, err)
+		}
 	}
-	c.wmu.Unlock()
-
-	if err := c.flushContext(ctx); err != nil {
-		return total, c.ioError(ctx, err)
-	}
-	return total, nil
+	return accepted, nil
 }
 
 // closeGracePeriod bounds the entire best-effort graceful close, including a
@@ -684,6 +745,9 @@ func (c *Conn) recycleBuffers() {
 }
 
 func (c *Conn) ioError(ctx context.Context, err error) error {
+	if failure := c.limitFailure.Load(); failure != nil {
+		return failure.err
+	}
 	if c.closed.Load() == 1 {
 		return net.ErrClosed
 	}
@@ -766,7 +830,9 @@ func (c *Conn) keepAlive() {
 					c.wmu.Unlock()
 					return
 				}
-				BuildFrame(&c.bufs.Write, Frame{Type: MsgTypePing})
+				if c.bufs.Write.Len()+2*FrameHeaderSize <= c.cfg.limits().Write {
+					BuildFrame(&c.bufs.Write, Frame{Type: MsgTypePing})
+				}
 				c.wmu.Unlock()
 				_ = c.flush()
 				continue
@@ -866,6 +932,12 @@ func (c *Conn) flushContext(ctx context.Context) error {
 // applying any rotation only once the write lands; a failure leaves both queued
 // for retry. Caller must hold flushGate and must not hold wmu.
 func (c *Conn) sendChunk(ctx context.Context, sealed []byte, consume int, rotate bool, seq uint64) (err error) {
+	if seq == ^uint64(0) {
+		return c.overflow("sequence exhausted")
+	}
+	if len(sealed) > c.cfg.limits().Retry {
+		return c.overflow("retry ciphertext")
+	}
 	sent := c.pending.valid && c.pending.sent
 	defer func() {
 		if err != nil {
@@ -878,6 +950,9 @@ func (c *Conn) sendChunk(ctx context.Context, sealed []byte, consume int, rotate
 	}()
 	if !sent {
 		if err = c.transport.WriteRaw(ctx, seq, bytes.NewReader(sealed)); err != nil {
+			if errors.Is(err, ErrBufferLimit) {
+				return c.overflow("transport write")
+			}
 			return err
 		}
 		sent = true
@@ -888,7 +963,7 @@ func (c *Conn) sendChunk(ctx context.Context, sealed []byte, consume int, rotate
 		}
 	}
 
-	c.pending.valid = false
+	c.pending = pendingChunk{}
 	c.chunkSeq = seq + 1
 
 	if consume > 0 {
@@ -939,10 +1014,18 @@ type metricsTransport struct {
 	m   Metrics
 }
 
-func newMetricsTransport(t Transport, m Metrics) *metricsTransport {
+type metricsLimitedTransport struct {
+	*metricsTransport
+	reader limitedRawReader
+}
+
+func newMetricsTransport(t Transport, m Metrics) Transport {
 	mt := &metricsTransport{Transport: t, m: m}
 	if r, ok := t.(Rotator); ok {
 		mt.rot = r
+	}
+	if reader, ok := t.(limitedRawReader); ok {
+		return &metricsLimitedTransport{metricsTransport: mt, reader: reader}
 	}
 	return mt
 }
@@ -965,6 +1048,15 @@ func (t *metricsTransport) WriteRaw(ctx context.Context, seq uint64, data io.Rea
 
 func (t *metricsTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 	rc, err := t.Transport.ReadRaw(ctx)
+	return t.recordRead(rc, err)
+}
+
+func (t *metricsLimitedTransport) ReadRawLimit(ctx context.Context, limit int) (io.ReadCloser, error) {
+	rc, err := t.reader.ReadRawLimit(ctx, limit)
+	return t.recordRead(rc, err)
+}
+
+func (t *metricsTransport) recordRead(rc io.ReadCloser, err error) (io.ReadCloser, error) {
 	if err == nil {
 		t.m.IncrementReadTransaction()
 		return &metricsReadCloser{ReadCloser: rc, m: t.m}, nil

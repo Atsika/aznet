@@ -87,6 +87,27 @@ The duration for which generated Shared Access Signature (SAS) tokens remain val
 
 ## Advanced Configuration
 
+### WithBufferLimits
+
+```go
+func WithBufferLimits(limits BufferLimits) Option
+```
+
+`BufferLimits` sets finite live-byte allowances per connection:
+
+| Field | Default | Ownership |
+| --- | --- | --- |
+| `Pending` | 8 MiB | Received ciphertext; a separate allowance also bounds Queue reassembly and Table prefetch |
+| `Decrypted` | 8 MiB | Decrypted framed bytes awaiting application reads |
+| `Write` | 4 MiB | Accepted framed plaintext, including control frames |
+| `Retry` | 4 MiB | One sealed outgoing chunk retained for an uncertain write |
+
+Large `Write` calls flush in bounded batches. Concurrent writers wait interruptibly before accepting bytes. On failure, the returned count identifies bytes owned by the connection; retry only `p[n:]`. Failed chunks retain their exact ciphertext and sequence. The effective MTU is also constrained by the write and retry allowances. One FIN header is reserved; redundant pings may be skipped when the buffer is full.
+
+Receive overflow returns `ErrBufferLimit`, cancels connection I/O, and remains terminal on subsequent operations. Call `Close` to dispose of the transport and session. Smaller receive limits can reject valid larger chunks from a peer; configure both endpoints accordingly. Nonpositive fields leave defaults unchanged; `Write` must fit two frame headers plus one byte and `Retry` must fit a framed byte plus encryption overhead.
+
+These are live-byte allowances, not a process-heap quota: buffer allocator capacity, encryption/decryption scratch, SDK JSON/base64 responses, and other connection state require additional finite memory. They do not bound unread cloud storage or implement ProxyBlob logical-stream flow control.
+
 ### WithContext
 
 ```go
