@@ -240,6 +240,8 @@ type tableStore struct {
 	deleteFailure   string
 	blockDelete     chan struct{}
 	peakRows        int
+	cleanupPasses   int
+	lastMethod      string
 }
 
 var rowKeyPattern = regexp.MustCompile(`RowKey='([0-9]+)'`)
@@ -249,6 +251,10 @@ func (s *tableStore) Do(r *http.Request) (*http.Response, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.requests[r.Method]++
+	if r.Method == http.MethodDelete && s.lastMethod != http.MethodDelete {
+		s.cleanupPasses++
+	}
+	s.lastMethod = r.Method
 	respond := func(code int, body string) (*http.Response, error) { return tableReadResponse(r, code, body), nil }
 	switch r.Method {
 	case http.MethodPost:
@@ -382,10 +388,10 @@ func TestTableConsumptionAndUncertainRetry(t *testing.T) {
 	if _, err := rx.ReadRaw(ctx); !errors.Is(err, ErrNoData) {
 		t.Fatal(err)
 	}
-	if len(s.rows) != 1 || s.rows[formatRowKey(1)] == nil {
+	if len(s.rows) != 2 || s.rows[formatRowKey(1)] == nil {
 		t.Fatal("latest uncertain write receipt deleted")
 	}
-	// This retry occurs after full consumption and reclamation of older rows.
+	// This retry occurs after full consumption, below the cleanup threshold.
 	if err := tx.WriteRaw(ctx, 1, strings.NewReader("second")); err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +408,7 @@ func TestTableConsumptionAndUncertainRetry(t *testing.T) {
 	if err := tx.WriteRaw(ctx, 0, strings.NewReader("first")); err != nil {
 		t.Fatal(err)
 	}
-	if s.requests[http.MethodPost] != before || len(s.rows) != 1 {
+	if s.requests[http.MethodPost] != before || len(s.rows) != 3 {
 		t.Fatal("confirmed retry recreated reclaimed data")
 	}
 }
@@ -411,13 +417,13 @@ func TestTablePartialDeletionFailures(t *testing.T) {
 	for _, uncertain := range []bool{false, true} {
 		t.Run(strconv.FormatBool(uncertain), func(t *testing.T) {
 			s, tx, rx := newTableStore(t)
-			for i := range 4 {
+			for i := range tableCleanupRows + 1 {
 				if err := tx.WriteRaw(context.Background(), uint64(i), strings.NewReader(strconv.Itoa(i))); err != nil {
 					t.Fatal(err)
 				}
 			}
-			if got := string(readTableBody(t, rx)); got != "0123" {
-				t.Fatal(got)
+			for rx.rxSeq < tableCleanupRows+1 {
+				readTableBody(t, rx)
 			}
 			if uncertain {
 				s.uncertainDelete = formatRowKey(1)
@@ -427,23 +433,88 @@ func TestTablePartialDeletionFailures(t *testing.T) {
 			if _, err := rx.ReadRaw(context.Background()); err == nil || errors.Is(err, ErrNoData) {
 				t.Fatalf("delete failure hidden: %v", err)
 			}
-			if rx.reclaimSeq != 1 || rx.rxSeq != 4 {
+			if rx.reclaimSeq != 1 || rx.rxSeq != tableCleanupRows+1 {
 				t.Fatal("failed deletion changed progress")
 			}
 			if _, err := rx.ReadRaw(context.Background()); !errors.Is(err, ErrNoData) {
 				t.Fatal(err)
 			}
-			if rx.reclaimSeq != 3 || len(s.rows) != 1 || s.requests[http.MethodDelete] != 4 {
+			if rx.reclaimSeq != tableCleanupRows || len(s.rows) != 1 || s.requests[http.MethodDelete] != tableCleanupRows+1 {
 				t.Fatal("deletion retry lost cursor or retained old rows")
 			}
 		})
 	}
 }
 
+func TestTableCleanupThresholdPreservesUncertainReceipt(t *testing.T) {
+	s, tx, rx := newTableStore(t)
+	ctx := context.Background()
+	for seq := range tableCleanupRows {
+		if err := tx.WriteRaw(ctx, uint64(seq), bytes.NewReader([]byte{byte(seq)})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var got []byte
+	for len(got) < tableCleanupRows {
+		got = append(got, readTableBody(t, rx)...)
+	}
+	for seq, value := range got {
+		if int(value) != seq {
+			t.Fatal("byte ordering")
+		}
+	}
+	// Sixteen consumed rows provide only fifteen eligible rows and one receipt.
+	for range 3 {
+		if _, err := rx.ReadRaw(ctx); !errors.Is(err, ErrNoData) {
+			t.Fatal(err)
+		}
+	}
+	if s.requests[http.MethodDelete] != 0 {
+		t.Fatal("idle polls cleaned below threshold")
+	}
+	seq := tableCleanupRows
+	s.uncertainWrite = formatRowKey(seq)
+	payload := []byte{byte(seq), byte(seq)}
+	if err := tx.WriteRaw(ctx, uint64(seq), bytes.NewReader(payload)); err == nil {
+		t.Fatal("expected lost write response")
+	}
+	body, err := rx.ReadRaw(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := make([]byte, 1)
+	if _, err := io.ReadFull(body, first); err != nil {
+		t.Fatal(err)
+	}
+	body.Close()
+	if s.requests[http.MethodDelete] != 0 || rx.rxSeq != seq {
+		t.Fatal("partial consumption triggered cleanup")
+	}
+	if tail := readTableBody(t, rx); !bytes.Equal(append(first, tail...), payload) {
+		t.Fatal("partial-read identity")
+	}
+	if _, err := rx.ReadRaw(ctx); !errors.Is(err, ErrNoData) {
+		t.Fatal(err)
+	}
+	if s.cleanupPasses != 1 || s.requests[http.MethodDelete] != tableCleanupRows || len(s.rows) != 1 || s.rows[formatRowKey(seq)] == nil {
+		t.Fatal("threshold cleanup lost receipt or wrong range")
+	}
+	// The latest uncertain write still collides byte-for-byte after cleanup.
+	if err := tx.WriteRaw(ctx, uint64(seq), bytes.NewReader(payload)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.WriteRaw(ctx, 0, bytes.NewReader([]byte{0})); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.rows) != 1 {
+		t.Fatal("confirmed old retry recreated reclaimed row")
+	}
+}
+
 func TestTableReclamationShutdown(t *testing.T) {
 	s, tx, rx := newTableStore(t)
 	a, b := reviewNoise(t)
-	for i := range 2 {
+	for i := range tableCleanupRows + 1 {
 		var frame bytes.Buffer
 		BuildFrame(&frame, Frame{Type: MsgTypeData, Payload: []byte{byte(i)}})
 		raw, _ := a.SealData(nil, frame.Bytes())
@@ -455,7 +526,7 @@ func TestTableReclamationShutdown(t *testing.T) {
 	// Give Close a real SDK writer. Its request waits behind the blocked delete
 	// until the bounded Close cancels connection I/O.
 	rx.txClient = tx.txClient
-	if _, err := io.ReadFull(c, make([]byte, 2)); err != nil {
+	if _, err := io.ReadFull(c, make([]byte, tableCleanupRows+1)); err != nil {
 		t.Fatal(err)
 	}
 	entered := make(chan struct{})
@@ -511,8 +582,8 @@ func TestTableConnUncertainWriteAfterConsumption(t *testing.T) {
 	if _, err := rx.ReadRaw(context.Background()); !errors.Is(err, ErrNoData) {
 		t.Fatal(err)
 	}
-	if len(s.rows) != 1 {
-		t.Fatal("old ciphertext retained after successor consumption")
+	if len(s.rows) != 2 || s.requests[http.MethodDelete] != 0 {
+		t.Fatal("cleanup ran below threshold")
 	}
 }
 
@@ -537,8 +608,8 @@ func TestTableReclamationRequestMeasurement(t *testing.T) {
 				if _, err := rx.ReadRaw(context.Background()); !errors.Is(err, ErrNoData) {
 					t.Fatal(err)
 				}
-				if len(s.rows) != 1 || s.requests[http.MethodDelete] != count-1 {
-					t.Fatal("rows not reclaimed")
+				if len(s.rows) != count || s.requests[http.MethodDelete] != 0 {
+					t.Fatal("cleanup ran below threshold")
 				}
 				t.Logf("chunks=%d payload=%d prefetch=%d peak_rows=%d retained=%d GET=%d POST=%d DELETE=%d", count, size, rows, s.peakRows, len(s.rows), s.requests[http.MethodGet], s.requests[http.MethodPost], s.requests[http.MethodDelete])
 			})
@@ -626,10 +697,10 @@ func TestTableSlowConsumerRetainsUnreadRows(t *testing.T) {
 					if _, err := rx.ReadRaw(context.Background()); !errors.Is(err, ErrNoData) {
 						t.Fatal(err)
 					}
-					if len(s.rows) != 1 {
-						t.Fatal("consumed rows retained")
+					if len(s.rows) > tableCleanupRows || s.cleanupPasses != 3 {
+						t.Fatal("cleanup threshold did not bound retained rows/passes")
 					}
-					t.Logf("connections=%d peak_unread_rows=%d retained=%d GET=%d POST=%d DELETE=%d", concurrency, s.peakRows, len(s.rows), s.requests[http.MethodGet], s.requests[http.MethodPost], s.requests[http.MethodDelete])
+					t.Logf("connections=%d peak_unread_rows=%d retained=%d GET=%d POST=%d DELETE=%d cleanup_passes=%d", concurrency, s.peakRows, len(s.rows), s.requests[http.MethodGet], s.requests[http.MethodPost], s.requests[http.MethodDelete], s.cleanupPasses)
 				})
 			}
 		})

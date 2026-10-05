@@ -22,6 +22,10 @@ const tableDriverName = "aztable"
 // tableReadRows amortizes queries without exposing storage tuning in Config.
 const tableReadRows = 4
 
+// tableCleanupRows defers deletion until a modest backlog has accumulated.
+// The newest consumed row is never included: it remains the retry receipt.
+const tableCleanupRows = 16
+
 // MaxTableBinaryPropertySize is the maximum size (64 KiB) for a single Edm.Binary property.
 const MaxTableBinaryPropertySize = 64 * 1024
 
@@ -315,6 +319,7 @@ type tableTransport struct {
 	ends               []int
 	rxSeq              int
 	reclaimSeq         int
+	reclaimEnd         int
 	position           int
 	txConfirmed        uint64
 	mu                 sync.Mutex
@@ -377,9 +382,13 @@ func (t *tableTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 	// Consumption alone is insufficient: keep the newest row as the retry
 	// receipt. Consuming its successor proves the serialized writer advanced
 	// beyond it, so that row can no longer be the uncertain outgoing chunk.
-	// A failed deletion leaves this cursor unchanged, including an uncertain
-	// successful delete; 404 on the next attempt counts as success.
-	for t.reclaimSeq < t.rxSeq-1 {
+	// Start only at the threshold. Once started, finish the captured range even
+	// if a partial failure leaves fewer rows than the threshold. A failed delete
+	// keeps its cursor; 404 reconciles an uncertain successful delete on retry.
+	if t.reclaimSeq == t.reclaimEnd && t.rxSeq-1-t.reclaimSeq >= tableCleanupRows {
+		t.reclaimEnd = t.rxSeq - 1
+	}
+	for t.reclaimSeq < t.reclaimEnd {
 		_, err := t.rxClient.DeleteEntity(ctx, "data", formatRowKey(t.reclaimSeq), nil)
 		if err = missingDelete(err); err != nil {
 			return nil, fmt.Errorf("reclaim table row %d: %w", t.reclaimSeq, err)

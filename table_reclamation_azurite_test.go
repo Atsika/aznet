@@ -48,7 +48,7 @@ func TestAzuriteTableReclamation(t *testing.T) {
 	}
 	for _, pair := range [][2]Transport{{client, server}, {server, client}} {
 		tx, rx := pair[0].(*tableTransport), pair[1].(*tableTransport)
-		for seq := range 8 {
+		for seq := range tableCleanupRows + 1 {
 			payload := bytes.Repeat([]byte{byte(seq)}, 128)
 			if err := tx.WriteRaw(ctx, uint64(seq), bytes.NewReader(payload)); err != nil {
 				t.Fatal(err)
