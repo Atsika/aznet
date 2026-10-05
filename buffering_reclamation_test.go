@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"regexp"
 	"sort"
@@ -242,6 +243,8 @@ type tableStore struct {
 	peakRows        int
 	cleanupPasses   int
 	lastMethod      string
+	batchFailure    bool
+	uncertainBatch  bool
 }
 
 var rowKeyPattern = regexp.MustCompile(`RowKey='([0-9]+)'`)
@@ -251,10 +254,23 @@ func (s *tableStore) Do(r *http.Request) (*http.Response, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.requests[r.Method]++
-	if r.Method == http.MethodDelete && s.lastMethod != http.MethodDelete {
+	isBatch := strings.HasSuffix(r.URL.Path, "/$batch")
+	if isBatch {
+		s.requests["BATCH"]++
+		s.cleanupPasses++
+	} else if r.Method == http.MethodDelete && s.lastMethod != http.MethodDelete {
 		s.cleanupPasses++
 	}
 	s.lastMethod = r.Method
+	if (isBatch || r.Method == http.MethodDelete) && s.blockDelete != nil {
+		close(s.blockDelete)
+		s.blockDelete = nil
+		<-r.Context().Done()
+		return nil, r.Context().Err()
+	}
+	if isBatch {
+		return s.batchLocked(r)
+	}
 	respond := func(code int, body string) (*http.Response, error) { return tableReadResponse(r, code, body), nil }
 	switch r.Method {
 	case http.MethodPost:
@@ -281,12 +297,6 @@ func (s *tableStore) Do(r *http.Request) (*http.Response, error) {
 		return respond(204, "")
 	case http.MethodDelete:
 		key := rowKeyPattern.FindStringSubmatch(r.URL.Path)[1]
-		if s.blockDelete != nil {
-			close(s.blockDelete)
-			s.blockDelete = nil
-			<-r.Context().Done()
-			return nil, r.Context().Err()
-		}
 		if s.deleteFailure == key {
 			s.deleteFailure = ""
 			return respond(403, `{"odata.error":{"code":"AuthorizationFailure","message":{"value":"injected"}}}`)
@@ -319,6 +329,51 @@ func (s *tableStore) Do(r *http.Request) (*http.Response, error) {
 		return respond(200, `{"value":[`+strings.Join(entities, ",")+`]}`)
 	}
 	return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL)
+}
+
+func (s *tableStore) batchLocked(r *http.Request) (*http.Response, error) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, err
+	}
+	decoded, err := url.PathUnescape(string(body))
+	if err != nil {
+		return nil, err
+	}
+	keys := rowKeyPattern.FindAllStringSubmatch(decoded, -1)
+	if len(keys) == 0 || len(keys) > 100 || strings.Count(decoded, "DELETE ") != len(keys) || strings.Count(decoded, "PartitionKey='data'") != len(keys) {
+		return nil, errors.New("invalid batch delete actions")
+	}
+	if s.batchFailure {
+		s.batchFailure = false
+		return tableBatchResponse(r, 403, 1), nil
+	}
+	// A missing entity rolls back the entire change set, not just that row.
+	for _, key := range keys {
+		if _, exists := s.rows[key[1]]; !exists {
+			return tableBatchResponse(r, 404, 1), nil
+		}
+	}
+	for _, key := range keys {
+		delete(s.rows, key[1])
+	}
+	if s.uncertainBatch {
+		s.uncertainBatch = false
+		return nil, io.ErrUnexpectedEOF
+	}
+	return tableBatchResponse(r, 204, len(keys)), nil
+}
+
+func tableBatchResponse(r *http.Request, status, count int) *http.Response {
+	var body strings.Builder
+	body.WriteString("--batchresponse\r\nContent-Type: multipart/mixed; boundary=changesetresponse\r\n\r\n")
+	for range count {
+		fmt.Fprintf(&body, "--changesetresponse\r\nContent-Type: application/http\r\nContent-Transfer-Encoding: binary\r\n\r\nHTTP/1.1 %d %s\r\nContent-Length: 0\r\n\r\n\r\n", status, http.StatusText(status))
+	}
+	body.WriteString("--changesetresponse--\r\n--batchresponse--\r\n")
+	resp := tableReadResponse(r, http.StatusAccepted, body.String())
+	resp.Header.Set("Content-Type", "multipart/mixed; boundary=batchresponse")
+	return resp
 }
 
 func newTableStore(t *testing.T) (*tableStore, *tableTransport, *tableTransport) {
@@ -425,6 +480,13 @@ func TestTablePartialDeletionFailures(t *testing.T) {
 			for rx.rxSeq < tableCleanupRows+1 {
 				readTableBody(t, rx)
 			}
+			s.batchFailure = true
+			if _, err := rx.ReadRaw(context.Background()); err == nil || errors.Is(err, ErrNoData) {
+				t.Fatalf("batch failure hidden: %v", err)
+			}
+			if rx.reclaimSeq != 0 || len(s.rows) != tableCleanupRows+1 {
+				t.Fatal("failed atomic batch advanced or partially committed")
+			}
 			if uncertain {
 				s.uncertainDelete = formatRowKey(1)
 			} else {
@@ -441,6 +503,71 @@ func TestTablePartialDeletionFailures(t *testing.T) {
 			}
 			if rx.reclaimSeq != tableCleanupRows || len(s.rows) != 1 || s.requests[http.MethodDelete] != tableCleanupRows+1 {
 				t.Fatal("deletion retry lost cursor or retained old rows")
+			}
+		})
+	}
+}
+
+func TestTableBatchReconciliation(t *testing.T) {
+	for _, lostResponse := range []bool{false, true} {
+		t.Run(strconv.FormatBool(lostResponse), func(t *testing.T) {
+			s, tx, rx := newTableStore(t)
+			ctx := context.Background()
+			for seq := range tableCleanupRows + 1 {
+				if err := tx.WriteRaw(ctx, uint64(seq), bytes.NewReader([]byte{byte(seq)})); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var got []byte
+			for rx.rxSeq < tableCleanupRows+1 {
+				got = append(got, readTableBody(t, rx)...)
+			}
+			for seq, value := range got {
+				if int(value) != seq {
+					t.Fatal("byte ordering")
+				}
+			}
+			if lostResponse {
+				s.uncertainBatch = true
+			} else {
+				delete(s.rows, formatRowKey(7))
+			}
+			if _, err := rx.ReadRaw(ctx); err == nil || errors.Is(err, ErrNoData) {
+				t.Fatalf("batch error hidden: %v", err)
+			}
+			wantRows := tableCleanupRows
+			if lostResponse {
+				wantRows = 1
+			}
+			if rx.reclaimSeq != 0 || len(s.rows) != wantRows {
+				t.Fatal("unknown batch outcome advanced cursor or atomic rollback failed")
+			}
+			if _, err := rx.ReadRaw(ctx); !errors.Is(err, ErrNoData) {
+				t.Fatal(err)
+			}
+			if rx.reclaimSeq != tableCleanupRows || len(s.rows) != 1 || s.rows[formatRowKey(tableCleanupRows)] == nil || s.requests["BATCH"] != 1 || s.requests[http.MethodDelete] != tableCleanupRows {
+				t.Fatal("batch reconciliation lost range or latest receipt")
+			}
+			// A later cleanup range returns to batching after reconciliation completes.
+			for seq := tableCleanupRows + 1; seq < 2*tableCleanupRows+1; seq++ {
+				if err := tx.WriteRaw(ctx, uint64(seq), bytes.NewReader([]byte{byte(seq)})); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got = nil
+			for rx.rxSeq < 2*tableCleanupRows+1 {
+				got = append(got, readTableBody(t, rx)...)
+			}
+			for i, value := range got {
+				if int(value) != tableCleanupRows+1+i {
+					t.Fatal("ordering after reconciliation")
+				}
+			}
+			if _, err := rx.ReadRaw(ctx); !errors.Is(err, ErrNoData) {
+				t.Fatal(err)
+			}
+			if s.requests["BATCH"] != 2 || s.requests[http.MethodDelete] != tableCleanupRows || len(s.rows) != 1 {
+				t.Fatal("subsequent cleanup did not return to batching")
 			}
 		})
 	}
@@ -496,7 +623,7 @@ func TestTableCleanupThresholdPreservesUncertainReceipt(t *testing.T) {
 	if _, err := rx.ReadRaw(ctx); !errors.Is(err, ErrNoData) {
 		t.Fatal(err)
 	}
-	if s.cleanupPasses != 1 || s.requests[http.MethodDelete] != tableCleanupRows || len(s.rows) != 1 || s.rows[formatRowKey(seq)] == nil {
+	if s.cleanupPasses != 1 || s.requests["BATCH"] != 1 || s.requests[http.MethodDelete] != 0 || len(s.rows) != 1 || s.rows[formatRowKey(seq)] == nil {
 		t.Fatal("threshold cleanup lost receipt or wrong range")
 	}
 	// The latest uncertain write still collides byte-for-byte after cleanup.
@@ -700,7 +827,7 @@ func TestTableSlowConsumerRetainsUnreadRows(t *testing.T) {
 					if len(s.rows) > tableCleanupRows || s.cleanupPasses != 3 {
 						t.Fatal("cleanup threshold did not bound retained rows/passes")
 					}
-					t.Logf("connections=%d peak_unread_rows=%d retained=%d GET=%d POST=%d DELETE=%d cleanup_passes=%d", concurrency, s.peakRows, len(s.rows), s.requests[http.MethodGet], s.requests[http.MethodPost], s.requests[http.MethodDelete], s.cleanupPasses)
+					t.Logf("connections=%d peak_unread_rows=%d retained=%d GET=%d POST=%d DELETE=%d BATCH=%d cleanup_passes=%d", concurrency, s.peakRows, len(s.rows), s.requests[http.MethodGet], s.requests[http.MethodPost], s.requests[http.MethodDelete], s.requests["BATCH"], s.cleanupPasses)
 				})
 			}
 		})

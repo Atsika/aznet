@@ -326,6 +326,7 @@ type tableTransport struct {
 	txMu               sync.Mutex
 	active             bool
 	txHasConfirmed     bool
+	reclaimSingles     bool
 }
 
 // WriteRaw is serialized by Conn. Keep the confirmed high-water mark locally so
@@ -388,6 +389,24 @@ func (t *tableTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 	if t.reclaimSeq == t.reclaimEnd && t.rxSeq-1-t.reclaimSeq >= tableCleanupRows {
 		t.reclaimEnd = t.rxSeq - 1
 	}
+	for t.reclaimSeq < t.reclaimEnd && !t.reclaimSingles {
+		// Deletes contain only keys. The normal range is at most the threshold
+		// plus one prefetch page, comfortably below Azure's 100-action/4 MiB cap.
+		end := min(t.reclaimEnd, t.reclaimSeq+100)
+		actions := make([]aztables.TransactionAction, 0, end-t.reclaimSeq)
+		for seq := t.reclaimSeq; seq < end; seq++ {
+			entity, _ := buildTableEntity("data", formatRowKey(seq), nil)
+			actions = append(actions, aztables.TransactionAction{ActionType: aztables.TransactionTypeDelete, Entity: entity})
+		}
+		if _, err := t.rxClient.SubmitTransaction(ctx, actions, nil); err != nil {
+			// A missing row rejects the entire atomic batch. A lost response may
+			// instead mean every delete committed. Surface the error now; the next
+			// call reconciles each row (404 included) without guessing the outcome.
+			t.reclaimSingles = true
+			return nil, fmt.Errorf("reclaim table batch [%d,%d): %w", t.reclaimSeq, end, err)
+		}
+		t.reclaimSeq = end
+	}
 	for t.reclaimSeq < t.reclaimEnd {
 		_, err := t.rxClient.DeleteEntity(ctx, "data", formatRowKey(t.reclaimSeq), nil)
 		if err = missingDelete(err); err != nil {
@@ -395,6 +414,7 @@ func (t *tableTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 		}
 		t.reclaimSeq++
 	}
+	t.reclaimSingles = false
 	if t.rxSeq >= 1_000_000_000 {
 		return nil, fmt.Errorf("table receive sequence exhausted: %w", ErrBufferLimit)
 	}

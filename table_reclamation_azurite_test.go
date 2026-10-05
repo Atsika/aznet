@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/google/uuid"
 )
 
@@ -64,7 +65,20 @@ func TestAzuriteTableReclamation(t *testing.T) {
 			}
 		}
 		if _, err := rx.ReadRaw(ctx); !errors.Is(err, ErrNoData) {
-			t.Fatal(err)
+			// Azurite 3.34.0 authenticates the outer $batch as a table named
+			// "$batch", rejecting table-scoped SAS. Exercise reconciliation
+			// only for that observed error; shared-key batching must succeed.
+			var responseErr *azcore.ResponseError
+			if rx != client || !errors.As(err, &responseErr) || responseErr.StatusCode != 403 || responseErr.ErrorCode != "AuthorizationFailure" {
+				t.Fatal(err)
+			}
+			if rx.reclaimSeq != 0 || !rx.reclaimSingles {
+				t.Fatal("failed batch advanced cleanup")
+			}
+			t.Log("Azurite rejected table-SAS batch: validating individual reconciliation; live Azure SAS batch remains unvalidated")
+			if _, err := rx.ReadRaw(ctx); !errors.Is(err, ErrNoData) {
+				t.Fatal(err)
+			}
 		}
 		if err := tx.WriteRaw(ctx, 0, bytes.NewReader(bytes.Repeat([]byte{0}, 128))); err != nil {
 			t.Fatal(err)
