@@ -108,18 +108,6 @@ Receive overflow returns `ErrBufferLimit`, cancels connection I/O, and remains t
 
 These are live-byte allowances, not a process-heap quota: buffer allocator capacity, encryption/decryption scratch, SDK JSON/base64 responses, and other connection state require additional finite memory. They do not bound unread cloud storage or implement ProxyBlob logical-stream flow control.
 
-### WithTableReadRows
-
-```go
-func WithTableReadRows(rows int) Option
-```
-
-Caps each Table fetch at 1–100 rows (default 4). The `Pending` allowance further reduces prefetch based on the maximum 960 KiB entity size. With a smaller allowance, one row is fetched and its decoded size checked. Four rows allow up to 3.75 MiB of decoded prefetch while amortizing query requests; eight rows double that allowance for only one fewer query per eight continuously available rows. Each reclaimed row adds one delete request, excluding SDK retries. These are operation counts, not Azure billing estimates.
-
-Table rows are reclaimed only after their bytes **and a successor row's bytes** have been consumed by the connection. The newest consumed row remains as the receipt for an uncertain write. Cleanup occurs on the next fetch; failures are returned and retried from the failed row on a later read. At an idle frontier, one receipt plus at most one consumed page remains until the next fetch or session cleanup. Unread rows remain in storage.
-
-Table session receive SAS now includes `Delete`. Upgrade the listener before creating sessions with a new client; older read-only session tokens cannot perform reclamation. There is no token refresh or resumed-session protocol. Sequence keys retain the existing nine-digit format and fail explicitly before wrapping.
-
 ### WithContext
 
 ```go

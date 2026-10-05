@@ -19,6 +19,9 @@ import (
 
 const tableDriverName = "aztable"
 
+// tableReadRows amortizes queries without exposing storage tuning in Config.
+const tableReadRows = 4
+
 // MaxTableBinaryPropertySize is the maximum size (64 KiB) for a single Edm.Binary property.
 const MaxTableBinaryPropertySize = 64 * 1024
 
@@ -386,11 +389,7 @@ func (t *tableTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 	if t.rxSeq >= 1_000_000_000 {
 		return nil, fmt.Errorf("table receive sequence exhausted: %w", ErrBufferLimit)
 	}
-	rows := 4
-	if t.cfg != nil && t.cfg.tableReadRows > 0 {
-		rows = t.cfg.tableReadRows
-	}
-	rows = min(rows, max(1, t.cfg.limits().Pending/MaxTableEntitySize))
+	rows := min(tableReadRows, max(1, t.cfg.limits().Pending/MaxTableEntitySize))
 	pager := t.rxClient.NewListEntitiesPager(&aztables.ListEntitiesOptions{Filter: to.Ptr("PartitionKey eq 'data' and RowKey ge '" + formatRowKey(t.rxSeq) + "'"), Top: to.Ptr(int32(rows))})
 	if !pager.More() {
 		return nil, ErrNoData

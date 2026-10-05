@@ -208,7 +208,7 @@ func TestRepeatedWriteFailuresStayBounded(t *testing.T) {
 }
 
 func TestTableByteBoundAndSequenceExhaustion(t *testing.T) {
-	s, tx, rx := newTableStore(t, 4)
+	s, tx, rx := newTableStore(t)
 	if err := tx.WriteRaw(context.Background(), 0, strings.NewReader("123456789")); err != nil {
 		t.Fatal(err)
 	}
@@ -315,7 +315,7 @@ func (s *tableStore) Do(r *http.Request) (*http.Response, error) {
 	return nil, fmt.Errorf("unexpected request %s %s", r.Method, r.URL)
 }
 
-func newTableStore(t *testing.T, rows int) (*tableStore, *tableTransport, *tableTransport) {
+func newTableStore(t *testing.T) (*tableStore, *tableTransport, *tableTransport) {
 	t.Helper()
 	s := &tableStore{rows: make(map[string]json.RawMessage), requests: make(map[string]int)}
 	client, err := aztables.NewClientWithNoCredential("https://table.invalid/session", &aztables.ClientOptions{ClientOptions: azcore.ClientOptions{
@@ -324,7 +324,7 @@ func newTableStore(t *testing.T, rows int) (*tableStore, *tableTransport, *table
 	if err != nil {
 		t.Fatal(err)
 	}
-	cfg := applyConfig([]Option{WithPing(0), WithTableReadRows(rows)})
+	cfg := applyConfig([]Option{WithPing(0)})
 	t.Cleanup(cfg.cancel)
 	return s, &tableTransport{txClient: client, cfg: cfg}, &tableTransport{rxClient: client, cfg: cfg}
 }
@@ -346,7 +346,7 @@ func readTableBody(t *testing.T, tr *tableTransport) []byte {
 }
 
 func TestTableConsumptionAndUncertainRetry(t *testing.T) {
-	s, tx, rx := newTableStore(t, 4)
+	s, tx, rx := newTableStore(t)
 	ctx := context.Background()
 	s.uncertainWrite = formatRowKey(0)
 	if err := tx.WriteRaw(ctx, 0, strings.NewReader("first")); err == nil {
@@ -410,7 +410,7 @@ func TestTableConsumptionAndUncertainRetry(t *testing.T) {
 func TestTablePartialDeletionFailures(t *testing.T) {
 	for _, uncertain := range []bool{false, true} {
 		t.Run(strconv.FormatBool(uncertain), func(t *testing.T) {
-			s, tx, rx := newTableStore(t, 4)
+			s, tx, rx := newTableStore(t)
 			for i := range 4 {
 				if err := tx.WriteRaw(context.Background(), uint64(i), strings.NewReader(strconv.Itoa(i))); err != nil {
 					t.Fatal(err)
@@ -441,7 +441,7 @@ func TestTablePartialDeletionFailures(t *testing.T) {
 }
 
 func TestTableReclamationShutdown(t *testing.T) {
-	s, tx, rx := newTableStore(t, 4)
+	s, tx, rx := newTableStore(t)
 	a, b := reviewNoise(t)
 	for i := range 2 {
 		var frame bytes.Buffer
@@ -484,7 +484,7 @@ func TestTableReclamationShutdown(t *testing.T) {
 }
 
 func TestTableConnUncertainWriteAfterConsumption(t *testing.T) {
-	s, tx, rx := newTableStore(t, 4)
+	s, tx, rx := newTableStore(t)
 	a, b := reviewNoise(t)
 	sender, receiver := reviewConn(tx, a), reviewConn(rx, b)
 	defer sender.cancel()
@@ -517,10 +517,11 @@ func TestTableConnUncertainWriteAfterConsumption(t *testing.T) {
 }
 
 func TestTableReclamationRequestMeasurement(t *testing.T) {
-	for _, rows := range []int{1, 4, 8} {
+	for _, rows := range []int{1, 4} {
 		for _, size := range []int{64, 32 << 10, MaxTableEntitySize} {
 			t.Run(fmt.Sprintf("rows%d_bytes%d", rows, size), func(t *testing.T) {
-				s, tx, rx := newTableStore(t, rows)
+				s, tx, rx := newTableStore(t)
+				WithBufferLimits(BufferLimits{Pending: rows * MaxTableEntitySize})(rx.cfg)
 				payload := bytes.Repeat([]byte{42}, size)
 				const count = 16
 				for batch := 0; batch < count; batch += rows {
@@ -603,7 +604,7 @@ func TestTableSlowConsumerRetainsUnreadRows(t *testing.T) {
 			for i := range concurrency {
 				t.Run(strconv.Itoa(i), func(t *testing.T) {
 					t.Parallel()
-					s, tx, rx := newTableStore(t, 4)
+					s, tx, rx := newTableStore(t)
 					const count = 64
 					for seq := range count {
 						if err := tx.WriteRaw(context.Background(), uint64(seq), bytes.NewReader([]byte{byte(seq)})); err != nil {

@@ -38,7 +38,7 @@ flowchart LR
 ```
 
 1. **Write Path**: Data is encrypted and split into up to 15 binary properties (`Data`, `Data01`...`Data14`) within a single table entity. This allows storing up to **960 KiB** per entity while staying under the 1 MiB limit.
-2. **Read Path**: The reader queries the table using a sequence-based `RowKey`. To optimize performance, the driver pre-fetches up to **10 entities** in a single query using the `ge` (greater or equal) operator.
+2. **Read Path**: The reader queries the table using a sequence-based `RowKey`. The driver prefetches up to **four entities** per query using the `ge` (greater or equal) operator. The generic pending-byte allowance may reduce that batch size.
 
 ## Resource Usage
 
@@ -71,7 +71,7 @@ Unlike Queue storage, Table Storage doesn't have a built-in "pop" mechanism.
 
 1. Writing entities with incrementing, padded `RowKey` values.
 2. Reading entities using a filter: `PartitionKey eq 'data' and RowKey ge '<next_expected_seq>'`.
-3. **Pre-fetching**: The driver requests up to 10 entities at once (`Top: 10`). If the returned entities are strictly sequential, they are processed as a single batch, significantly reducing the number of round-trips to Azure.
+3. **Pre-fetching**: The driver requests up to four entities at once, subject to the pending-byte allowance. If the returned entities are strictly sequential, they are processed as a single batch, significantly reducing the number of round-trips to Azure.
 
 ## Performance
 
@@ -92,3 +92,11 @@ The `aztable` driver has been optimized to handle larger payloads and reduce lat
 - **Highest Cost**: More expensive than both Queue and Blob storage per unit of data.
 - **Lower Performance**: Slower than `azblob` due to entity management and querying overhead.
 - **Not Recommended**: For most use cases, `azblob` (speed) or `azqueue` (cost) is a better choice.
+
+## Bounded buffering and reclamation
+
+Prefetch is an internal driver policy, not a public configuration option. The generic `WithBufferLimits` pending-byte allowance can reduce the page size; four maximum-sized rows require at most 3.75 MiB of decoded prefetch.
+
+Table rows are reclaimed only after their bytes **and a successor row's bytes** have been consumed by the connection. The newest consumed row remains as the receipt for an uncertain write. Cleanup occurs on the next fetch; failures are returned and retried from the failed row on a later read. At an idle frontier, one receipt plus at most one consumed page remains until the next fetch or session cleanup. Unread rows remain in storage.
+
+Table session receive SAS now includes `Delete`. Upgrade the listener before creating sessions with a new client; older read-only session tokens cannot perform reclamation. There is no token refresh or resumed-session protocol. Sequence keys retain the existing nine-digit format and fail explicitly before wrapping.

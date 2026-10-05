@@ -63,7 +63,6 @@ type Config struct {
 	connectTimeout time.Duration
 	idleTimeout    time.Duration
 	bufferLimits   BufferLimits
-	tableReadRows  int
 }
 
 // Validate checks if the configuration is sane and valid.
@@ -96,7 +95,6 @@ func defaultConfig() *Config {
 		connectTimeout:    DefaultConnectTimeout,
 		idleTimeout:       DefaultIdleTimeout,
 		bufferLimits:      DefaultBufferLimits(),
-		tableReadRows:     4,
 	}
 }
 
@@ -243,16 +241,6 @@ func WithBufferLimits(limits BufferLimits) Option {
 		}
 		if limits.Retry >= NoiseOverhead+FrameHeaderSize+1 {
 			c.bufferLimits.Retry = limits.Retry
-		}
-	}
-}
-
-// WithTableReadRows caps Table prefetch at 1..100 rows. The Pending byte
-// allowance further reduces the page size using the maximum entity size.
-func WithTableReadRows(rows int) Option {
-	return func(c *Config) {
-		if rows > 0 && rows <= 100 {
-			c.tableReadRows = rows
 		}
 	}
 }
