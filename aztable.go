@@ -22,9 +22,9 @@ const tableDriverName = "aztable"
 // tableReadRows amortizes queries without exposing storage tuning in Config.
 const tableReadRows = 4
 
-// tableCleanupRows defers deletion until a modest backlog has accumulated.
+// tableCleanupRows amortizes cleanup over a full Azure transaction.
 // The newest consumed row is never included: it remains the retry receipt.
-const tableCleanupRows = 16
+const tableCleanupRows = 100
 
 // MaxTableBinaryPropertySize is the maximum size (64 KiB) for a single Edm.Binary property.
 const MaxTableBinaryPropertySize = 64 * 1024
@@ -387,11 +387,11 @@ func (t *tableTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 	// if a partial failure leaves fewer rows than the threshold. A failed delete
 	// keeps its cursor; 404 reconciles an uncertain successful delete on retry.
 	if t.reclaimSeq == t.reclaimEnd && t.rxSeq-1-t.reclaimSeq >= tableCleanupRows {
-		t.reclaimEnd = t.rxSeq - 1
+		t.reclaimEnd = t.reclaimSeq + tableCleanupRows
 	}
 	for t.reclaimSeq < t.reclaimEnd && !t.reclaimSingles {
-		// Deletes contain only keys. The normal range is at most the threshold
-		// plus one prefetch page, comfortably below Azure's 100-action/4 MiB cap.
+		// Capture only a full 100-row batch, leaving any prefetched remainder
+		// for the next cleanup. Key-only actions stay below the 4 MiB cap.
 		end := min(t.reclaimEnd, t.reclaimSeq+100)
 		actions := make([]aztables.TransactionAction, 0, end-t.reclaimSeq)
 		for seq := t.reclaimSeq; seq < end; seq++ {

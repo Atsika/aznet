@@ -590,13 +590,13 @@ func TestTableCleanupThresholdPreservesUncertainReceipt(t *testing.T) {
 			t.Fatal("byte ordering")
 		}
 	}
-	// Sixteen consumed rows provide only fifteen eligible rows and one receipt.
+	// At the threshold, one consumed row is still the protected retry receipt.
 	for range 3 {
 		if _, err := rx.ReadRaw(ctx); !errors.Is(err, ErrNoData) {
 			t.Fatal(err)
 		}
 	}
-	if s.requests[http.MethodDelete] != 0 {
+	if s.requests[http.MethodDelete] != 0 || s.requests["BATCH"] != 0 {
 		t.Fatal("idle polls cleaned below threshold")
 	}
 	seq := tableCleanupRows
@@ -797,37 +797,41 @@ func TestWriteAllowanceMeasurement(t *testing.T) {
 }
 
 func TestTableSlowConsumerRetainsUnreadRows(t *testing.T) {
-	for _, concurrency := range []int{1, 8} {
-		t.Run(strconv.Itoa(concurrency), func(t *testing.T) {
-			for i := range concurrency {
-				t.Run(strconv.Itoa(i), func(t *testing.T) {
-					t.Parallel()
-					s, tx, rx := newTableStore(t)
-					const count = 64
-					for seq := range count {
-						if err := tx.WriteRaw(context.Background(), uint64(seq), bytes.NewReader([]byte{byte(seq)})); err != nil {
-							t.Fatal(err)
-						}
+	for _, count := range []int{64, 304} {
+		t.Run(strconv.Itoa(count), func(t *testing.T) {
+			for _, concurrency := range []int{1, 8} {
+				t.Run(strconv.Itoa(concurrency), func(t *testing.T) {
+					for i := range concurrency {
+						t.Run(strconv.Itoa(i), func(t *testing.T) {
+							t.Parallel()
+							s, tx, rx := newTableStore(t)
+							for seq := range count {
+								if err := tx.WriteRaw(context.Background(), uint64(seq), bytes.NewReader([]byte{byte(seq)})); err != nil {
+									t.Fatal(err)
+								}
+							}
+							if len(s.rows) != count || s.requests[http.MethodDelete] != 0 {
+								t.Fatal("unread data reclaimed")
+							}
+							var got []byte
+							for len(got) < count {
+								got = append(got, readTableBody(t, rx)...)
+							}
+							for seq, value := range got {
+								if value != byte(seq) {
+									t.Fatal("slow consumer byte order")
+								}
+							}
+							if _, err := rx.ReadRaw(context.Background()); !errors.Is(err, ErrNoData) {
+								t.Fatal(err)
+							}
+							wantBatches := (count - 1) / tableCleanupRows
+							if len(s.rows) != count-wantBatches*tableCleanupRows || s.cleanupPasses != wantBatches || s.requests["BATCH"] != wantBatches || s.requests[http.MethodDelete] != 0 {
+								t.Fatal("cleanup threshold did not bound retained rows/passes")
+							}
+							t.Logf("connections=%d peak_unread_rows=%d retained=%d GET=%d POST=%d DELETE=%d BATCH=%d cleanup_passes=%d", concurrency, s.peakRows, len(s.rows), s.requests[http.MethodGet], s.requests[http.MethodPost], s.requests[http.MethodDelete], s.requests["BATCH"], s.cleanupPasses)
+						})
 					}
-					if len(s.rows) != count || s.requests[http.MethodDelete] != 0 {
-						t.Fatal("unread data reclaimed")
-					}
-					var got []byte
-					for len(got) < count {
-						got = append(got, readTableBody(t, rx)...)
-					}
-					for seq, value := range got {
-						if int(value) != seq {
-							t.Fatal("slow consumer byte order")
-						}
-					}
-					if _, err := rx.ReadRaw(context.Background()); !errors.Is(err, ErrNoData) {
-						t.Fatal(err)
-					}
-					if len(s.rows) > tableCleanupRows || s.cleanupPasses != 3 {
-						t.Fatal("cleanup threshold did not bound retained rows/passes")
-					}
-					t.Logf("connections=%d peak_unread_rows=%d retained=%d GET=%d POST=%d DELETE=%d BATCH=%d cleanup_passes=%d", concurrency, s.peakRows, len(s.rows), s.requests[http.MethodGet], s.requests[http.MethodPost], s.requests[http.MethodDelete], s.requests["BATCH"], s.cleanupPasses)
 				})
 			}
 		})
