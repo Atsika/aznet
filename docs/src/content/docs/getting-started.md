@@ -32,7 +32,7 @@ In the repository directory, set the **public emulator credentials** and start t
 ```sh
 export AZURE_STORAGE_ACCOUNT=devstoreaccount1
 export AZURE_STORAGE_ACCOUNT_KEY='Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=='
-GOWORK=off go run -mod=readonly ./examples/quickstart \
+go run ./examples/quickstart \
   -listen http://127.0.0.1:10000/devstoreaccount1
 ```
 
@@ -45,7 +45,7 @@ Open another terminal in the same repository. Read the URL into an environment v
 ```sh
 read -r AZNET_URL
 export AZNET_URL
-GOWORK=off go run -mod=readonly ./examples/quickstart
+go run ./examples/quickstart
 unset AZNET_URL
 ```
 

@@ -67,7 +67,11 @@ func serve(ctx context.Context, driver, endpoint string, opts []aznet.Option) (r
 		}
 		return errors.New("accept failed")
 	}
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			result = errors.Join(result, errors.New("session cleanup incomplete; inspect the demo namespace"))
+		}
+	}()
 	if err = conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
 		return errors.New("deadline setup failed")
 	}
@@ -96,7 +100,7 @@ func serve(ctx context.Context, driver, endpoint string, opts []aznet.Option) (r
 	return nil
 }
 
-func request(driver, url string, opts []aznet.Option) error {
+func request(driver, url string, opts []aznet.Option) (result error) {
 	if url == "" {
 		return errors.New("set AZNET_URL to the server's generated URL")
 	}
@@ -104,7 +108,11 @@ func request(driver, url string, opts []aznet.Option) error {
 	if err != nil {
 		return errors.New("dial failed; check driver, namespace and fresh URL")
 	}
-	defer conn.Close()
+	defer func() {
+		if err := conn.Close(); err != nil {
+			result = errors.Join(result, errors.New("session cleanup incomplete; inspect the demo namespace"))
+		}
+	}()
 	if err = conn.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
 		return errors.New("deadline setup failed")
 	}

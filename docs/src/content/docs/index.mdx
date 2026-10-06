@@ -1,12 +1,16 @@
 ---
-title: Go networking over Azure Storage
+title: Networking over Azure Storage
 description: Build ordered byte streams over Blob, Queue and Table with aznet.
 template: splash
+prev: false
+next: false
 hero:
-  title: Go networking over Azure Storage.
-  tagline: Connect Go applications through Blob, Queue or Table using familiar net.Conn and net.Listener interfaces.
+  title: Networking over Azure Storage.
+  tagline: Connect applications through Azure Blob, Queue or Table storage. Use aznet natively in Go or compile to WebAssembly for other host environments.
+  image:
+    file: ../../assets/aznet.png
   actions:
-    - text: Make your first connection
+    - text: Get started
       link: /getting-started/
       icon: right-arrow
     - text: API reference
@@ -14,17 +18,23 @@ hero:
       variant: secondary
 ---
 
-import { LinkCard, CardGrid } from "@astrojs/starlight/components";
+import { Card, CardGrid } from "@astrojs/starlight/components";
 
-<CardGrid>
-  <LinkCard title="Run locally" description="Complete a request and response with Azurite, then move to Azure." href="/getting-started/" />
-  <LinkCard title="Choose a driver" description="Compare the storage mechanisms and account requirements." href="/drivers/overview/" />
-  <LinkCard title="Configure your application" description="Set polling, memory allowances and credential lifetimes." href="/reference/options/" />
-  <LinkCard title="Build a driver" description="Implement the transport's ordering, retry and cleanup contracts." href="/guides/developing-drivers/" />
+<CardGrid stagger>
+  <Card title="Standard Interface" icon="puzzle">
+    Provides familiar connection and listener interfaces in Go, with WebAssembly
+    support for integration into other host environments.
+  </Card>
+  <Card title="End-to-End Encryption" icon="seti:lock">
+    Encrypts application frames using Noise NN. Peers are anonymous;
+    handshake identifiers, lengths and traffic timing remain visible.
+  </Card>
+  <Card title="Multiple Drivers" icon="list-format">
+    Choose between Blob, Queue, or Table storage based on your performance and
+    cost requirements.
+  </Card>
+  <Card title="Firewall Traversal" icon="random">
+    Communicate through restrictive environments that block traditional TCP/UDP
+    ports but allow HTTPS traffic to Azure.
+  </Card>
 </CardGrid>
-
-## What to expect
-
-aznet carries an ordered byte stream through storage requests and polling. It encrypts application frames with Noise NN, which does not authenticate peer identity. Storage latency, credentials and resource cleanup remain part of your application's design.
-
-Start with the local walkthrough. Before deployment, review [security](/core-concepts/security/), [delivery and cleanup](/reference/api/#closing-and-resource-ownership), and [upgrade requirements](/guides/validation/#upgrade-requirements).
