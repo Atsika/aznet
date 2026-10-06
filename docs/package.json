@@ -15,5 +15,10 @@
     "astro-mermaid": "^1.2.0",
     "mermaid": "^11.12.2",
     "sharp": "^0.34.2"
-  }
+  },
+  "packageManager": "bun@1.4.2",
+  "trustedDependencies": [
+    "esbuild",
+    "sharp"
+  ]
 }

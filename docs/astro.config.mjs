@@ -26,6 +26,7 @@ export default defineConfig({
     }),
     starlight({
       title: "aznet",
+      customCss: ["./src/styles/docs.css"],
       social: [
         {
           icon: "github",
@@ -35,49 +36,43 @@ export default defineConfig({
       ],
       sidebar: [
         {
-          label: "Start Here",
+          label: "Start",
           items: [
-            { label: "Introduction", slug: "index" },
-            { label: "Getting Started", slug: "getting-started" },
-          ],
-        },
-        {
-          label: "Core Concepts",
-          items: [
-            { label: "Architecture", slug: "core-concepts/architecture" },
-            { label: "Security", slug: "core-concepts/security" },
-          ],
-        },
-        {
-          label: "Drivers",
-          items: [
-            { label: "Overview", slug: "drivers/overview" },
-            { label: "Azure Blob Storage", slug: "drivers/azblob" },
-            { label: "Azure Queue Storage", slug: "drivers/azqueue" },
-            { label: "Azure Table Storage", slug: "drivers/aztable" },
-            { label: "Cost Analysis", slug: "drivers/cost" },
-            { label: "Performance Analysis", slug: "drivers/performance" },
-          ],
-        },
-        {
-          label: "Tools",
-          items: [{ label: "azurl", slug: "tools/azurl" }],
-        },
-        {
-          label: "Guides",
-          items: [
-            { label: "Local Development", slug: "guides/azurite" },
-            { label: "Developing a Driver", slug: "guides/developing-drivers" },
+            { label: "Overview", slug: "index" },
+            { label: "Your first connection", slug: "getting-started" },
             { label: "Examples", slug: "guides/examples" },
-            { label: "Validation & Migration", slug: "guides/validation" },
           ],
         },
         {
-          label: "Reference",
+          label: "Use aznet",
           items: [
-            { label: "Core API", slug: "reference/api" },
-            { label: "Configuration Options", slug: "reference/options" },
-            { label: "Metrics & Monitoring", slug: "reference/metrics" },
+            { label: "API reference", slug: "reference/api" },
+            { label: "Configuration", slug: "reference/options" },
+            { label: "Connection URLs", slug: "tools/azurl" },
+            { label: "Security & authorization", slug: "core-concepts/security" },
+          ],
+        },
+        {
+          label: "Storage drivers",
+          collapsed: true,
+          items: [
+            { label: "Choose a driver", slug: "drivers/overview" },
+            { label: "Blob", slug: "drivers/azblob" },
+            { label: "Queue", slug: "drivers/azqueue" },
+            { label: "Table", slug: "drivers/aztable" },
+          ],
+        },
+        {
+          label: "Develop & operate",
+          collapsed: true,
+          items: [
+            { label: "Local emulator", slug: "guides/azurite" },
+            { label: "Architecture", slug: "core-concepts/architecture" },
+            { label: "Develop a driver", slug: "guides/developing-drivers" },
+            { label: "Metrics", slug: "reference/metrics" },
+            { label: "Measure performance", slug: "drivers/performance" },
+            { label: "Estimate cost", slug: "drivers/cost" },
+            { label: "Validation & migration", slug: "guides/validation" },
           ],
         },
       ],
