@@ -1,95 +1,28 @@
 ---
 title: Azure Blob Storage Driver
-description: Detailed documentation for the azblob driver.
+description: Append blobs, range reads, and independent directional progress.
 ---
 
-The `azblob` driver uses Azure Blob Storage as the underlying transport layer.
-It is the most performant driver in `aznet`, designed for high-throughput data transfers.
+`azblob` uses one session container with separate request and response append blobs. The initiator appends to the request channel and reads the response channel; the listener uses the opposite direction.
 
-## How it works
+## Data path
 
-The `azblob` driver leverages **Append Blobs** to simulate a bi-directional network stream.
+Writes use conditional append positions so an uncertain retry does not append the same ciphertext twice. The core retains the identical sealed chunk until completion. Reads use ranged downloads; the receive offset advances only by bytes actually read, including bytes returned alongside an error. Fetching headers does not consume the advertised body length.
 
-```mermaid
----
-config:
-  look: neo
----
-flowchart LR
-    Client[Client]
-    Server[Server]
+Independent transmit and receive locks allow appends to progress while a download is waiting, and downloads to progress while an append is waiting. Operations within each direction remain ordered. This removes cross-direction lock contention; it does not remove Azure request latency or polling delay.
 
-    subgraph Azure["Azure Storage Account"]
-        direction TB
+## Limits and rotation
 
-        subgraph Container["Container (UUID)"]
-            direction TB
-            Req["req-N"]
-            Res["res-N"]
-        end
-    end
+The library chooses a **4 MiB sealed-chunk ceiling** (`MaxBlobBlockSize`). This is an aznet policy, not a claim about the largest append supported by every Azure API version. The application MTU is smaller and also respects configured write/retry limits.
 
-    %% Client interactions
-    Client -- "Append (write)" --> Req
-    Client -- "DownloadStream (read)" --> Res
+The driver signals rotation near 49,990 appended blocks. An ordered rotation control frame transfers both peers to the next blob. Failed creation preserves the current resource identity and offsets for retry.
 
-    %% Server interactions
-    Req -- "DownloadStream (read)" --> Server
-    Server -- "Append (write)" --> Res
-```
+Blob implements `ReadRawLimit`: range downloads respect the remaining receive allowance and may stop inside an encrypted chunk, whose unread suffix is fetched later. See the [driver contract](/guides/developing-drivers).
 
-1. **Write Path**: Data is buffered into frames. When a flush is triggered, frames are encrypted and appended as a single block to the current "TX" Append Blob.
-2. **Read Path**: The reader performs a range-based download starting from its current offset on the "RX" Append Blob. If no new data is available (416 Range Not Satisfiable or zero content length), it returns and the adaptive poller retries later.
+## Deployment and authorization
 
-## Resource Usage
+Standard general-purpose v2 and Premium block blob accounts support append blobs; choose using your own [measurements](/drivers/performance). Premium is not required and no fixed speedup is promised.
 
-For each connection, the driver creates:
+The session SAS is scoped to its container and permits Read, List, Add, Create and Write. The same token serves both directions; it is not a permission boundary between request and response blobs. Accepted-connection teardown owns session-container deletion. Shared bootstrap containers require separate administrator cleanup.
 
-- A unique **Container** named with the session UUID.
-- Initial blobs: `req-0` and `res-0`.
-
-## Technical Details
-
-### Blob Rotation
-
-Azure Append Blobs have a limit of **50,000 blocks** per blob.
-To support long-running or high-volume connections, `aznet` implements automatic **Blob Rotation**.
-
-```mermaid
----
-config:
-  look: neo
----
-stateDiagram-v2
-    [*] --> req_0: Start Connection
-    req_0 --> req_0: Append Blocks (0-49,989)
-    req_0 --> RotateMsg: Block 49,990 reached
-    RotateMsg --> req_1: Create New Blob
-    req_1 --> req_1: Append Blocks...
-```
-
-- When a blob reaches **49,990 appends** (a safety threshold slightly below the Azure limit of 50,000), the driver:
-  1. Sends a `MsgTypeRotate` control frame to the peer.
-  2. Creates a new Append Blob with an incremented sequence number (e.g., `req-0` → `req-1`).
-  3. Switches all future writes to the new blob.
-- The peer, upon receiving the rotation notification, automatically switches its reader to the next sequence after exhausting the current blob.
-
-## Performance
-
-`azblob` is the throughput champion of `aznet`.
-
-- **Storage Account**: For production workloads, use a **Premium Block Blob** account. This uses SSD storage, providing significantly lower latency and up to **3x higher throughput** compared to Standard (HDD) storage.
-- **Chunk Size**: Defaults to **4 MB** (`MaxBlobBlockSize`). This is the maximum allowed size for a single append operation in Azure.
-- **Throughput**: Up to **3.07 MB/s** sender / **2.65 MB/s** receiver (iperf3 benchmark through SOCKS proxy).
-- **Transfer Pattern**: Smooth and consistent with zero retransmissions.
-
-## Advantages
-
-- **Speed**: Fastest driver available.
-- **Large Chunks**: Efficiently handles streaming data.
-- **Scalability**: Rotation ensures virtually unlimited data transfer.
-
-## Limitations
-
-- **Cost**: Higher per-operation costs than Queue storage for small writes.
-- **Latency**: Polling-based reads introduce small delays.
+See [security](/core-concepts/security), [cost](/drivers/cost), and [closing ownership](/reference/api#closing-and-resource-ownership).

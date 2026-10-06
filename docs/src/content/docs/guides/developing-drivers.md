@@ -5,7 +5,7 @@ description: Learn how to implement a new transport driver for aznet.
 
 `aznet` is designed with a pluggable architecture. You can add support for new Azure services or even other cloud providers by implementing a set of core interfaces.
 
-Each of the three built-in drivers (`azblob`, `azqueue`, `aztable`) is roughly **~300 lines of Go code**, making it straightforward to add new ones.
+The built-in Blob, Queue and Table drivers demonstrate different ordering, retry and reclamation strategies. A driver must satisfy the contracts below, not just compile against the interfaces.
 
 ## Architecture Overview
 
@@ -197,5 +197,18 @@ Existing transports can continue implementing only `ReadRaw`. Their response bod
 1. **Use Adaptive Polling**: Don't implement your own polling loops in `ReadRaw`. Return `aznet.ErrNoData` and let the core `aznet.Conn` manage the sleep intervals.
 2. **Resource Cleanup**: Ensure `CleanupBootstrap` and `CleanupSession` properly remove any Azure resources created during the session.
 3. **Respect Context**: Always pass the `context.Context` from the interface methods to your underlying SDK calls to support cancellation.
-4. **Error Wrapping**: Wrap SDK errors with `fmt.Errorf("context: %w", err)` to help users debug connection issues.
+4. **Error Wrapping**: Preserve SDK causes with `%w` so callers can classify them. Return `ErrNoData` only for an actual empty poll; do not conceal authorization, malformed data, ordering or cleanup failures. Redact credentials before displaying errors.
 5. **SAS Tokens**: Use `cfg.SASTimes()` to get consistent start/end times for SAS token generation (includes 5-minute clock skew tolerance).
+
+## Migration checklist
+
+- Update implementations and wrappers from `WriteRaw(ctx, data)` to `WriteRaw(ctx, seq, data)`. Sequences begin at zero; retries can occur after the backend committed but the response was lost. Retain a receipt or equivalent position condition long enough to prevent replay after consumption. Do not reseal ciphertext or silently duplicate accepted bytes.
+- Keep `MaxRawSize` constant for the transport lifetime. Bound read bodies, sequence reassembly and prefetch. Preserve unread suffixes and advance offsets by consumed bytes, not announced response sizes.
+- Honor cancellation in SDK calls and returned response-body reads. Closing the body must unblock a pending read. Independent read and write calls must be able to progress concurrently; serialize state within a direction.
+- Rotation is ordered with data and FIN. Preserve state after failed resource creation; retry must not skip a generation. Core chunking keeps frames whole.
+- Cleanup must tolerate partial acquisition and already-missing resources. The listener owns the session before `CreateSession`, and closes a partial transport returned with an error once. Report cleanup failure instead of treating every deletion error as success.
+- Listener Close no longer deletes shared bootstrap resources. Namespace administrators call `CleanupBootstrap` explicitly with a fresh bounded context after all users stop. A cleanup timeout does not prove deletion.
+- Implement optional `BootstrapTokenIssuer.CreateBootstrapTokensFor(time.Duration)` to support independent per-URL bootstrap lifetime. Otherwise `ConnectionStringFor` returns `ErrBootstrapDurationUnsupported`; ordinary `ConnectionString` still works. `cfg.SASTimes()` describes session issuance. Populate `SessionTokens.ExpiresAt` only from trustworthy issuance metadata; zero means unknown.
+- Preserve optional rotation and bounded-read capabilities through wrappers. For Table, upgrade listeners before clients that reclaim rows: old read-only response SAS tokens lack Delete. Existing sessions are not refreshed or resumed.
+
+Validate uncertain commits, duplicate/delayed chunks, short reads and `n > 0` with an error, close while blocked, bidirectional progress, ordered EOF, and partial setup rollback. See [validation](/guides/validation) for the retained coverage and deployment limits.

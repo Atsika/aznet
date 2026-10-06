@@ -22,12 +22,12 @@ import { Card, CardGrid } from "@astrojs/starlight/components";
 
 <CardGrid stagger>
   <Card title="Standard Interface" icon="puzzle">
-    Full `net.Conn` implementation that works with existing Go networking code.
-    Any library that accepts `net.Conn` can use aznet.
+    Exposes `net.Conn` for Go networking code. Review storage latency,
+    authorization lifetime and close semantics before deployment.
   </Card>
   <Card title="End-to-End Encryption" icon="seti:lock">
-    Built-in Noise Protocol (NN pattern) for secure communication. Data is
-    encrypted before it ever touches Azure Storage.
+    Encrypts application frames using Noise NN. Peers are anonymous;
+    handshake identifiers, lengths and traffic timing remain visible.
   </Card>
   <Card title="Multiple Drivers" icon="list-format">
     Choose between Blob, Queue, or Table storage based on your performance and
@@ -42,7 +42,7 @@ import { Card, CardGrid } from "@astrojs/starlight/components";
 ## How it works
 
 aznet abstracts Azure Storage services into a standard networking interface.
-Your application code stays the same, while the data flows through Azure's highly available cloud infrastructure.
+Applications use familiar interfaces while accounting for storage polling, credentials and explicit cleanup ownership.
 
 ```mermaid
 ---
@@ -67,7 +67,7 @@ graph LR
 While `aznet` is powerful, it is not a direct replacement for low-latency TCP in all scenarios:
 
 - **Latency**: Polling-based reads introduce latency compared to direct socket I/O.
-- **Cost**: Each "packet" involves Azure Storage API calls which incur costs.
+- **Cost**: Polling, batched data, retries and cleanup generate billable operations; an application write is not a billing unit.
 - **Throughput**: Subject to Azure service quotas and throttling.
 
 For a detailed analysis, see our [Performance](/drivers/performance) and [Cost](/drivers/cost) comparisons.

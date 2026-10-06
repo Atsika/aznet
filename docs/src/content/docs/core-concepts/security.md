@@ -1,104 +1,32 @@
 ---
-title: Security Measures
-description: How aznet ensures end-to-end encryption and connection isolation.
+title: Security and Authorization
+description: Encryption, anonymous peers, credential scope, and resource ownership.
 ---
 
-Security is a primary concern for `aznet`.
-Since data travels through a third-party service (Azure Storage), it is critical that the data remains confidential
-and authentic.
+aznet uses `Noise_NN_25519_AESGCM_SHA256`. Application frames and the session-token response are encrypted; **NN does not authenticate peer identity**. Ephemeral key agreement and AEAD integrity alone do not protect an anonymous handshake against an active intermediary able to replace its messages. Applications needing peer authentication must supply it at an appropriate layer. See the [Noise pattern specification](https://noiseprotocol.org/noise.html#handshake-patterns).
 
-## End-to-End Encryption
+## Visible metadata
 
-`aznet` implements the **Noise Protocol Framework** to provide robust, authenticated, and encrypted communication.
+The first handshake carries the client's UUID without encryption. Resource names, message lengths, ciphertext lengths and traffic timing are also visible to the storage service. A sealed chunk has a four-byte length prefix and a 16-byte authentication tag in addition to encrypted content. Do not describe all stored content or metadata as secret.
 
-### Noise Configuration
+## Credential scope
 
-Specifically, `aznet` uses the `Noise_NN_25519_AESGCM_SHA256` pattern:
+The listener uses account credentials to provision resources and issue SAS tokens. Clients receive bootstrap credentials and, after the handshake, session credentials; the listener does not send its account key in the connection URL.
 
-- **Pattern**: `NN` (Anonymous handshake). No static keys are required, and both parties remain anonymous during the handshake.
-- **DH (Diffie-Hellman)**: Curve25519 for key exchange.
-- **Cipher**: AES-256-GCM for Authenticated Encryption with Associated Data (AEAD).
-- **Hash**: SHA-256 for cryptographic hashing.
+| Service | Bootstrap handshake / token permissions | Client session request / response permissions |
+| :--- | :--- | :--- |
+| Blob | Add/Create/Write / Read/List | Same container SAS for both: Read/List/Add/Create/Write |
+| Queue | Add / Read | Add / Read/Process |
+| Table | Add / Read | Add / Read/Delete |
 
-### Handshake Flow (Noise NN)
+Session resources are named using the client's validated UUID. Resource scoping reduces cross-session access, but Blob's container token does not isolate the two directions. Bootstrap credentials are bearer secrets for a shared namespace, not proof of a particular peer's identity. Protect them accordingly.
 
-The handshake process establishes the shared symmetric key without transmitting it.
+## Lifetime and cleanup
 
-```mermaid
----
-config:
-  look: neo
----
-sequenceDiagram
-    participant Client
-    participant Server
-    
-    Note over Client: Generate Ephemeral Key pair (e_c)
-    Client->>Server: e_c (Cleartext, contains UUID)
-    
-    Note over Server: Generate Ephemeral Key pair (e_s)
-    Note over Server: Perform DH(e_c, e_s)
-    Note over Server: Derives Encryption Keys
-    Server->>Client: e_s, Ciphertext(SAS_Tokens)
-    
-    Note over Client: Perform DH(e_c, e_s)
-    Note over Client: Derives same Encryption Keys
-    Note over Client: Decrypt SAS_Tokens
-```
+Bootstrap and session credentials default to 24 hours and have independent [configuration](/reference/options#independent-credential-lifetimes). `ConnectionStringFor` changes only that URL's issuance duration. There is no automatic credential refresh. Bootstrap expiry prevents later joining; it does not itself expire sessions already established. `SessionExpiry` reports issuance metadata, not liveness.
 
-### Encrypted Chunks
+The listener owns accepted-session cleanup. Its janitor closes idle sessions while the process runs; it cannot reclaim every resource left by a crash or an unavailable backend. Close errors and timeouts require follow-up. Shared bootstrap deletion is an explicit administrator operation after every namespace user stops.
 
-Data is encrypted into discrete chunks before being sent to the transport layer. Each encrypted chunk is prefixed with its own length:
+## Deployment
 
-```mermaid
----
-config:
-  look: neo
----
-graph LR
-    A[Length: 4 Bytes] --- B[Ciphertext: N Bytes]
-    B[Ciphertext: N Bytes] --- C[Authentication Tag: 16 Bytes]
-    subgraph EncryptedChunk [Encrypted Chunk Structure]
-    A
-    B
-    C
-    end
-```
-
-- **Length** (4 bytes): Big-endian length of the following ciphertext.
-- **Ciphertext**: The actual encrypted payload.
-- **Authentication Tag**: (16 bytes) The AEAD authentication tag.
-
-## Connection Isolation
-
-Each connection is strictly isolated from others, even if they share the same Storage Account.
-
-### Dedicated Resources
-
-When a new connection is accepted, `aznet` generates a unique UUID to identify the session.
-
-Each driver is responsible for creating isolated resources dedicated to that specific session. These resources (such as containers, blobs, queues, or tables) are named using the session UUID to ensure strict isolation between concurrent connections sharing the same Azure Storage account.
-
-### SAS Tokens with Least Privilege
-
-`aznet` does not share the main Storage Account Key with clients.
-Instead, the server generates **Shared Access Signatures (SAS)** that:
-
-- Are valid only for the specific resources of that connection.
-- Have a short expiration time (configurable via `WithSASExpiry`).
-- Grant only the necessary permissions.
-
-## Threat Model & Mitigations
-
-| Threat                   | Mitigation                                                                                                |
-| :----------------------- | :-------------------------------------------------------------------------------------------------------- |
-| **Azure Insider Access** | Data is end-to-end encrypted; Azure only sees encrypted blobs/messages.                                   |
-| **Man-in-the-Middle**    | Noise Protocol (NN pattern) provides forward secrecy and data integrity through ephemeral DH key exchange. Note: NN is anonymous — it does not authenticate peers. |
-| **Replay Attacks**       | AES-GCM provides sequence-based authentication; old or duplicate frames are rejected by the cipher state. |
-| **Resource Exhaustion**  | The server's Janitor automatically cleans up leaked or old resources.                                     |
-
-## Recommendations
-
-1. **Rotate Account Keys**: Regularly rotate your main Azure Storage Account keys in the Azure Portal.
-2. **Use HTTPS**: `aznet` communicates with Azure over HTTPS by default.
-3. **Audit Logs**: Enable Azure Storage Analytics to monitor access patterns.
+Use HTTPS to Azure, protect account keys and connection URLs, and configure storage network access for the participating endpoints. Anonymous public Blob access is not required. Avoid logging credentials or raw SDK errors without redaction: an error may include request details. Validate authentication and cleanup behavior in the intended host; compilation alone is not runtime evidence.

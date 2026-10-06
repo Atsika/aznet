@@ -16,7 +16,7 @@ go get github.com/atsika/aznet
 
 ## Prerequisites
 
-- **Go 1.25** or later.
+- **Go with automatic toolchain selection**: this revision declares Go 1.25 and selects Go 1.26.5.
 - An **Azure Storage Account** (or [Azurite](https://github.com/Azure/Azurite) for local development).
 
 ## Azure Storage Setup
@@ -28,20 +28,7 @@ Before using `aznet`, you need to set up an Azure Storage account.
 1. Go to the [Azure Portal](https://portal.azure.com).
 2. Create a new **Storage account**.
 3. Choose a name and region. For best performance, choose the region closest to your application.
-4. **Select the correct Performance and Account Type based on your driver:**
-
-| Driver      | Performance  | Account Type       | Storage Type | Recommendation                                                 |
-| :---------- | :----------- | :----------------- | :----------- | :------------------------------------------------------------- |
-| **azblob**  | **Premium**  | **Block Blobs**    | SSD          | **Recommended for production.** Up to 3x faster than Standard. |
-| **azblob**  | Standard     | General Purpose v2 | HDD          | Lower performance, but works.                                  |
-| **azqueue** | **Standard** | General Purpose v2 | HDD          | **Required.** Premium Block Blobs do not support Queues.       |
-| **aztable** | **Standard** | General Purpose v2 | HDD          | **Required.** Premium Block Blobs do not support Tables.       |
-
-:::tip[Best Practice]
-For the best performance/cost ratio, use **different storage accounts** for blobs and queues/tables. Use a **Premium Block Blob** account for `azblob` and a **Standard General Purpose v2** account for `azqueue` or `aztable`.
-:::
-
-5. For **Redundancy**, **LRS (Locally-redundant storage)** is usually sufficient and most cost-effective for `aznet`.
+4. Select a **Standard general-purpose v2** account to use Blob, Queue or Table. Premium block blob accounts also support append blobs but not Queue or Table. Choose redundancy for your availability needs and compare actual workload costs; no particular tier has a guaranteed aznet speedup. See [driver deployment requirements](/drivers/overview).
 
 ### 2. Get Connection Credentials
 
@@ -54,7 +41,7 @@ You need the storage account name and one of its access keys.
 
 `aznet` automatically manages the required resources (containers, queues, or tables). However, ensure your storage account allows:
 
-- **Public access**: While `aznet` uses SAS tokens, the account itself must be accessible over HTTPS.
+- **Network access**: Both endpoints need authorized HTTPS access to storage. Anonymous public Blob access is not required.
 - **Firewall**: If you use the storage firewall, ensure the IP addresses of your clients/servers are whitelisted.
 
 ## Quick Start
@@ -80,7 +67,7 @@ func main() {
     
     listener, err := aznet.Listen("azblob", address)
     if err != nil {
-        log.Fatal(err)
+        log.Fatal("storage operation failed; inspect the error securely")
     }
     defer listener.Close()
     
@@ -89,8 +76,8 @@ func main() {
     for {
         conn, err := listener.Accept()
         if err != nil {
-            log.Printf("Accept error: %v", err)
-            continue
+            log.Print("Accept failed; inspect and redact the error before logging details")
+            return
         }
         
         go handleConnection(conn)
@@ -137,39 +124,30 @@ func main() {
     
     conn, err := aznet.Dial("azblob", address)
     if err != nil {
-        log.Fatal(err)
+        log.Fatal("storage operation failed; inspect the error securely")
     }
     defer conn.Close()
     
-    conn.Write([]byte("Hello, aznet!"))
+    if _, err := conn.Write([]byte("Hello, aznet!")); err != nil {
+        log.Fatal("write failed")
+    }
     
     response := make([]byte, 1024)
-    n, _ := conn.Read(response)
+    n, err := conn.Read(response)
+    if err != nil {
+        log.Fatal("read failed")
+    }
     fmt.Printf("Received: %s\n", response[:n])
 }
 ```
 
-## Drop-in Replacement
+## Interface compatibility and delivery
 
-`aznet` is designed to be a drop-in replacement for Go's standard `net` package.
-Because it implements the same interfaces, you can swap traditional TCP networking for Azure Storage transport
-with just a one-line change.
+The returned values implement `net.Listener` and `net.Conn`, so applications can use familiar I/O APIs. Test application timeouts, write sizes, authorization lifetime and closure against storage behavior; matching interfaces do not promise TCP latency or delivery semantics.
 
-Using standard TCP:
+A successful write accepts bytes locally; even a successful upload does not prove peer consumption. Full Close on an accepted connection deletes session resources. For a final response that must be delivered, half-close with `CloseWrite`, wait for application-level completion, then Close. The echo snippets are introductory examples, not a graceful production shutdown policy. See [ownership and deadlines](/reference/api#closing-and-resource-ownership).
 
-```go
-// Traditional TCP listener
-listener, err := net.Listen("tcp", ":8080")
-```
-
-Using aznet:
-
-```go
-// aznet listener - same interface, different transport
-listener, err := aznet.Listen("azblob", "https://account:key@account.blob.core.windows.net/")
-```
-
-Any code that accepts a `net.Listener` or `net.Conn` (like `http.Serve`, `grpc.Server`, or custom protocols) will continue to work without modification.
+Treat generated connection URLs as bearer secrets and share them through a protected channel. Bootstrap resources outlive listener Close and need explicit administrator cleanup. Review [migration and validation](/guides/validation) before upgrading existing peers.
 
 ## Next Steps
 
