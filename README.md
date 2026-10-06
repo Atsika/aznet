@@ -8,6 +8,10 @@ aznet provides an ordered encrypted byte stream using storage requests and polli
 
 ## Start here
 
+Follow [Your First Connection](docs/src/content/docs/getting-started.md) to run a complete local round trip with Azurite and the `examples/quickstart` program. It prints `hello aznet`, verifies delivery and cleans up its demo resources.
+
+To add the library to an existing Go project:
+
 ```bash
 go get github.com/atsika/aznet
 ```
@@ -30,12 +34,14 @@ GOWORK=off go test -mod=readonly -race -count=1 ./...
 GOWORK=off go vet -mod=readonly ./...
 ```
 
-External-service tests require explicit opt-in; see the validation guide. To build the Starlight documentation:
+External-service tests require explicit opt-in; see the validation guide. The Starlight documentation uses **Bun 1.4.2** and the committed `docs/bun.lock`. To install the locked dependencies and build:
 
 ```bash
 cd docs
-pnpm install --frozen-lockfile
-pnpm build
+bun install --frozen-lockfile
+bun run build
+# For local editing:
+bun run dev
 ```
 
 The Driver/Transport registration mechanism remains the extension point. See the driver guide before changing ordering, retries or resource ownership.

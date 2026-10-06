@@ -3,25 +3,11 @@ title: Examples
 description: Explore working examples of aznet in action.
 ---
 
-The `aznet` repository includes working examples in the `examples/` directory to help you understand how to use the library in different scenarios.
+Start with [Your First Connection](/getting-started). Its `examples/quickstart` program runs one complete request/response with byte verification, ordered EOF, application acknowledgement and explicit demo cleanup. It accepts `-driver`, `-listen`, `-namespace` and the client `AZNET_URL` environment variable; no source edits or checked-in SAS token are needed.
 
-To run the examples:
+## Interactive echo example
 
-1. Start Azurite or have an Azure Storage account ready.
-1. Run the server in one terminal:
-
-```bash
-go run ./examples/echo/server
-```
-
-1. Configure the client with a fresh connection URL from the server. The checked-in URL is illustrative and may be expired. Treat the generated URL as a secret.
-1. Run the client in another terminal:
-
-```bash
-go run ./examples/echo/client
-```
-
-## Echo
+The older `examples/echo` program is useful for manual interactive exploration. Its driver and endpoint are package variables: configure both sides, start the server, then replace the client's illustrative URL with the fresh one the server prints. Run `go run ./examples/echo/server` and `go run ./examples/echo/client` from the repository root. Its stdin EOF exits the client without a delivery acknowledgement, so use the quickstart example for a complete, verified one-shot exchange.
 
 A simple demonstration of bi-directional communication. The client sends lines of text to the server, which echoes them back.
 

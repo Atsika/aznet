@@ -1,157 +1,109 @@
 ---
-title: Getting Started
-description: Learn how to install and start using aznet in your Go projects.
+title: Your First Connection
+description: Run a complete request and response locally before connecting to Azure.
 ---
 
-`aznet` provides a TCP-like networking abstraction over Azure Storage, allowing you to use
-familiar socket programming patterns with cloud storage as the underlying transport.
+Start with a local storage emulator and the runnable `examples/quickstart` program. The server listens through storage, the client sends `hello aznet`, and both sides finish before the server removes the demo resources.
 
-## Installation
+## 1. Prepare the tools
 
-To start using `aznet` in your Go project, install the package:
+You need Git, Docker and Go with automatic toolchain selection enabled. This revision selects Go 1.26.5. Bun is only needed to develop the documentation site, not to use the Go library.
 
-```bash
+```sh
+git clone https://github.com/atsika/aznet.git
+cd aznet
+```
+
+In a separate terminal, start the disposable emulator:
+
+```sh
+docker run --rm --name aznet-demo \
+  -p 127.0.0.1:10000:10000 -p 127.0.0.1:10001:10001 -p 127.0.0.1:10002:10002 \
+  mcr.microsoft.com/azure-storage/azurite:3.34.0 \
+  azurite --blobHost 0.0.0.0 --queueHost 0.0.0.0 --tableHost 0.0.0.0 --skipApiVersionCheck
+```
+
+Wait until the emulator reports that its services are listening. The version-check bypass is needed by the SDK used here; this local test is not evidence for every Azure service behavior.
+
+## 2. Start the server
+
+In the repository directory, set the **public emulator credentials** and start the Blob example:
+
+```sh
+export AZURE_STORAGE_ACCOUNT=devstoreaccount1
+export AZURE_STORAGE_ACCOUNT_KEY='Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=='
+go run ./examples/quickstart \
+  -listen http://127.0.0.1:10000/devstoreaccount1
+```
+
+The server prints a fresh connection URL and `Waiting for one client`. Leave it running. A connection URL contains bearer credentials: copy the complete URL only to the intended client.
+
+## 3. Run the client
+
+Open another terminal in the same repository. Read the URL into an environment variable, paste it at the prompt and press Enter:
+
+```sh
+read -r AZNET_URL
+export AZNET_URL
+go run ./examples/quickstart
+unset AZNET_URL
+```
+
+Expected client output:
+
+```text
+hello aznet
+```
+
+The server reports `Round trip acknowledged; cleaning up`, then exits. Both processes should exit successfully. The demo reserves the `aznetdemohandshake` and `aznetdemotoken` namespace; run one demo at a time, or pass the same unique lowercase `-namespace` value to both sides.
+
+## 4. Finish and clean up
+
+The server deletes its session and its exclusive demo bootstrap resources. Stop the disposable emulator when finished:
+
+```sh
+docker stop aznet-demo
+```
+
+Do not apply the demo's bootstrap cleanup to shared production namespaces. Ordinary listener Close leaves bootstrap resources intact; their administrator removes them after all users stop. If the demo reports incomplete cleanup or is killed forcibly, inspect its resources or remove its disposable emulator. A cleanup timeout does not prove deletion.
+
+## Try another driver
+
+Pass the same `-driver` to both processes and use the matching server endpoint:
+
+| Driver | Local server endpoint | Azure server endpoint |
+|---|---|---|
+| `azblob` | `http://127.0.0.1:10000/devstoreaccount1` | `https://ACCOUNT.blob.core.windows.net` |
+| `azqueue` | `http://127.0.0.1:10001/devstoreaccount1` | `https://ACCOUNT.queue.core.windows.net` |
+| `aztable` | `http://127.0.0.1:10002/devstoreaccount1` | `https://ACCOUNT.table.core.windows.net` |
+
+For example, the server uses `-driver azqueue -listen http://127.0.0.1:10001/devstoreaccount1`, and the client uses `-driver azqueue`. Generate a fresh URL for each server run.
+
+## Move to Azure
+
+Use a storage account with the selected service, allow authorized network access from both endpoints, and set the server's `AZURE_STORAGE_ACCOUNT` and `AZURE_STORAGE_ACCOUNT_KEY` to its credentials. Replace the local `-listen` URL using the table above. The client still needs only the generated URL and matching driver/namespace, not the account key.
+
+Standard general-purpose v2 supports all three services. Premium Blob is not required. Anonymous public Blob access is not required either. See [driver selection](/drivers/overview) and [security and authorization](/core-concepts/security) before deployment. Use a dedicated demo namespace: the example removes it when done.
+
+## Use aznet in your application
+
+```sh
 go get github.com/atsika/aznet
 ```
 
-## Prerequisites
+`Listen` returns `net.Listener`; `Dial` and `Accept` return `net.Conn`. Start from the [quickstart source](https://github.com/atsika/aznet/tree/main/examples/quickstart), then read the [API reference](/reference/api) for deadlines, accepted write counts and resource ownership.
 
-- **Go with automatic toolchain selection**: this revision declares Go 1.25 and selects Go 1.26.5.
-- An **Azure Storage Account** (or [Azurite](https://github.com/Azure/Azurite) for local development).
+The example half-closes the response, waits for a client acknowledgement and ordered EOF, then performs full Close. A successful upload alone does not mean the peer consumed the response. Plan the same application-level completion in delivery-sensitive protocols.
 
-## Azure Storage Setup
+## If it does not work
 
-Before using `aznet`, you need to set up an Azure Storage account.
+| Symptom | Check |
+|---|---|
+| Server cannot listen | Emulator is ready; ports are free; server endpoint and account key match |
+| Demo namespace is still being deleted | Wait and retry, or use a new exclusive `-namespace` with the same value on server and client |
+| Client cannot dial | Copy a fresh complete URL; keep the server running; match driver and namespace |
+| Azure rejects authorization | Verify credentials, service permissions, network access and expiry; avoid posting raw SDK errors or URLs |
+| Transfer or acknowledgement times out | Both processes have access to storage; the example has a 30-second conversation deadline |
+| Cleanup is incomplete | Inspect the exclusive demo namespace; do not delete other applications' resources |
 
-### 1. Create a Storage Account
-
-1. Go to the [Azure Portal](https://portal.azure.com).
-2. Create a new **Storage account**.
-3. Choose a name and region. For best performance, choose the region closest to your application.
-4. Select a **Standard general-purpose v2** account to use Blob, Queue or Table. Premium block blob accounts also support append blobs but not Queue or Table. Choose redundancy for your availability needs and compare actual workload costs; no particular tier has a guaranteed aznet speedup. See [driver deployment requirements](/drivers/overview).
-
-### 2. Get Connection Credentials
-
-You need the storage account name and one of its access keys.
-
-1. In your storage account, go to **Security + networking** > **Access keys**.
-2. Copy the **Storage account name** and **Key1**.
-
-### 3. Required Settings
-
-`aznet` automatically manages the required resources (containers, queues, or tables). However, ensure your storage account allows:
-
-- **Network access**: Both endpoints need authorized HTTPS access to storage. Anonymous public Blob access is not required.
-- **Firewall**: If you use the storage firewall, ensure the IP addresses of your clients/servers are whitelisted.
-
-## Quick Start
-
-### 1. Server (Listener)
-
-The server listens for incoming connections. It uses an `Account Key` for authentication.
-
-```go
-package main
-
-import (
-    "io"
-    "log"
-    "net"
-    "github.com/atsika/aznet"
-)
-
-func main() {
-    // Arguments: driver type, service URL
-    // Credentials can be in the URL or in environment variables
-    address := "https://myaccount:mykey@myaccount.blob.core.windows.net/"
-    
-    listener, err := aznet.Listen("azblob", address)
-    if err != nil {
-        log.Fatal("storage operation failed; inspect the error securely")
-    }
-    defer listener.Close()
-    
-    log.Println("Listening on Azure Storage...")
-
-    for {
-        conn, err := listener.Accept()
-        if err != nil {
-            log.Print("Accept failed; inspect and redact the error before logging details")
-            return
-        }
-        
-        go handleConnection(conn)
-    }
-}
-
-func handleConnection(conn net.Conn) {
-    defer conn.Close()
-    io.Copy(conn, conn) // Echo back
-}
-```
-
-### 2. Client (Dialer)
-
-The client connects to the server. Establishing a connection requires a URL with embedded SAS tokens. You can generate this URL either through the [`azurl` tool](/tools/azurl) or directly from the `Listener` in your code.
-
-#### Using code (Server-side)
-
-```go
-// Generate a connection string for clients directly from the listener
-connStr, err := listener.(*aznet.Listener).ConnectionString()
-if err == nil {
-    fmt.Println("Client URL:", connStr)
-}
-```
-
-#### Using the `azurl` tool
-
-The server administrator typically runs `azurl` to generate a connection string for the client.
-
-```go
-package main
-
-import (
-    "fmt"
-    "log"
-    "github.com/atsika/aznet"
-)
-
-func main() {
-    // The server will typically provide the connection URL via azurl or ConnectionString()
-    // Format: https://<host>/?handshake=<base64_sas>&token=<base64_sas>
-    address := "https://myaccount.blob.core.windows.net/?handshake=YmxvYl_...&token=YmxvYl_..."
-    
-    conn, err := aznet.Dial("azblob", address)
-    if err != nil {
-        log.Fatal("storage operation failed; inspect the error securely")
-    }
-    defer conn.Close()
-    
-    if _, err := conn.Write([]byte("Hello, aznet!")); err != nil {
-        log.Print("write failed")
-        return
-    }
-    
-    response := make([]byte, 1024)
-    n, err := conn.Read(response)
-    if err != nil {
-        log.Print("read failed")
-        return
-    }
-    fmt.Printf("Received: %s\n", response[:n])
-}
-```
-
-## Interface compatibility and delivery
-
-The returned values implement `net.Listener` and `net.Conn`, so applications can use familiar I/O APIs. Test application timeouts, write sizes, authorization lifetime and closure against storage behavior; matching interfaces do not promise TCP latency or delivery semantics.
-
-A successful write accepts bytes locally; even a successful upload does not prove peer consumption. Full Close on an accepted connection deletes session resources. For a final response that must be delivered, half-close with `CloseWrite`, wait for application-level completion, then Close. The echo snippets are introductory examples, not a graceful production shutdown policy. See [ownership and deadlines](/reference/api#closing-and-resource-ownership).
-
-Treat generated connection URLs as bearer secrets and share them through a protected channel. Bootstrap resources outlive listener Close and need explicit administrator cleanup. Review [migration and validation](/guides/validation) before upgrading existing peers.
-
-## Next Steps
-
-Check out the [Architecture](/core-concepts/architecture) to understand how `aznet` manages connections
-and the [Drivers](/drivers/overview) guide to choose the right driver for your needs.
+For existing deployments, read [validation and migration](/guides/validation). For expected latency and cost, use the [measurement guide](/drivers/performance), rather than assuming TCP-like speed.

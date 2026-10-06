@@ -1,0 +1,64 @@
+/* Keep Starlight's navigation, search and accessible controls; refine the reading surface. */
+:root {
+  --sl-color-accent-low: #102d49;
+  --sl-color-accent: #2078bc;
+  --sl-color-accent-high: #83bff0;
+  --sl-font: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --sl-content-width: 48rem;
+  --sl-text-h1: 2.5rem;
+}
+:root[data-theme="light"] {
+  --sl-color-accent-low: #e7f2fc;
+  --sl-color-accent: #2078bc;
+  --sl-color-accent-high: #185e96;
+}
+.site-title { font-weight: 700; letter-spacing: -0.04em; }
+.hero { padding-block: 2.5rem; }
+.hero h1 { font-weight: 750; line-height: 1.12; }
+.hero .tagline { max-width: 48ch; line-height: 1.6; }
+.sl-markdown-content :is(h1, h2, h3) { letter-spacing: -0.025em; }
+.sl-markdown-content h2 { margin-top: 2.5rem; }
+.sl-markdown-content p { line-height: 1.75; }
+.sl-markdown-content table { font-size: 0.925rem; }
+.card { border-radius: 0.5rem; box-shadow: none; }
+@media (max-width: 50rem) {
+  :root { --sl-text-h1: 2rem; }
+  .hero { padding-block: 1.5rem; }
+}
+
+/* Keep the article central and the table of contents a compact reference. */
+@media (min-width: 72rem) {
+  .right-sidebar-container { flex: 0 0 18rem; width: 18rem; }
+  .right-sidebar { width: 18rem; }
+  [data-has-sidebar][data-has-toc] .main-pane {
+    flex: 1; min-width: 0; width: calc(100% - 18rem);
+    --sl-content-margin-inline: auto;
+  }
+}
+.sl-markdown-content h2 { font-size: 1.875rem; font-weight: 700; }
+.sl-markdown-content h3 { font-size: 1.35rem; font-weight: 650; }
+.sl-markdown-content h4 { font-size: 1.1rem; font-weight: 650; }
+.pagination-links { display: flex; justify-content: space-between; flex-wrap: wrap; }
+.pagination-links a {
+  flex: 0 1 auto; width: auto; max-width: 100%;
+  border: 0; border-radius: 0; padding: 0.5rem 0; box-shadow: none;
+}
+.pagination-links a[rel="next"] { margin-inline-start: auto; }
+.pagination-links .link-title { font-size: 1rem; }
+.pagination-links a:hover .link-title { text-decoration: underline; }
+
+/* Match the logo's deeper blue for primary actions in either theme. */
+.sl-link-button.primary {
+  background: #2078bc;
+  border-color: #2078bc;
+  color: #fff;
+}
+.sl-link-button.primary:hover { background: #185e96; border-color: #185e96; }
+
+/* Size the inner TOC to its column instead of Starlight's left sidebar width. */
+.right-sidebar-panel .sl-container { width: 100%; max-width: 100%; }
+.right-sidebar-panel a { white-space: normal; overflow-wrap: anywhere; }
+
+@media (min-width: 50rem) {
+  .card-grid.stagger { --stagger-height: 2rem; }
+}
