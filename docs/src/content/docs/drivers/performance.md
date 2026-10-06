@@ -1,66 +1,27 @@
 ---
-title: Performance Analysis
-description: A detailed comparison of throughput, latency, and efficiency across different Azure Storage drivers.
+title: Performance Measurement
+description: Measured evidence and the limits of driver comparisons.
 ---
 
-Performance in `aznet` is primarily determined by the **chunk size** supported by the underlying Azure service.
-Larger chunks mean fewer API calls and less accumulated network latency.
+Polling and Azure request latency are part of every connection. Throughput also depends on application write sizes, batching, receive consumption, concurrency, service throttling and account placement. A driver's raw chunk ceiling alone does not predict speed.
 
-:::note
-The following benchmarks were performed using **iperf3** through an aznet SOCKS proxy against a public iperf server, measuring real-world throughput over live Azure infrastructure.
-:::
+## Retained measurements
 
-## Summary
+The [SDK measurement baseline](/reference/metrics#reproducing-measurements) uses local Azurite and includes idle, interactive, bulk and concurrent cases. Emulator results validate request accounting and provide a repeatable local comparison; they are not Azure throughput predictions.
 
-| Driver      | Sender        | Receiver       | Speed Ranking |
-| :---------- | :------------ | :------------- | :------------ |
-| **azblob**  | **3.07 MB/s** | **2.65 MB/s**  | **Fastest**   |
-| **azqueue** | 1.11 MB/s     | 0.79 MB/s      | Medium        |
-| **aztable** | 1.13 MB/s     | 0.54 MB/s      | Slowest       |
+On 2026-10-06, a same-account native ProxyBlob workload compared aznet `9e6683d` with the directional Blob-lock change (`aa3fec8`, merged as `7abcd80a7a2820d69e55deb1fc62f8b5a601f4be`). Two alternating rounds each ran 3 BIND conversations, 3 public DNS queries and 45 UDP echo cases, with independent zero-residue checks afterward.
 
-## Key Performance Drivers
+| Round | Before echo median | After echo median |
+| :--- | ---: | ---: |
+| 1 | 974 ms | 481 ms |
+| 2 | 995 ms | 483 ms |
 
-### 1. Storage Account Type
+DNS latency did not improve consistently. These are whole ProxyBlob conversation measurements, not direct aznet bulk-transfer benchmarks. The separate instrumented pair found cross-direction mutex waits dropped while mean SDK header/append calls still took roughly 120–230 ms. Polling also remained significant. Do not sum overlapping directional totals or infer a general Azure SLO.
 
-Azure Blob Storage performance varies significantly between account types:
+Exact workload settings, host/toolchains, concurrency, heap measurements and the profile are retained in ProxyBlob's [measured-workload report](https://github.com/quarkslab/proxyblob/blob/6493d6329a62dc3a1ff5a2f0ca3823b5926ea46b/docs/performance.md) and its linked baseline. ProxyBlob's per-stream credit budgets are an application layer above aznet's connection buffers.
 
-- **Standard**: General-purpose storage using HDD-based media. Good for bulk data.
-- **Premium**: High-performance storage using SSD-based media. Significantly lower latency for small operations and higher throughput for large transfers.
+## Reproduce before tuning
 
-### 2. Chunk Size
+Record both endpoint revisions and the actual published module or explicit workspace used. Hold payload, concurrency, polling, limits, region and account constant; alternate old/new runs and repeat. Measure application bytes, latency distributions, SDK attempts, allocations and sampled peak memory. Separate race correctness runs from performance timings.
 
-The most significant factor. Azure Blob Storage supports the largest appends, dramatically reducing the number of round-trips.
-
-- **azblob**: 4,096 KB chunks.
-- **aztable**: 960 KB chunks (using multi-property entities).
-- **azqueue**: 48 KB chunks (85x more operations than Blob).
-
-### 3. Transfer Pattern
-
-Each driver exhibits a different transfer behavior:
-
-- **azblob**: Smooth, consistent throughput with zero retransmissions.
-- **azqueue**: Steady flow with occasional minor retransmissions.
-- **aztable**: Bursty pattern with frequent zero-transfer intervals and high retransmissions, caused by the heavier per-operation overhead of entity serialization and query-based reads.
-
-## iperf3 Benchmark Details
-
-| Driver      | Sender (Mbits/sec) | Receiver (Mbits/sec) | Retransmissions | Pattern |
-| :---------- | :------------------ | :------------------- | :-------------- | :------ |
-| **azblob**  | **24.6**            | **21.2**             | 0               | Smooth  |
-| **azqueue** | 8.91                | 6.31                 | 3               | Steady  |
-| **aztable** | 9.02                | 4.30                 | 16              | Bursty  |
-
-*Benchmarks performed through an aznet SOCKS proxy to a public iperf3 server.*
-
-## Operation Efficiency (100 MB Echo Transfer)
-
-Operation counts measured from a live Azure 100 MB echo transfer using the metrics example.
-
-| Driver      | Total Write Ops | Total Read Ops | Total List Ops | Grand Total |
-| :---------- | :-------------- | :------------- | :------------- | :---------- |
-| **azblob**  | 55              | 47             | 24             | **128**     |
-| **azqueue** | 4,274           | 583            | 182            | **5,041**   |
-| **aztable** | 217             | 207            | 84             | **510**     |
-
-*Combined client + server operations. `azblob` requires ~39x fewer total operations than `azqueue` for the same data.*
+Keep byte identity, ordered EOF, cancellation, bounded memory and cleanup as correctness gates. Faster results that lose bytes or increase resource retention are not acceptable improvements. See [validation and migration](/guides/validation) for what ran and what remains deployment-specific.

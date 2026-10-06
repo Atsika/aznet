@@ -10,15 +10,13 @@ description: How to use the Azurite storage emulator for local testing and devel
 The easiest way to run Azurite is via Docker:
 
 ```bash
-docker run -p 10000:10000 -p 10001:10001 -p 10002:10002 \
-    mcr.microsoft.com/azure-storage/azurite
+docker run --rm --name aznet-dev \
+    -p 127.0.0.1:10000:10000 -p 127.0.0.1:10001:10001 -p 127.0.0.1:10002:10002 \
+    mcr.microsoft.com/azure-storage/azurite:3.34.0 \
+    azurite --blobHost 0.0.0.0 --queueHost 0.0.0.0 --tableHost 0.0.0.0 --skipApiVersionCheck
 ```
 
-Alternatively, use the provided `docker-compose.yml` in the root of the `aznet` repository:
-
-```bash
-docker-compose up -d
-```
+The retained integration runs used Azurite 3.34.0 with `--skipApiVersionCheck` because the SDK requests a newer API version. This bypass supports emulator testing; it does not establish parity with every live Azure behavior.
 
 ## Connecting with aznet
 
@@ -62,8 +60,18 @@ Ensure you are using a recent version of Azurite. `aznet` relies on features (li
 
 ### 2. HTTPS vs HTTP
 
-By default, Azurite runs over HTTP. `aznet` handles this automatically if you specify `http://` or `localhost` in the endpoint URL.
+Azurite runs over HTTP in this example. Specify `http://` explicitly; use HTTPS for live Azure.
 
 ### 3. Cleaning Up
 
-If your tests crash, Azurite might still have old containers or queues. You can reset Azurite by deleting its data directory (usually `__blobstorage__`, `__queuestorage__`, etc.) or by restarting the container.
+If tests crash, owned resources may remain. Stop and remove the disposable container above to discard its unmounted storage. Restarting a container or recreating one with a persistent volume does not erase that volume. Never clear a shared emulator’s data as a substitute for namespace cleanup.
+
+## Run the SDK integration suite
+
+With the emulator running at the default ports above:
+
+```bash
+AZNET_AZURITE=1 GOWORK=off go test -mod=readonly -race -count=1 ./...
+```
+
+Without the opt-in environment variable, emulator tests skip. See [metrics](/reference/metrics) for the measurement-only invocation and [validation](/guides/validation) for the separate live Azure evidence.

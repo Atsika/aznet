@@ -36,7 +36,7 @@ func WithFastPoll(d time.Duration) Option
 ```
 
 Sets a faster polling interval used when data is actively flowing.
-Drivers switch to this interval immediately after receiving a chunk.
+The core poller switches to this interval after receiving data.
 
 - **Default**: `10ms`
 - **Use case**: Decrease for lower latency during active transfers; increase for cost savings.
@@ -60,7 +60,7 @@ func WithIdleTimeout(d time.Duration) Option
 ```
 
 The duration of inactivity before a connection is considered dead and
-its Azure resources are eligible for cleanup by the server's janitor.
+its Azure resources are eligible for cleanup by the server's janitor. Zero or negative values retain the default; they do not disable idle cleanup.
 
 - **Default**: `5m`
 
@@ -80,10 +80,10 @@ The interval between keep-alive "Ping" frames. Set to `0` to disable.
 func WithSASExpiry(d time.Duration) Option
 ```
 
-The duration for which generated Shared Access Signature (SAS) tokens remain valid.
+Legacy option setting both default bootstrap and session authorization duration. Use the independent lifetime APIs below when those policies differ.
 
 - **Default**: `24h`
-- **Security**: Shorter expiries are safer but may interrupt long-running connections if not refreshed.
+- **Security**: Session expiry can interrupt active connections. There is no automatic refresh.
 
 ## Advanced Configuration
 

@@ -97,7 +97,7 @@ Handles the full connection lifecycle: handshake posting/polling, token exchange
 
 ```go
 type Transport interface {
-    WriteRaw(ctx context.Context, data io.ReadSeeker) error
+    WriteRaw(ctx context.Context, seq uint64, data io.ReadSeeker) error
     ReadRaw(ctx context.Context) (io.ReadCloser, error)
     Close() error
     LocalAddr() net.Addr
@@ -106,7 +106,7 @@ type Transport interface {
 }
 ```
 
-The raw byte-exchange interface implemented by drivers for data transfer.
+The raw byte-exchange interface implemented by drivers for data transfer. Sequence starts at zero and advances only on success; an uncertain retry receives identical ciphertext and sequence. See the [driver contract and migration requirements](/guides/developing-drivers#migration-checklist).
 
 ### Rotator
 
@@ -141,6 +141,8 @@ The `net.Listener` implementation returned by `Listen` also provides:
 - `Close() error`: Cancels acceptance and closes all owned sessions, independently of the janitor. Returns cleanup failures or a timeout if teardown remains incomplete. Repeated calls return the original result. Shared bootstrap endpoints remain intact.
 - `CleanupBootstrap(ctx context.Context) error`: Explicitly deletes the shared handshake/token namespace. Its administrator should call this only after every namespace user has stopped, with an uncancelled cleanup context. Deletion failures are returned.
 
+Deadlines are mutable and also interrupt operations waiting for an internal I/O gate. Moving or clearing a deadline before it expires updates pending operations. A canceled operation does not erase already accepted write bytes.
+
 ### Closing and resource ownership
 
 A successful storage upload is not an acknowledgement that the peer consumed the bytes. Full `Close` on an accepted connection deletes session storage and can discard data the peer has not read. For delivery-sensitive responses, call `CloseWrite`, wait for application-level completion from the peer, then call `Close`.
@@ -160,7 +162,7 @@ connection report the same timestamp. Callers do not need access to credentials.
 Custom drivers may populate `SessionTokens.ExpiresAt` with trustworthy issuance
 metadata. Its zero value means unknown and is omitted from the exchange. Older
 peers that omit expiry also yield unknown; no connection-time estimate is invented.
-The original Driver/Transport interfaces remain unchanged.
+The expiry capability does not add a required Driver or Transport method. The earlier sequence-aware WriteRaw change still requires custom-driver migration.
 
 Expiry is informational. There is no automatic renewal, expiry timer, or forced
 close at the displayed timestamp. Bootstrap expiry governs discovery/joining; it

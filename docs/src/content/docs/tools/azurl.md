@@ -32,7 +32,7 @@ azurl [-driver <type>] -url <url> -account <account> -key <key> [options]
 | `-key`       | The Azure Storage account key. (default: Azurite master key)                                                            |
 | `-handshake` | Handshake endpoint name (default: `handshake`).                                                                         |
 | `-token`     | Token endpoint name (default: `token`).                                                                                 |
-| `-expiry`    | SAS token expiry duration (default: `24h`).                                                                             |
+| `-expiry`    | Bootstrap SAS duration (default: `24h`); does not configure a running listener’s session duration.                                                                             |
 | `-env`       | Use credentials from environment variables (`AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_ACCOUNT_KEY`).                      |
 
 ### Examples
@@ -61,7 +61,7 @@ azurl -url https://account.blob.core.windows.net -account account -key key -expi
 
 When you run `azurl`, it performs the following steps:
 
-1. **Authenticates** with your Azure Storage account using the provided credentials (flags, environment variables, or defaults).
+1. **Creates a listener** using the provided credentials (flags, environment variables, or defaults), ensuring shared bootstrap resources exist. The temporary listener closes without deleting those resources. An administrator owns their eventual cleanup.
 2. **Generates** two separate Shared Access Signature (SAS) tokens with minimal permissions:
    - **Handshake SAS**: Grants `Add`, `Create`, and `Write` for Blob; `Add` for Queue and Table.
    - **Token SAS**: Grants `Read` and `List` for Blob; `Read` for Queue and Table.
@@ -80,6 +80,6 @@ using only the limited permissions granted by the embedded SAS tokens.
 
 ## Security Considerations
 
-- **SAS Expiration**: The generated SAS tokens are valid for the duration specified by `-expiry` (default **24 hours**). After they expire, the client will receive `403 Forbidden` errors.
+- **SAS Expiration**: The generated SAS tokens are valid for the duration specified by `-expiry` (default **24 hours**). Expiry affects later bootstrap requests, not already-issued session credentials. The running listener sets session duration independently; this tool does not renew either credential.
 - **Token Encoding**: SAS tokens often contain special characters. `azurl` ensures these are safely Base64 URL-encoded so they don't interfere with the overall URL structure.
 - **Credential Safety**: `azurl` is intended to be run by the server administrator. The output URL does *not* contain your master Account Key.

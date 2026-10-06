@@ -14,13 +14,12 @@ The core idea of `aznet` is **"Network Anywhere"**. Traditional networking (TCP/
 - Network Address Translation (NAT).
 - Lack of stable IP addresses in serverless environments.
 
-By using Azure Storage as a transport layer, `aznet` bypasses these issues.
-If you can reach `*.core.windows.net` via HTTPS, you can establish a bi-directional networking connection.
+Azure Storage provides a rendezvous and data path when both endpoints have authorized network access and valid credentials. Storage firewall rules, credential permissions, expiry and service availability still apply.
 
 ### Design Principles
-1. **Interface Compatibility**: Strictly adhere to `net.Conn` and `net.Listener`.
-2. **Ephemeral Resources**: Azure resources (containers, queues, tables) should exist only as long as the connection.
-3. **Security First**: No plaintext data should ever touch Azure.
+1. **Interface Compatibility**: Expose `net.Conn` and `net.Listener`, with storage latency and explicit delivery/cleanup semantics.
+2. **Resource Ownership**: The listener owns accepted-session cleanup; shared bootstrap resources outlive it.
+3. **Encryption**: Encrypt application frames; anonymous Noise NN does not authenticate peers or hide all metadata.
 4. **Driver Agnostic**: The application shouldn't care which Azure service is used under the hood.
 
 ## Framing & Message Types
@@ -35,7 +34,7 @@ Each frame consists of a header and a payload:
 - **Payload** (N bytes): The actual message content.
 
 The maximum size of a single frame (MTU) is derived from the driver's `MaxRawSize()` minus the
-encryption overhead (20 bytes) and the aznet frame header (5 bytes).
+encryption overhead (20 bytes) and the aznet frame header (5 bytes), further constrained by configured write/retry allowances.
 
 ### Message Types
 `aznet` defines four distinct message types:
@@ -77,8 +76,8 @@ sequenceDiagram
     Note over Server: Create Dedicated Connection Resources
     Note over Server: Generate Scoped SAS Tokens
     
-    Server->>TokenStorage: Upload Handshake Response (write)
     Server->>HandshakeStorage: Delete Handshake Request
+    Server->>TokenStorage: Upload Handshake Response (write)
     
     loop Polling
         Client->>TokenStorage: Get Handshake Response (read)
@@ -100,7 +99,7 @@ The client initiates a handshake using the Noise Protocol.
 
 ### 2. Data Transfer Phase
 Once the handshake is complete, both parties have:
-1. A shared symmetric encryption key.
+1. Separate directional cipher states derived by the anonymous handshake.
 2. Direct access to the dedicated Azure Storage resources.
 
 Data is split into chunks, encrypted locally, and uploaded to Azure.
@@ -127,4 +126,4 @@ It increases polling frequency when data is actively flowing and slows down duri
 ### Janitor
 
 The Janitor is responsible for garbage collection of Azure resources.
-It monitors `peerLastSeen` timestamps and connection states to ensure that ephemeral resources are cleaned up promptly.
+It monitors `peerLastSeen` timestamps and connection states to close idle owned sessions. Crashes and backend failures still require external resource reconciliation.

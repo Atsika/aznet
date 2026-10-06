@@ -11,13 +11,14 @@ To run the examples:
 1. Run the server in one terminal:
 
 ```bash
-go run examples/echo/server/server.go
+go run ./examples/echo/server
 ```
 
+1. Configure the client with a fresh connection URL from the server. The checked-in URL is illustrative and may be expired. Treat the generated URL as a secret.
 1. Run the client in another terminal:
 
 ```bash
-go run examples/echo/client/client.go
+go run ./examples/echo/client
 ```
 
 ## Echo
@@ -38,3 +39,5 @@ Demonstrates how to use the built-in metrics system to monitor connection health
   - Shows all transaction types (Write, Read, List, Delete)
   - Displays data transfer statistics (bytes sent/received)
 - **Usage**: Run the server first, then the client. Both will print metrics reports when the transfer completes.
+
+These examples illustrate API usage; the [validation guide](/guides/validation) identifies the automated suites and exact revisions actually exercised. Check write/close errors and use application-level completion when final delivery matters.

@@ -69,6 +69,7 @@ export default defineConfig({
             { label: "Local Development", slug: "guides/azurite" },
             { label: "Developing a Driver", slug: "guides/developing-drivers" },
             { label: "Examples", slug: "guides/examples" },
+            { label: "Validation & Migration", slug: "guides/validation" },
           ],
         },
         {

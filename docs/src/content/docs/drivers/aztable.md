@@ -4,7 +4,7 @@ description: Detailed documentation for the aztable driver.
 ---
 
 The `aztable` driver uses Azure Table Storage as the underlying transport layer.
-While it provides a balanced architecture, it is generally the least performant and most expensive option in the `aznet` suite.
+It provides ordered entity reads, bounded prefetch, and reclamation of consumed rows.
 
 ## How it works
 
@@ -60,7 +60,7 @@ Each data entity in the table follows this schema to maximize storage efficiency
 | Property           | Value                       | Description                                           |
 | :----------------- | :-------------------------- | :---------------------------------------------------- |
 | **PartitionKey**   | `"data"`                    | Static key used to group all data for the connection. |
-| **RowKey**         | `000000001`, `000000002`... | Zero-padded 9-digit sequence number for ordering.     |
+| **RowKey**         | `000000000`, `000000001`... | Zero-padded 9-digit sequence number for ordering.     |
 | **Data**           | `Edm.Binary`                | The first 64 KiB of encrypted binary payload.         |
 | **Data01..Data14** | `Edm.Binary`                | Subsequent 64 KiB chunks of the payload.              |
 
@@ -73,25 +73,9 @@ Unlike Queue storage, Table Storage doesn't have a built-in "pop" mechanism.
 2. Reading entities using a filter: `PartitionKey eq 'data' and RowKey ge '<next_expected_seq>'`.
 3. **Pre-fetching**: The driver requests up to four entities at once, subject to the pending-byte allowance. If the returned entities are strictly sequential, they are processed as a single batch, significantly reducing the number of round-trips to Azure.
 
-## Performance
+## Deployment and measurement
 
-The `aztable` driver has been optimized to handle larger payloads and reduce latency through pre-fetching.
-
-- **Max Payload**: **960 KiB** (`MaxTableEntitySize`).
-- **Storage Strategy**: Uses 15 `Edm.Binary` properties of 64 KiB each.
-- **Throughput**: Up to **1.13 MB/s** sender / **0.54 MB/s** receiver (iperf3 benchmark through SOCKS proxy).
-- **Transfer Pattern**: Bursty with frequent zero-transfer intervals and high retransmissions due to entity serialization and query overhead.
-
-## Advantages
-
-- **Architectural Completeness**: Included for scenarios where Table Storage is the only available service.
-- **Ordered Retrieval**: Uses sequence-based `RowKey` to guarantee message order despite the lack of a native queue mechanism.
-
-## Limitations
-
-- **Highest Cost**: More expensive than both Queue and Blob storage per unit of data.
-- **Lower Performance**: Slower than `azblob` due to entity management and querying overhead.
-- **Not Recommended**: For most use cases, `azblob` (speed) or `azqueue` (cost) is a better choice.
+Use a Standard general-purpose v2 account. Compare [measured performance](/drivers/performance) and [SDK attempts](/reference/metrics) for your payload sizes and concurrency. Entity serialization, query pages and deletion transactions all contribute; these do not establish a universal ranking against Blob or Queue.
 
 ## Bounded buffering and reclamation
 
