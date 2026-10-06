@@ -78,9 +78,9 @@ func TestAzuriteConnectionContract(t *testing.T) {
 			}
 			// Force a real Blob resource rollover at a frame boundary without 50k writes.
 			if blob, ok := client.(*blobTransport); ok {
-				blob.mu.Lock()
+				blob.txMu.Lock()
 				blob.blocksWritten = MaxBlocksPerBlob - 10
-				blob.mu.Unlock()
+				blob.txMu.Unlock()
 			}
 			if _, err := sender.Write([]byte("tail")); err != nil {
 				t.Fatal(err)
