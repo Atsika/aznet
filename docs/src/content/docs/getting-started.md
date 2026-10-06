@@ -129,13 +129,15 @@ func main() {
     defer conn.Close()
     
     if _, err := conn.Write([]byte("Hello, aznet!")); err != nil {
-        log.Fatal("write failed")
+        log.Print("write failed")
+        return
     }
     
     response := make([]byte, 1024)
     n, err := conn.Read(response)
     if err != nil {
-        log.Fatal("read failed")
+        log.Print("read failed")
+        return
     }
     fmt.Printf("Received: %s\n", response[:n])
 }

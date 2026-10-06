@@ -1,6 +1,6 @@
 # aznet
 
-<p align="center"><img src="./docs/src/assets/aznet.png" width="300"></p>
+<p align="center"><img src="./docs/src/assets/aznet.png" width="300" alt="aznet logo"></p>
 
 Go `net.Conn` and `net.Listener` interfaces over Azure Blob, Queue and Table Storage.
 
