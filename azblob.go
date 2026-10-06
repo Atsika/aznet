@@ -276,13 +276,14 @@ type blobTransport struct {
 	txOffset       int64 // bytes appended to txBlob; the append-position guard
 	rxOffset       int64
 	txSeq, rxSeq   int
-	mu             sync.Mutex
-	isInitiator    bool
+	// HTTP calls serialize only their own direction; TX and RX use distinct blobs.
+	txMu, rxMu  sync.Mutex
+	isInitiator bool
 }
 
 func (t *blobTransport) WriteRaw(ctx context.Context, seq uint64, data io.ReadSeeker) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.txMu.Lock()
+	defer t.txMu.Unlock()
 
 	n, _ := data.Seek(0, io.SeekEnd)
 	_, _ = data.Seek(0, io.SeekStart)
@@ -315,8 +316,8 @@ func (t *blobTransport) ReadRawLimit(ctx context.Context, limit int) (io.ReadClo
 	if limit <= 0 {
 		return nil, ErrBufferLimit
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.rxMu.Lock()
+	defer t.rxMu.Unlock()
 	resp, err := t.containerClient.NewBlobClient(t.rxBlob).DownloadStream(ctx, &blob.DownloadStreamOptions{Range: blob.HTTPRange{Offset: t.rxOffset, Count: int64(min(limit, t.MaxRawSize(), max(1, t.cfg.limits().Pending/2)))}})
 	if err != nil {
 		if re, ok := err.(*azcore.ResponseError); ok && (re.StatusCode == http.StatusNotFound || re.StatusCode == http.StatusRequestedRangeNotSatisfiable) {
@@ -344,9 +345,9 @@ type blobReadBody struct {
 
 func (b *blobReadBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
-	b.transport.mu.Lock()
+	b.transport.rxMu.Lock()
 	b.transport.rxOffset += int64(n)
-	b.transport.mu.Unlock()
+	b.transport.rxMu.Unlock()
 	return n, err
 }
 
@@ -360,14 +361,14 @@ func (t *blobTransport) RemoteAddr() net.Addr {
 }
 
 func (t *blobTransport) ShouldRotate() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.txMu.Lock()
+	defer t.txMu.Unlock()
 	return t.blocksWritten >= MaxBlocksPerBlob-10
 }
 
 func (t *blobTransport) RotateTX(ctx context.Context) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.txMu.Lock()
+	defer t.txMu.Unlock()
 	prefix := t.cfg.reqPrefix
 	if !t.isInitiator {
 		prefix = t.cfg.resPrefix
@@ -384,8 +385,8 @@ func (t *blobTransport) RotateTX(ctx context.Context) error {
 }
 
 func (t *blobTransport) RotateRX() error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.rxMu.Lock()
+	defer t.rxMu.Unlock()
 	t.rxSeq++
 	prefix := t.cfg.resPrefix
 	if !t.isInitiator {
