@@ -18,6 +18,6 @@ Use official [Blob](https://azure.microsoft.com/en-us/pricing/details/storage/bl
 
 ## Retention and cleanup
 
-Session storage remains until it is consumed/reclaimed or the accepted connection cleans it up. Table keeps a bounded consumed-row tail as an uncertain-write receipt; unread data may remain much larger. Blob retains appended data until rotation/session resource deletion. Memory limits do not cap all remote storage.
+Session storage remains until it is consumed/reclaimed or the accepted connection cleans it up. Table keeps a bounded consumed-row tail as an uncertain-write receipt; unread data may remain much larger. Blob retains appended data until session-container deletion; rotation does not reclaim previous blobs. Memory limits do not cap all remote storage.
 
 Bootstrap resources deliberately outlive listener Close. Crashes, unavailable storage, or failed cleanup can leave resources behind. Inspect cleanup errors and independently verify the owned namespace; a timeout is not proof of deletion.
