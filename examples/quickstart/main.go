@@ -41,6 +41,9 @@ func main() {
 func serve(ctx context.Context, driver, endpoint string, opts []aznet.Option) (result error) {
 	listener, err := aznet.Listen(driver, endpoint, opts...)
 	if err != nil {
+		if errors.Is(err, aznet.ErrResourceBeingDeleted) {
+			return errors.New("demo namespace is still being deleted; wait and retry or choose a new exclusive -namespace on both server and client")
+		}
 		return errors.New("listen failed; check endpoint and credentials")
 	}
 	l := listener.(*aznet.Listener)

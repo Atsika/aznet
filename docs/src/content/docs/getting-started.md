@@ -100,6 +100,7 @@ The example half-closes the response, waits for a client acknowledgement and ord
 | Symptom | Check |
 |---|---|
 | Server cannot listen | Emulator is ready; ports are free; server endpoint and account key match |
+| Demo namespace is still being deleted | Wait and retry, or use a new exclusive `-namespace` with the same value on server and client |
 | Client cannot dial | Copy a fresh complete URL; keep the server running; match driver and namespace |
 | Azure rejects authorization | Verify credentials, service permissions, network access and expiry; avoid posting raw SDK errors or URLs |
 | Transfer or acknowledgement times out | Both processes have access to storage; the example has a 30-second conversation deadline |
