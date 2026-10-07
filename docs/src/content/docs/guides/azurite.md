@@ -71,7 +71,7 @@ If tests crash, owned resources may remain. Stop and remove the disposable conta
 With the emulator running at the default ports above:
 
 ```bash
-AZNET_AZURITE=1 GOWORK=off go test -mod=readonly -race -count=1 ./...
+AZNET_AZURITE=1 go test -race -count=1 ./...
 ```
 
 Without the opt-in environment variable, emulator tests skip. See [metrics](/reference/metrics) for the measurement-only invocation and [validation](/guides/validation) for the separate live Azure evidence.

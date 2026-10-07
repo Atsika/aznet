@@ -1,5 +1,5 @@
 ---
-title: Your First Connection
+title: Getting started
 description: Run a complete request and response locally before connecting to Azure.
 ---
 

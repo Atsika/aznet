@@ -3,7 +3,7 @@ title: Core API Reference
 description: Detailed documentation for the main aznet package functions and interfaces.
 ---
 
-The `aznet` package provides a standard Go networking interface over Azure Storage.
+The `aznet` package provides standard Go networking interfaces over pluggable drivers. Built-in drivers connect through Azure Storage services.
 
 ## Core Functions
 
@@ -13,10 +13,10 @@ The `aznet` package provides a standard Go networking interface over Azure Stora
 func Listen(network, address string, opts ...Option) (net.Listener, error)
 ```
 
-`Listen` is analogous to `net.Listen`. It starts a listener that polls an Azure Storage resource for incoming connection requests.
+`Listen` is analogous to `net.Listen`. It starts a listener using the selected driver to discover incoming connection requests.
 
 - **network**: The driver type to use (e.g., `"azblob"`, `"azqueue"`, `"aztable"`).
-- **address**: A URL or host identifying the Azure resource (e.g., `https://account.blob.core.windows.net`).
+- **address**: The endpoint understood by the selected driver (e.g., `https://account.blob.core.windows.net` for the Blob driver).
 - **opts**: Optional functional options to configure the listener.
 - **Returns**: A `net.Listener` implementation.
 
@@ -26,7 +26,7 @@ func Listen(network, address string, opts ...Option) (net.Listener, error)
 func Dial(network, address string, opts ...Option) (net.Conn, error)
 ```
 
-`Dial` is analogous to `net.Dial`. It establishes a connection to a remote `aznet.Listener` by performing a Noise handshake via Azure Storage.
+`Dial` is analogous to `net.Dial`. It establishes a connection to a remote `aznet.Listener` by performing a Noise handshake through the selected driver.
 
 - **network**: The driver type to use (e.g., `"azblob"`, `"azqueue"`, `"aztable"`).
 - **address**: A URL provided by the server or generated via `azurl`.

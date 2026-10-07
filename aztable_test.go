@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -24,188 +23,27 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/data/aztables"
+	"github.com/google/uuid"
 )
 
-func TestBoundedWriteBatchesAndCiphertextRetry(t *testing.T) {
-	a, b := reviewNoise(t)
-	var attempts [][]byte
-	var seqs []uint64
-	var c *Conn
-	var plain []byte
-	cfg := applyConfig([]Option{WithPing(0), WithBufferLimits(BufferLimits{Write: 64, Retry: 40})})
-	c = newConn(cfg.ctx, cfg.cancel, &reviewTransport{write: func(_ context.Context, seq uint64, r io.ReadSeeker) error {
-		raw, err := io.ReadAll(r)
-		if err != nil {
-			return err
-		}
-		if len(raw) > 40 || c.bufs.Write.Len() > 64 {
-			t.Fatal("byte allowance exceeded")
-		}
-		attempts = append(attempts, raw)
-		seqs = append(seqs, seq)
-		if len(attempts) == 1 {
-			return io.ErrUnexpectedEOF
-		}
-		p, _, err := b.UnsealData(nil, raw, 40)
-		plain = append(plain, p...)
-		return err
-	}}, cfg, a, nil, "bounded")
-	defer c.cancel()
-	want := bytes.Repeat([]byte("0123456789"), 100)
-	n, err := c.Write(want)
-	if !errors.Is(err, io.ErrUnexpectedEOF) || n <= 0 || n >= len(want) {
-		t.Fatalf("Write = %d, %v", n, err)
-	}
-	if len(c.pending.data) > 40 || c.bufs.Write.Len() > 64 {
-		t.Fatal("retry exceeded allowance")
-	}
-	if err := c.flush(); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(attempts[0], attempts[1]) || seqs[0] != seqs[1] {
-		t.Fatal("retry changed bytes or sequence")
-	}
-	if got, err := c.Write(want[n:]); err != nil || got != len(want)-n {
-		t.Fatal(got, err)
-	}
-	var got []byte
-	for len(plain) > 0 {
-		length := int(binary.BigEndian.Uint32(plain[:4]))
-		got = append(got, plain[FrameHeaderSize:FrameHeaderSize+length]...)
-		plain = plain[FrameHeaderSize+length:]
-	}
-	if !bytes.Equal(got, want) {
-		t.Fatal("batched bytes reordered, duplicated or lost")
-	}
-	if c.pending.data != nil {
-		t.Fatal("successful retry still retains ciphertext")
-	}
-}
-
-func TestReceiveByteOverflowIsTerminal(t *testing.T) {
-	for _, stage := range []string{"pending", "decrypted", "frame"} {
-		t.Run(stage, func(t *testing.T) {
-			a, b := reviewNoise(t)
-			var raw []byte
-			limits := BufferLimits{Pending: 128, Decrypted: 32}
-			switch stage {
-			case "pending":
-				raw = bytes.Repeat([]byte{1}, 129)
-			case "decrypted":
-				raw, _ = a.SealData(nil, bytes.Repeat([]byte{1}, 33))
-			case "frame":
-				var header [FrameHeaderSize]byte
-				binary.BigEndian.PutUint32(header[:4], 100)
-				raw, _ = a.SealData(nil, header[:])
-			}
-			calls := 0
-			c := reviewConn(&reviewTransport{read: func(context.Context) (io.ReadCloser, error) {
-				calls++
-				return io.NopCloser(bytes.NewReader(raw)), nil
-			}}, b)
-			WithBufferLimits(limits)(c.cfg)
-			defer c.cancel()
-			for range 2 {
-				if _, err := c.Read(make([]byte, 1)); !errors.Is(err, ErrBufferLimit) {
-					t.Fatalf("Read = %v", err)
-				}
-			}
-			if _, err := c.Write([]byte("x")); !errors.Is(err, ErrBufferLimit) {
-				t.Fatalf("Write after overflow = %v", err)
-			}
-			if calls != 1 || c.bufs.Noise.Len() > 128 || c.bufs.Read.Len() > 32 {
-				t.Fatal("overflow polled again or retained excess bytes")
-			}
-			start := time.Now()
-			_ = c.Close()
-			if time.Since(start) > time.Second {
-				t.Fatal("overflow shutdown blocked")
-			}
-		})
-	}
-}
-
-type zeroBeforeLastByte struct {
-	*bytes.Reader
-	paused bool
-}
-
-func (r *zeroBeforeLastByte) Read(p []byte) (int, error) {
-	if r.Len() == 1 && !r.paused {
-		r.paused = true
-		return 0, nil
-	}
-	return r.Reader.Read(p)
-}
-
-func TestReceiveOverflowProbeDoesNotDiscardUnreadByte(t *testing.T) {
-	a, b := reviewNoise(t)
-	var frame bytes.Buffer
-	BuildFrame(&frame, Frame{Type: MsgTypeData, Payload: make([]byte, 103)})
-	raw, err := a.SealData(nil, frame.Bytes())
+func TestTableFetchDoesNotConsumeRows(t *testing.T) {
+	client, err := aztables.NewClientWithNoCredential("https://table.invalid/session", &aztables.ClientOptions{ClientOptions: azcore.ClientOptions{
+		Retry: policy.RetryOptions{MaxRetries: -1},
+		Transport: rotationHTTP(func(r *http.Request) (*http.Response, error) {
+			return tableReadResponse(r, 200, `{"value":[{"PartitionKey":"data","RowKey":"000000000","Data":"YWJj","Data@odata.type":"Edm.Binary"}]}`), nil
+		}),
+	}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw = append(raw, 42) // Exactly 128 valid bytes followed by one excess byte.
-	c := reviewConn(&reviewTransport{read: func(context.Context) (io.ReadCloser, error) {
-		return io.NopCloser(&zeroBeforeLastByte{Reader: bytes.NewReader(raw)}), nil
-	}}, b)
-	defer c.cancel()
-	WithBufferLimits(BufferLimits{Pending: 128})(c.cfg)
-	if _, err := c.Read(make([]byte, 1)); !errors.Is(err, ErrBufferLimit) {
+	tr := &tableTransport{rxClient: client}
+	body, err := tr.ReadRaw(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
-}
-
-func TestQueuePendingByteAccounting(t *testing.T) {
-	cfg := applyConfig([]Option{WithBufferLimits(BufferLimits{Pending: 8})})
-	defer cfg.cancel()
-	tr := &queueTransport{cfg: cfg, pending: make(map[uint64][]byte)}
-	if tr.ingestLocked(1, []byte("4567")) || tr.ingestLocked(1, []byte("duplicate")) {
-		t.Fatal("duplicate counted")
-	}
-	if !tr.ingestLocked(2, []byte("overflow")) || tr.pendingBytes != 4 || len(tr.pending) != 1 {
-		t.Fatal("overflow retained bytes")
-	}
-	if tr.ingestLocked(0, []byte("0123")) {
-		t.Fatal("exact allowance rejected")
-	}
-	if got := string(tr.drainLocked()); got != "01234567" || tr.pendingBytes != 0 {
-		t.Fatal(got, tr.pendingBytes)
-	}
-	if tr.ingestLocked(0, []byte("old")) || tr.pendingBytes != 0 {
-		t.Fatal("consumed duplicate counted")
-	}
-}
-
-func TestRepeatedWriteFailuresStayBounded(t *testing.T) {
-	a, _ := reviewNoise(t)
-	var first []byte
-	cfg := applyConfig([]Option{WithPing(0), WithBufferLimits(BufferLimits{Write: 64, Retry: 40})})
-	c := newConn(cfg.ctx, cfg.cancel, &reviewTransport{write: func(_ context.Context, seq uint64, r io.ReadSeeker) error {
-		data, _ := io.ReadAll(r)
-		if first == nil {
-			first = data
-		}
-		if seq != 0 || !bytes.Equal(first, data) {
-			t.Fatal("failed retry changed ciphertext")
-		}
-		return io.ErrUnexpectedEOF
-	}}, cfg, a, nil, "retry")
-	defer c.cancel()
-	for range 10 {
-		if _, err := c.Write(make([]byte, 100)); !errors.Is(err, io.ErrUnexpectedEOF) {
-			t.Fatal(err)
-		}
-		if c.bufs.Write.Len() > 64 || len(c.pending.data) > 40 {
-			t.Fatal("failures accumulated unbounded bytes")
-		}
-	}
-	if err := c.CloseWrite(); !errors.Is(err, io.ErrUnexpectedEOF) {
-		t.Fatal(err)
-	}
-	if c.bufs.Write.Len() > 64 {
-		t.Fatal("FIN exceeded allowance")
+	defer body.Close()
+	if tr.rxSeq != 0 {
+		t.Fatalf("fetch advanced consumption to %d", tr.rxSeq)
 	}
 }
 
@@ -287,6 +125,7 @@ type tableStore struct {
 }
 
 var rowKeyPattern = regexp.MustCompile(`RowKey='([0-9]+)'`)
+
 var filterKeyPattern = regexp.MustCompile(`RowKey ge '([0-9]+)'`)
 
 func (s *tableStore) Do(r *http.Request) (*http.Response, error) {
@@ -783,58 +622,6 @@ func TestTableReclamationRequestMeasurement(t *testing.T) {
 	}
 }
 
-type sizedReviewTransport struct {
-	reviewTransport
-	size int
-}
-
-func (t *sizedReviewTransport) MaxRawSize() int { return t.size }
-
-func TestWriteAllowanceMeasurement(t *testing.T) {
-	for _, allowance := range []int{4 << 20, 8 << 20, 16 << 20} {
-		t.Run(strconv.Itoa(allowance), func(t *testing.T) {
-			a, b := reviewNoise(t)
-			var c *Conn
-			requests, peak, received := 0, 0, 0
-			tr := &sizedReviewTransport{size: 4 << 20}
-			tr.write = func(_ context.Context, seq uint64, r io.ReadSeeker) error {
-				if seq != uint64(requests) {
-					t.Fatal("sequence ordering")
-				}
-				requests++
-				peak = max(peak, c.bufs.Write.Len())
-				raw, _ := io.ReadAll(r)
-				plain, _, err := b.UnsealData(nil, raw, tr.size)
-				if err != nil {
-					return err
-				}
-				for len(plain) > 0 {
-					length := int(binary.BigEndian.Uint32(plain[:4]))
-					for _, value := range plain[FrameHeaderSize : FrameHeaderSize+length] {
-						if value != 42 {
-							t.Fatal("byte identity")
-						}
-					}
-					received += length
-					plain = plain[FrameHeaderSize+length:]
-				}
-				return nil
-			}
-			cfg := applyConfig([]Option{WithPing(0), WithBufferLimits(BufferLimits{Write: allowance})})
-			defer cfg.cancel()
-			c = newConn(cfg.ctx, cfg.cancel, tr, cfg, a, nil, "measurement")
-			payload := bytes.Repeat([]byte{42}, 16<<20)
-			if n, err := c.Write(payload); n != len(payload) || err != nil {
-				t.Fatal(n, err)
-			}
-			if received != len(payload) || peak > allowance {
-				t.Fatal("byte bounds or accounting")
-			}
-			t.Logf("payload=%d write_allowance=%d peak_write=%d requests=%d retry_limit=%d", len(payload), allowance, peak, requests, cfg.limits().Retry)
-		})
-	}
-}
-
 func TestTableSlowConsumerRetainsUnreadRows(t *testing.T) {
 	for _, count := range []int{64, 304} {
 		t.Run(strconv.Itoa(count), func(t *testing.T) {
@@ -874,5 +661,550 @@ func TestTableSlowConsumerRetainsUnreadRows(t *testing.T) {
 				})
 			}
 		})
+	}
+}
+
+func TestTableReadErrorsRemainObservable(t *testing.T) {
+	for _, tc := range []struct {
+		name, code   string
+		status       int
+		transportErr error
+	}{
+		{name: "authorization", code: "AuthorizationFailure", status: 403},
+		{name: "service", code: "InternalError", status: 500},
+		{name: "missing_table", code: "TableNotFound", status: 404},
+		{name: "canceled", transportErr: context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			client, err := aztables.NewClientWithNoCredential("https://read.invalid/session", &aztables.ClientOptions{ClientOptions: azcore.ClientOptions{
+				Retry: policy.RetryOptions{MaxRetries: -1},
+				Transport: rotationHTTP(func(r *http.Request) (*http.Response, error) {
+					calls++
+					if got := r.URL.Query().Get("$filter"); got != "PartitionKey eq 'data' and RowKey ge '000000000'" {
+						t.Errorf("filter changed after error: %q", got)
+					}
+					if calls > 1 {
+						return tableReadResponse(r, 200, `{"value":[]}`), nil
+					}
+					if tc.transportErr != nil {
+						return nil, tc.transportErr
+					}
+					return tableReadResponse(r, tc.status, fmt.Sprintf(`{"odata.error":{"code":%q,"message":{"lang":"en-US","value":"injected failure"}}}`, tc.code)), nil
+				}),
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tr := &tableTransport{rxClient: client}
+			_, noise := reviewNoise(t)
+			conn := reviewConn(tr, noise)
+			defer conn.cancel()
+			conn.SetReadDeadline(time.Now().Add(time.Second))
+			n, err := conn.Read(make([]byte, 1))
+			if n != 0 || err == nil || errors.Is(err, ErrNoData) {
+				t.Fatalf("read = %d, %v", n, err)
+			}
+			if tc.transportErr != nil {
+				if !errors.Is(err, tc.transportErr) {
+					t.Fatalf("lost transport error: %v", err)
+				}
+			} else {
+				var sdkErr *azcore.ResponseError
+				if !errors.As(err, &sdkErr) || sdkErr.StatusCode != tc.status || sdkErr.ErrorCode != tc.code {
+					t.Fatalf("lost service error: %v", err)
+				}
+				if sdkErr.RawResponse.Header.Get("x-ms-request-id") != "read-integrity" {
+					t.Fatal("lost response details")
+				}
+			}
+			if calls != 1 {
+				t.Fatalf("error triggered %d requests", calls)
+			}
+			body, err := tr.ReadRaw(context.Background())
+			if body != nil || !errors.Is(err, ErrNoData) {
+				t.Fatalf("empty poll = %v, %v", body, err)
+			}
+		})
+	}
+}
+
+func tableReadResponse(r *http.Request, status int, body string) *http.Response {
+	return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {"application/json"}, "X-Ms-Request-Id": {"read-integrity"}}, Body: io.NopCloser(strings.NewReader(body)), Request: r}
+}
+
+func TestTableReadEmptyAndGappedPollingPreservesOrder(t *testing.T) {
+	// Literal SDK entities: base64 encodes "first", "second", and "third".
+	const first = `{"PartitionKey":"data","RowKey":"000000000","Data":"Zmlyc3Q=","Data@odata.type":"Edm.Binary"}`
+	const second = `{"PartitionKey":"data","RowKey":"000000001","Data":"c2Vjb25k","Data@odata.type":"Edm.Binary"}`
+	const third = `{"PartitionKey":"data","RowKey":"000000002","Data":"dGhpcmQ=","Data@odata.type":"Edm.Binary"}`
+	pages := []struct{ from, entities, want string }{
+		{"000000000", "", ""},
+		{"000000000", first + "," + third, "first"},
+		{"000000001", third, ""},
+		{"000000001", second + "," + third, "secondthird"},
+		{"000000003", "", ""},
+	}
+	calls := 0
+	client, err := aztables.NewClientWithNoCredential("https://read.invalid/session", &aztables.ClientOptions{ClientOptions: azcore.ClientOptions{
+		Retry: policy.RetryOptions{MaxRetries: -1}, Transport: rotationHTTP(func(r *http.Request) (*http.Response, error) {
+			if r.Method == http.MethodDelete {
+				return tableReadResponse(r, 204, ""), nil
+			}
+			if calls >= len(pages) {
+				return nil, errors.New("unexpected poll")
+			}
+			page := pages[calls]
+			calls++
+			if got := r.URL.Query().Get("$filter"); got != "PartitionKey eq 'data' and RowKey ge '"+page.from+"'" {
+				t.Errorf("filter = %q", got)
+			}
+			return tableReadResponse(r, 200, `{"value":[`+page.entities+`]}`), nil
+		}),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := &tableTransport{rxClient: client}
+	var got []byte
+	for _, page := range pages {
+		body, err := tr.ReadRaw(context.Background())
+		if page.want == "" {
+			if body != nil || !errors.Is(err, ErrNoData) {
+				t.Fatalf("empty/gapped poll = %v, %v", body, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(body)
+		body.Close()
+		if err != nil || string(data) != page.want {
+			t.Fatalf("read = %q, %v; want %q", data, err, page.want)
+		}
+		got = append(got, data...)
+	}
+	if string(got) != "firstsecondthird" {
+		t.Fatalf("out of order: %q", got)
+	}
+}
+
+// liveTableHTTP injects client-side response loss only after the real service
+// responds. SDK retries are disabled so each uncertain outcome reaches aznet.
+// Tests use it serially and never log credential-bearing URLs or SDK errors.
+type liveTableHTTP struct {
+	client                                       *http.Client
+	dropWrite, dropBatch, dropDelete, failDelete bool
+	retryBody                                    []byte
+	retryVerified                                bool
+	batches                                      int
+}
+
+func (h *liveTableHTTP) Do(r *http.Request) (*http.Response, error) {
+	batch := strings.HasSuffix(r.URL.Path, "/$batch")
+	write := r.Method == http.MethodPost && !batch
+	if write {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		if h.retryBody != nil {
+			if !bytes.Equal(body, h.retryBody) {
+				return nil, errors.New("live retry entity changed")
+			}
+			h.retryVerified = true
+			h.retryBody = nil
+		}
+		if h.dropWrite {
+			h.retryBody = bytes.Clone(body)
+			h.retryVerified = false
+		}
+	}
+	if r.Method == http.MethodDelete && h.failDelete {
+		h.failDelete = false
+		return nil, io.ErrUnexpectedEOF
+	}
+	if batch {
+		h.batches++
+	}
+	resp, err := h.client.Do(r)
+	if err != nil {
+		return resp, err
+	}
+	drop := false
+	if write && h.dropWrite && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		h.dropWrite = false
+		drop = true
+	}
+	if batch && h.dropBatch && resp.StatusCode == 202 {
+		h.dropBatch = false
+		drop = true
+	}
+	if r.Method == http.MethodDelete && h.dropDelete && resp.StatusCode == 204 {
+		h.dropDelete = false
+		drop = true
+	}
+	if drop {
+		_, err := io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, io.ErrUnexpectedEOF
+	}
+	return resp, nil
+}
+
+// TestLiveTableReclamation creates/deletes only UUID-named session tables.
+// AZNET_LIVE_CONFIG is the explicit opt-in used by the existing live tests.
+func TestLiveTableReclamation(t *testing.T) {
+	path := os.Getenv("AZNET_LIVE_CONFIG")
+	if path == "" {
+		t.Skip("set AZNET_LIVE_CONFIG to enable live Azure resource operations")
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal("cannot read live configuration")
+	}
+	var config struct {
+		Listeners []struct {
+			Driver  string `json:"driver"`
+			Address string `json:"address"`
+			Account string `json:"storage_account"`
+			Key     string `json:"storage_account_key"`
+		} `json:"listeners"`
+	}
+	if json.Unmarshal(raw, &config) != nil {
+		t.Fatal("invalid live configuration")
+	}
+	var ep *Endpoint
+	for _, c := range config.Listeners {
+		u, err := url.Parse(c.Address)
+		if err == nil && c.Driver == "aztable" && u.Scheme == "https" && strings.HasSuffix(u.Hostname(), ".table.core.windows.net") && c.Account != "" && c.Key != "" {
+			u.User = url.UserPassword(c.Account, c.Key)
+			u.Path = ""
+			u.RawQuery = ""
+			u.Fragment = ""
+			ep = NewEndpoint(u)
+			break
+		}
+	}
+	if ep == nil {
+		t.Fatal("no live Table account-key configuration")
+	}
+	check := func(t *testing.T, step string, err error) {
+		t.Helper()
+		if err == nil {
+			return
+		}
+		var response *azcore.ResponseError
+		if errors.As(err, &response) {
+			t.Fatalf("%s: status=%d code=%s", step, response.StatusCode, response.ErrorCode)
+		}
+		t.Fatalf("%s: error type %T", step, err)
+	}
+	for _, sasReceiver := range []bool{true, false} {
+		t.Run(fmt.Sprintf("sas_receiver_%t", sasReceiver), func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+			defer cancel()
+			cfg := applyConfig([]Option{WithContext(ctx), WithPing(0)})
+			defer cfg.cancel()
+			svc, err := newTableClient(ep, nil)
+			check(t, "service client", err)
+			driver := &tableDriver{client: svc, ep: ep, cfg: cfg}
+			id := uuid.NewString()
+			sid := strings.ReplaceAll(id, "-", "")
+			reqName, resName := cfg.reqPrefix+sid, cfg.resPrefix+sid
+			t.Logf("isolated tables: %s %s", reqName, resName)
+			// Register before creation, including partial CreateSession failure. Use a
+			// separate context so test cancellation cannot prevent residual cleanup.
+			t.Cleanup(func() {
+				cleanup, done := context.WithTimeout(context.Background(), 45*time.Second)
+				defer done()
+				err := driver.CleanupSession(cleanup, id)
+				if err != nil {
+					t.Error("session cleanup failed; test table names logged above")
+					return
+				}
+				for _, name := range []string{reqName, resName} {
+					// Query the table catalog, not merely an already-reclaimed
+					// entity: an entity 404 alone cannot prove table deletion.
+					filter := "TableName eq '" + name + "'"
+					pager := svc.NewListTablesPager(&aztables.ListTablesOptions{Filter: &filter})
+					for pager.More() {
+						page, err := pager.NextPage(cleanup)
+						check(t, "residual table catalog query", err)
+						if len(page.Tables) != 0 {
+							t.Fatal("residual session table remains in catalog")
+						}
+					}
+					_, err := svc.NewClient(name).GetEntity(cleanup, "data", formatRowKey(0), nil)
+					var response *azcore.ResponseError
+					if !errors.As(err, &response) || response.StatusCode != 404 {
+						check(t, "residual entity query", err)
+						t.Fatal("expected residual entity 404")
+					}
+					t.Logf("removed table %s: catalog matches=0; entity status=%d code=%s", name, response.StatusCode, response.ErrorCode)
+				}
+				t.Log("session cleanup verified: both tables absent from catalog and entity requests return 404")
+			})
+			tokens, err := driver.CreateSession(ctx, id)
+			check(t, "create session", err)
+			client, err := driver.NewTransport(ctx, id, tokens, true)
+			check(t, "initiator transport", err)
+			server, err := driver.NewTransport(ctx, id, tokens, false)
+			check(t, "responder transport", err)
+			tx, rx := server.(*tableTransport), client.(*tableTransport)
+			name, token := resName, tokens.Res
+			if !sasReceiver {
+				tx, rx = client.(*tableTransport), server.(*tableTransport)
+				name, token = reqName, tokens.Req
+			}
+			httpClient := &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone()}
+			defer httpClient.CloseIdleConnections()
+			txHTTP, rxHTTP := &liveTableHTTP{client: httpClient}, &liveTableHTTP{client: httpClient}
+			options := func(h *liveTableHTTP) *aztables.ClientOptions {
+				return &aztables.ClientOptions{ClientOptions: azcore.ClientOptions{Retry: policy.RetryOptions{MaxRetries: -1}, Transport: h}}
+			}
+			cred, err := aztables.NewSharedKeyCredential(ep.Account, ep.Key)
+			check(t, "credential", err)
+			if sasReceiver {
+				tx.txClient, err = aztables.NewClientWithSharedKey(ep.JoinURL(name, ""), cred, options(txHTTP))
+				check(t, "writer", err)
+				rx.rxClient, err = aztables.NewClientWithNoCredential(ep.JoinURL(name, token), options(rxHTTP))
+				check(t, "SAS reader", err)
+			} else {
+				tx.txClient, err = aztables.NewClientWithNoCredential(ep.JoinURL(name, token), options(txHTTP))
+				check(t, "SAS writer", err)
+				rx.rxClient, err = aztables.NewClientWithSharedKey(ep.JoinURL(name, ""), cred, options(rxHTTP))
+				check(t, "reader", err)
+			}
+			admin := svc.NewClient(name)
+			count := func(want int) {
+				t.Helper()
+				pager := admin.NewListEntitiesPager(nil)
+				n := 0
+				for pager.More() {
+					page, err := pager.NextPage(ctx)
+					check(t, "independent retained-row query", err)
+					n += len(page.Entities)
+				}
+				if n != want {
+					t.Fatalf("retained rows=%d want=%d", n, want)
+				}
+			}
+			a, b := reviewNoise(t)
+			ciphertext := make([][]byte, 3*tableCleanupRows+1)
+			plaintext := make([][]byte, len(ciphertext))
+			for seq := range ciphertext {
+				plaintext[seq] = []byte(fmt.Sprintf("live encrypted row %09d", seq))
+				ciphertext[seq], err = a.SealData(nil, plaintext[seq])
+				check(t, "seal", err)
+			}
+			write := func(seq int) {
+				t.Helper()
+				check(t, "write row", tx.WriteRaw(ctx, uint64(seq), bytes.NewReader(ciphertext[seq])))
+			}
+			consume := func(end int) {
+				t.Helper()
+				for rx.rxSeq < end {
+					start := rx.rxSeq
+					body, err := rx.ReadRaw(ctx)
+					check(t, "fetch", err)
+					raw, err := io.ReadAll(body)
+					body.Close()
+					check(t, "consume", err)
+					var expected []byte
+					for seq := start; seq < rx.rxSeq; seq++ {
+						expected = append(expected, ciphertext[seq]...)
+					}
+					if !bytes.Equal(raw, expected) {
+						t.Fatal("ciphertext byte identity/order changed")
+					}
+					for seq := start; seq < rx.rxSeq; seq++ {
+						plain, rest, err := b.UnsealData(nil, raw, MaxTableEntitySize)
+						check(t, "decrypt", err)
+						if !bytes.Equal(plain, plaintext[seq]) {
+							t.Fatal("plaintext ordering changed")
+						}
+						raw = rest
+					}
+					if len(raw) != 0 {
+						t.Fatal("encrypted frame remainder")
+					}
+				}
+			}
+			empty := func() {
+				t.Helper()
+				_, err := rx.ReadRaw(ctx)
+				if !errors.Is(err, ErrNoData) {
+					check(t, "cleanup/empty poll", err)
+					t.Fatal("expected empty poll")
+				}
+			}
+			uncertain := func(seq int) {
+				t.Helper()
+				txHTTP.dropWrite = true
+				err := tx.WriteRaw(ctx, uint64(seq), bytes.NewReader(ciphertext[seq]))
+				if !errors.Is(err, io.ErrUnexpectedEOF) || txHTTP.dropWrite {
+					t.Fatal("real successful write response was not dropped")
+				}
+			}
+			uncertain(0)
+			write(0)
+			if !txHTTP.retryVerified {
+				t.Fatal("pre-consumption retry not verified")
+			}
+			for seq := 1; seq < tableCleanupRows; seq++ {
+				write(seq)
+			}
+			uncertain(tableCleanupRows)
+			count(tableCleanupRows + 1)
+			consume(tableCleanupRows + 1)
+			empty() // Strict: SAS batch must succeed; no emulator exception here.
+			if rxHTTP.batches != 1 || rx.reclaimSeq != tableCleanupRows {
+				t.Fatal("full batch did not commit")
+			}
+			count(1)
+			write(tableCleanupRows)
+			if !txHTTP.retryVerified {
+				t.Fatal("post-consumption retry not verified")
+			}
+			write(0)
+			count(1)
+			t.Log("100-row batch succeeded; ciphertext-identical retries before/after consumption; latest receipt retained; old retry did not recreate row")
+
+			for seq := tableCleanupRows + 1; seq <= 2*tableCleanupRows; seq++ {
+				write(seq)
+			}
+			consume(2*tableCleanupRows + 1)
+			rxHTTP.dropBatch = true
+			_, err = rx.ReadRaw(ctx)
+			if !errors.Is(err, io.ErrUnexpectedEOF) || rxHTTP.dropBatch || rx.reclaimSeq != tableCleanupRows {
+				t.Fatal("uncertain batch did not retain cursor")
+			}
+			count(1) // Independently prove the real batch committed before response loss.
+			rxHTTP.failDelete = true
+			_, err = rx.ReadRaw(ctx)
+			if !errors.Is(err, io.ErrUnexpectedEOF) || rx.reclaimSeq != tableCleanupRows {
+				t.Fatal("reconciliation failure advanced cursor")
+			}
+			empty()
+			count(1)
+			if rx.reclaimSeq != 2*tableCleanupRows {
+				t.Fatal("uncertain batch reconciliation incomplete")
+			}
+			t.Log("real batch committed with response withheld; failed reconciliation preserved cursor; 100 individual 404s reconciled safely")
+
+			for seq := 2*tableCleanupRows + 1; seq <= 3*tableCleanupRows; seq++ {
+				write(seq)
+			}
+			consume(3*tableCleanupRows + 1)
+			_, err = admin.DeleteEntity(ctx, "data", formatRowKey(2*tableCleanupRows+50), nil)
+			check(t, "remove middle row", err)
+			count(tableCleanupRows)
+			_, err = rx.ReadRaw(ctx)
+			if err == nil || errors.Is(err, ErrNoData) || rx.reclaimSeq != 2*tableCleanupRows || !rx.reclaimSingles {
+				t.Fatal("missing-row batch failure was hidden")
+			}
+			count(tableCleanupRows) // Missing entity must roll back every other delete.
+			rxHTTP.dropDelete = true
+			_, err = rx.ReadRaw(ctx)
+			if !errors.Is(err, io.ErrUnexpectedEOF) || rxHTTP.dropDelete || rx.reclaimSeq != 2*tableCleanupRows {
+				t.Fatal("uncertain individual delete advanced cursor")
+			}
+			count(tableCleanupRows - 1)
+			empty()
+			count(1)
+			if rx.reclaimSeq != 3*tableCleanupRows || rxHTTP.batches != 3 {
+				t.Fatal("final cleanup progress")
+			}
+			t.Log("missing-row transaction rolled back; lost individual delete response reconciled; final retained rows=1 (newest receipt)")
+		})
+	}
+}
+
+func TestAzuriteTableReclamation(t *testing.T) {
+	if os.Getenv("AZNET_AZURITE") != "1" {
+		t.Skip("set AZNET_AZURITE=1")
+	}
+	const key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cfg := applyConfig([]Option{WithContext(ctx), WithPing(0)})
+	defer cfg.cancel()
+	suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+	cfg.handshakeEndpoint, cfg.tokenEndpoint = "h"+suffix, "t"+suffix
+	u, _ := url.Parse("http://127.0.0.1:10002/devstoreaccount1")
+	u.User = url.UserPassword("devstoreaccount1", key)
+	driver, err := (&tableFactory{}).NewDriver(NewEndpoint(u), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer driver.CleanupBootstrap(ctx)
+	id := uuid.NewString()
+	tokens, err := driver.CreateSession(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer driver.CleanupSession(ctx, id)
+	client, err := driver.NewTransport(ctx, id, tokens, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := driver.NewTransport(ctx, id, tokens, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, pair := range [][2]Transport{{client, server}, {server, client}} {
+		tx, rx := pair[0].(*tableTransport), pair[1].(*tableTransport)
+		for seq := range tableCleanupRows + 1 {
+			payload := bytes.Repeat([]byte{byte(seq)}, 128)
+			if err := tx.WriteRaw(ctx, uint64(seq), bytes.NewReader(payload)); err != nil {
+				t.Fatal(err)
+			}
+			body, err := rx.ReadRaw(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := io.ReadAll(body)
+			body.Close()
+			if err != nil || !bytes.Equal(got, payload) {
+				t.Fatal("byte identity", err)
+			}
+		}
+		if _, err := rx.ReadRaw(ctx); !errors.Is(err, ErrNoData) {
+			// Azurite 3.34.0 authenticates the outer $batch as a table named
+			// "$batch", rejecting table-scoped SAS. Exercise reconciliation
+			// only for that observed error; shared-key batching must succeed.
+			var responseErr *azcore.ResponseError
+			if rx != client || !errors.As(err, &responseErr) || responseErr.StatusCode != 403 || responseErr.ErrorCode != "AuthorizationFailure" {
+				t.Fatal(err)
+			}
+			if rx.reclaimSeq != 0 || !rx.reclaimSingles {
+				t.Fatal("failed batch advanced cleanup")
+			}
+			t.Log("Azurite rejected table-SAS batch: validating individual reconciliation; live Azure SAS batch remains unvalidated")
+			if _, err := rx.ReadRaw(ctx); !errors.Is(err, ErrNoData) {
+				t.Fatal(err)
+			}
+		}
+		if err := tx.WriteRaw(ctx, 0, bytes.NewReader(bytes.Repeat([]byte{0}, 128))); err != nil {
+			t.Fatal(err)
+		}
+		pager := rx.rxClient.NewListEntitiesPager(nil)
+		var retained int
+		for pager.More() {
+			page, err := pager.NextPage(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			retained += len(page.Entities)
+		}
+		if retained != 1 {
+			t.Fatalf("retained %d rows; want last retry receipt only", retained)
+		}
 	}
 }

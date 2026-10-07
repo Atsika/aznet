@@ -2,9 +2,12 @@ package aznet
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,6 +16,20 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/google/uuid"
 )
+
+func TestCleanupPreservesJoinedFailures(t *testing.T) {
+	missing := &azcore.ResponseError{StatusCode: 404}
+	denied := &azcore.ResponseError{StatusCode: 403}
+	for _, err := range []error{errors.Join(missing, denied), fmt.Errorf("custom driver: %w", errors.Join(missing, denied)), errors.Join(denied, missing)} {
+		got := cleanup("session", func(context.Context) error { return err })
+		if !errors.Is(got, denied) {
+			t.Fatalf("hidden deletion failure: %v", got)
+		}
+	}
+	if err := cleanup("already removed", func(context.Context) error { return fmt.Errorf("driver: %w", errors.Join(missing, missing)) }); err != nil {
+		t.Fatal(err)
+	}
+}
 
 type sessionDriver struct {
 	Driver
@@ -35,6 +52,7 @@ func (d *sessionDriver) GetHandshakes(ctx context.Context) ([]Handshake, error) 
 	d.batch = nil
 	return h, nil
 }
+
 func (d *sessionDriver) CreateSession(ctx context.Context, id string) (SessionTokens, error) {
 	d.creates.Add(1)
 	if d.create != nil {
@@ -42,18 +60,21 @@ func (d *sessionDriver) CreateSession(ctx context.Context, id string) (SessionTo
 	}
 	return SessionTokens{}, nil
 }
+
 func (d *sessionDriver) NewTransport(ctx context.Context, _ string, _ SessionTokens, _ bool) (Transport, error) {
 	if d.transport != nil {
 		return d.transport(ctx)
 	}
 	return &reviewTransport{}, nil
 }
+
 func (d *sessionDriver) PostToken(ctx context.Context, _ string, _ []byte) error {
 	if d.post != nil {
 		return d.post(ctx)
 	}
 	return nil
 }
+
 func (d *sessionDriver) DeleteHandshake(ctx context.Context, _ string) error {
 	d.handshakes.Add(1)
 	if d.deletion != nil {
@@ -61,10 +82,12 @@ func (d *sessionDriver) DeleteHandshake(ctx context.Context, _ string) error {
 	}
 	return nil
 }
+
 func (d *sessionDriver) DeleteToken(context.Context, string) error {
 	d.tokens.Add(1)
 	return nil
 }
+
 func (d *sessionDriver) CleanupSession(ctx context.Context, _ string) error {
 	d.sessions.Add(1)
 	if d.sessionCleanup != nil {
@@ -72,10 +95,12 @@ func (d *sessionDriver) CleanupSession(ctx context.Context, _ string) error {
 	}
 	return nil
 }
+
 func (d *sessionDriver) CleanupBootstrap(context.Context) error {
 	d.bootstraps.Add(1)
 	return nil
 }
+
 func sessionListener(t *testing.T, d *sessionDriver, n int) *Listener {
 	t.Helper()
 	for i := 0; i < n; i++ {
@@ -92,6 +117,7 @@ func sessionListener(t *testing.T, d *sessionDriver, n int) *Listener {
 	t.Cleanup(func() { l.Close() })
 	return l
 }
+
 func TestAcceptRetainsDequeuedBatch(t *testing.T) {
 	d := &sessionDriver{}
 	l := sessionListener(t, d, 40)
@@ -113,6 +139,7 @@ func TestAcceptRetainsDequeuedBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
 func TestAcceptAcquisitionRollback(t *testing.T) {
 	failure := errors.New("acquisition failure")
 	for _, stage := range []string{"session", "transport", "token", "handshake"} {
@@ -148,6 +175,7 @@ func TestAcceptAcquisitionRollback(t *testing.T) {
 		})
 	}
 }
+
 func TestAcceptFailureClassification(t *testing.T) {
 	for _, status := range []int{403, 404, 429, 503} {
 		t.Run(strconv.Itoa(status), func(t *testing.T) {
@@ -172,6 +200,7 @@ func TestAcceptFailureClassification(t *testing.T) {
 		})
 	}
 }
+
 func TestEmptyAcceptPollingCancellation(t *testing.T) {
 	for _, emptyErr := range []error{nil, ErrNoData} {
 		d := &sessionDriver{poll: func(context.Context) ([]Handshake, error) { return nil, emptyErr }}
@@ -196,6 +225,7 @@ func TestEmptyAcceptPollingCancellation(t *testing.T) {
 		}
 	}
 }
+
 func TestShutdownDuringAcquisition(t *testing.T) {
 	for _, stage := range []string{"create", "transport", "post"} {
 		t.Run(stage, func(t *testing.T) {
@@ -239,6 +269,7 @@ func TestShutdownDuringAcquisition(t *testing.T) {
 		})
 	}
 }
+
 func TestSessionCloseCleanupFailuresBoundedAndStable(t *testing.T) {
 	for _, tc := range []struct {
 		name         string
@@ -277,6 +308,7 @@ func TestSessionCloseCleanupFailuresBoundedAndStable(t *testing.T) {
 		})
 	}
 }
+
 func TestCleanupUncooperativeDriverBound(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
@@ -307,6 +339,7 @@ func TestTransientAcceptCanRecover(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
 func TestJanitorCleanupFailureSurvivesShutdown(t *testing.T) {
 	failure := errors.New("cannot delete session")
 	done := make(chan struct{}, 1)
@@ -330,6 +363,7 @@ func TestJanitorCleanupFailureSurvivesShutdown(t *testing.T) {
 		t.Fatal("duplicate cleanup")
 	}
 }
+
 func TestCleanupTransientRecovery(t *testing.T) {
 	var calls atomic.Int32
 	err := cleanup("test", func(context.Context) error {
@@ -342,6 +376,7 @@ func TestCleanupTransientRecovery(t *testing.T) {
 		t.Fatal(err, calls.Load())
 	}
 }
+
 func TestMalformedHandshakeDoesNotAllocate(t *testing.T) {
 	d := &sessionDriver{}
 	l := sessionListener(t, d, 1)
@@ -387,6 +422,7 @@ func (d *dialDriver) PostHandshake(ctx context.Context, _ string, msg []byte) er
 	d.token, _ = noise.WriteMessage([]byte(`{"req":"r","res":"s"}`))
 	return nil
 }
+
 func (d *dialDriver) GetToken(context.Context, string) ([]byte, error) {
 	if d.fail == "token" {
 		return nil, d.failure
@@ -403,6 +439,7 @@ func (t *countedTransport) Close() error {
 	t.closes.Add(1)
 	return nil
 }
+
 func TestDialFailureOwnership(t *testing.T) {
 	for _, stage := range []string{"post", "token", "transport", "cancel"} {
 		t.Run(stage, func(t *testing.T) {
@@ -477,5 +514,19 @@ func TestCloseCleansActiveSessionsBeforeBlockedSetupReturns(t *testing.T) {
 	}
 	if d.sessions.Load() != 2 {
 		t.Fatal("late setup leaked", d.sessions.Load())
+	}
+}
+
+func TestUnknownSessionExpirySerialization(t *testing.T) {
+	raw, err := json.Marshal(SessionTokens{Req: "custom", Res: "opaque"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "expires_at") {
+		t.Fatal("unknown metadata must be absent from handshake")
+	}
+	var legacy SessionTokens
+	if err := json.Unmarshal([]byte(`{"req":"custom","res":"opaque"}`), &legacy); err != nil || !legacy.ExpiresAt.IsZero() {
+		t.Fatalf("legacy tokens: %v %v", legacy, err)
 	}
 }
