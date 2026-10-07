@@ -276,3 +276,31 @@ func Listen(network, address string, opts ...Option) (net.Listener, error) {
 
 	return l, nil
 }
+
+// ErrBootstrapDurationUnsupported means a custom driver cannot issue bootstrap
+// credentials with an independent duration. Its default ConnectionString still works.
+var ErrBootstrapDurationUnsupported = errors.New("driver does not support an independent bootstrap duration")
+
+// BootstrapTokenIssuer is an optional Driver capability. It issues credentials
+// for one bootstrap URL without changing the driver's session policy.
+type BootstrapTokenIssuer interface {
+	CreateBootstrapTokensFor(time.Duration) (handshake, token string, err error)
+}
+
+// ConnectionStringFor issues bootstrap credentials valid for duration from their
+// issuance time. It does not mutate listener/session configuration or renew any
+// existing credential. Azure SAS timestamps have whole-second precision.
+func (l *Listener) ConnectionStringFor(duration time.Duration) (string, error) {
+	if err := validateCredentialDuration(duration); err != nil {
+		return "", err
+	}
+	issuer, ok := l.driver.(BootstrapTokenIssuer)
+	if !ok {
+		return "", ErrBootstrapDurationUnsupported
+	}
+	h, t, err := issuer.CreateBootstrapTokensFor(duration)
+	if err != nil {
+		return "", err
+	}
+	return l.ep.BuildConnURL(l.cfg, h, t), nil
+}

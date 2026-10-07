@@ -71,8 +71,8 @@ the pinned SDK version. The opt-in measurement uses only the public development
 account, unique bootstrap/session resources and cleanup:
 
 ```sh
-AZNET_MEASURE=1 GOWORK=off go test -mod=readonly \
-  -run '^TestSDKWorkloadMeasurement$' -count=1 -v -timeout=12m .
+AZNET_MEASURE=1 go test \
+  -run '^TestSDKWorkloadMeasurement$' -count=1 -v -timeout=12m ./tests/performance
 ```
 
 The workload uses public Listen/Dial and net.Conn reads/writes through all three

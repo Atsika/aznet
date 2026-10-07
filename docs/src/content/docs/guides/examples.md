@@ -3,7 +3,7 @@ title: Examples
 description: Explore working examples of aznet in action.
 ---
 
-Start with [Your First Connection](/getting-started). Its `examples/quickstart` program runs one complete request/response with byte verification, ordered EOF, application acknowledgement and explicit demo cleanup. It accepts `-driver`, `-listen`, `-namespace` and the client `AZNET_URL` environment variable; no source edits or checked-in SAS token are needed.
+Start with [Getting started](/getting-started). Its `examples/quickstart` program runs one complete request/response with byte verification, ordered EOF, application acknowledgement and explicit demo cleanup. It accepts `-driver`, `-listen`, `-namespace` and the client `AZNET_URL` environment variable; no source edits or checked-in SAS token are needed.
 
 ## Interactive echo example
 

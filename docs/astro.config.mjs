@@ -39,7 +39,7 @@ export default defineConfig({
           label: "Start",
           items: [
             { label: "Overview", slug: "index" },
-            { label: "Your first connection", slug: "getting-started" },
+            { label: "Getting started", slug: "getting-started" },
             { label: "Examples", slug: "guides/examples" },
           ],
         },

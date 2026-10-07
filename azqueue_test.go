@@ -3,14 +3,38 @@ package aznet
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 )
+
+func TestQueuePendingByteAccounting(t *testing.T) {
+	cfg := applyConfig([]Option{WithBufferLimits(BufferLimits{Pending: 8})})
+	defer cfg.cancel()
+	tr := &queueTransport{cfg: cfg, pending: make(map[uint64][]byte)}
+	if tr.ingestLocked(1, []byte("4567")) || tr.ingestLocked(1, []byte("duplicate")) {
+		t.Fatal("duplicate counted")
+	}
+	if !tr.ingestLocked(2, []byte("overflow")) || tr.pendingBytes != 4 || len(tr.pending) != 1 {
+		t.Fatal("overflow retained bytes")
+	}
+	if tr.ingestLocked(0, []byte("0123")) {
+		t.Fatal("exact allowance rejected")
+	}
+	if got := string(tr.drainLocked()); got != "01234567" || tr.pendingBytes != 0 {
+		t.Fatal(got, tr.pendingBytes)
+	}
+	if tr.ingestLocked(0, []byte("old")) || tr.pendingBytes != 0 {
+		t.Fatal("consumed duplicate counted")
+	}
+}
 
 // This is an investigation of the existing read-only bootstrap protocol, not a
 // claim that Azure Queue supports pagination of PeekMessages. It demonstrates
@@ -99,5 +123,50 @@ func TestAzuriteQueueAbandonedTokensExpire(t *testing.T) {
 	}
 	if err := driver.DeleteToken(ctx, id); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestQueueDeletionRetainsReceiptOnFailure(t *testing.T) {
+	var mu sync.Mutex
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			w.WriteHeader(201)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		attempts++
+		if r.URL.Query().Get("popreceipt") != "receipt" {
+			t.Error("lost receipt")
+		}
+		if attempts == 1 {
+			sdkFailure(w, "azqueue", 403, "AuthorizationFailure")
+			return
+		}
+		w.WriteHeader(204)
+	}))
+	defer server.Close()
+	u, _ := url.Parse(server.URL + "/account")
+	u.User = url.UserPassword("account", "dGVzdC1rZXk=")
+	cfg := applyConfig(nil)
+	defer cfg.cancel()
+	driver, err := (&queueFactory{}).NewDriver(NewEndpoint(u), cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := driver.(*queueDriver)
+	d.receipts.Store("session", "message:receipt")
+	if err := d.DeleteToken(context.Background(), "session"); err == nil {
+		t.Fatal("hidden deletion failure")
+	}
+	if _, ok := d.receipts.Load("session"); !ok {
+		t.Fatal("receipt discarded on failure")
+	}
+	if err := d.DeleteToken(context.Background(), "session"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := d.receipts.Load("session"); ok {
+		t.Fatal("receipt retained after success")
 	}
 }

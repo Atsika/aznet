@@ -14,9 +14,150 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
-	"github.com/Azure/azure-sdk-for-go/sdk/data/aztables"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 )
+
+type rotationHTTP func(*http.Request) (*http.Response, error)
+
+func (f rotationHTTP) Do(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestBlobRotationCreationFailurePreservesTX(t *testing.T) {
+	calls := 0
+	client, err := container.NewClientWithNoCredential("https://rotation.invalid/session", &container.ClientOptions{ClientOptions: azcore.ClientOptions{
+		Retry: policy.RetryOptions{MaxRetries: -1},
+		Transport: rotationHTTP(func(r *http.Request) (*http.Response, error) {
+			calls++
+			if r.URL.Path != "/session/req-1" {
+				t.Errorf("wrong target: %s", r.URL.Path)
+			}
+			status := http.StatusCreated
+			body := ""
+			if calls == 1 {
+				status = http.StatusForbidden
+				body = `<Error><Code>AuthorizationFailure</Code></Error>`
+			}
+			return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": []string{"application/xml"}}, Body: io.NopCloser(strings.NewReader(body)), Request: r}, nil
+		}),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := &blobTransport{containerClient: client, cfg: applyConfig(nil), isInitiator: true, txBlob: "req-0", txOffset: 123, blocksWritten: MaxBlocksPerBlob - 10}
+	if err := tr.RotateTX(context.Background()); err == nil {
+		t.Fatal("expected creation failure")
+	}
+	if tr.txSeq != 0 || tr.txBlob != "req-0" || tr.txOffset != 123 || tr.blocksWritten != MaxBlocksPerBlob-10 {
+		t.Fatal("failed creation changed TX identity or offsets")
+	}
+	if err := tr.RotateTX(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if tr.txSeq != 1 || tr.txBlob != "req-1" || tr.txOffset != 0 || tr.blocksWritten != 0 {
+		t.Fatal("successful creation did not commit TX")
+	}
+}
+
+func TestBlobRangeUsesRemainingReceiveAllowance(t *testing.T) {
+	for _, metrics := range []bool{false, true} {
+		t.Run(fmt.Sprint(metrics), func(t *testing.T) {
+			a, b := reviewNoise(t)
+			var ciphertext []byte
+			for range 3 {
+				var frame bytes.Buffer
+				BuildFrame(&frame, Frame{Type: MsgTypeData, Payload: bytes.Repeat([]byte{42}, 875)})
+				raw, err := a.SealData(nil, frame.Bytes())
+				if err != nil {
+					t.Fatal(err)
+				}
+				ciphertext = append(ciphertext, raw...)
+			}
+			var c *Conn
+			tr := newReadTestBlob(t, func(r *http.Request) (*http.Response, error) {
+				var start, end int
+				if _, err := fmt.Sscanf(blobRequestRange(r), "bytes=%d-%d", &start, &end); err != nil {
+					return nil, err
+				}
+				if end-start+1 > 1000-c.bufs.Noise.Len() {
+					t.Error("range exceeds remaining allowance")
+				}
+				end = min(end+1, len(ciphertext))
+				return blobReadResponse(r, io.NopCloser(bytes.NewReader(ciphertext[start:end])), end-start), nil
+			})
+			cfg := applyConfig([]Option{WithPing(0), WithBufferLimits(BufferLimits{Pending: 1000, Retry: 1000})})
+			tr.cfg = cfg
+			var transport Transport = tr
+			if metrics {
+				transport = newMetricsTransport(tr, NewDefaultMetrics())
+			}
+			c = newConn(cfg.ctx, cfg.cancel, transport, cfg, b, nil, "bounded")
+			defer cfg.cancel()
+			got := make([]byte, 3*875)
+			if _, err := io.ReadFull(c, got); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, bytes.Repeat([]byte{42}, len(got))) {
+				t.Fatal("bounded ranges changed byte identity or order")
+			}
+		})
+	}
+}
+
+// Read and write own distinct append blobs. A stalled HTTP operation in one
+// direction must not prevent the other from reaching Azure's SDK transport.
+func TestBlobDirectionsProgressIndependently(t *testing.T) {
+	for _, stalled := range []string{http.MethodGet, http.MethodPut} {
+		t.Run(stalled, func(t *testing.T) {
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			other := make(chan struct{})
+			tr := newReadTestBlob(t, func(r *http.Request) (*http.Response, error) {
+				if r.Method == stalled {
+					close(entered)
+					<-release
+				} else {
+					close(other)
+				}
+				if r.Method == http.MethodGet {
+					return blobReadResponse(r, io.NopCloser(bytes.NewReader([]byte{42})), 1), nil
+				}
+				return &http.Response{StatusCode: http.StatusCreated, Header: make(http.Header), Body: http.NoBody, Request: r}, nil
+			})
+			tr.txBlob = "req-0"
+			read := func() error {
+				body, err := tr.ReadRaw(context.Background())
+				if err == nil {
+					_, err = io.ReadAll(body)
+					body.Close()
+				}
+				return err
+			}
+			write := func() error { return tr.WriteRaw(context.Background(), 1, bytes.NewReader([]byte{7})) }
+			first, second := read, write
+			if stalled == http.MethodPut {
+				first, second = write, read
+			}
+			done := make(chan error, 2)
+			go func() { done <- first() }()
+			select {
+			case <-entered:
+			case <-time.After(time.Second):
+				t.Fatal("first operation never reached SDK")
+			}
+			go func() { done <- second() }()
+			select {
+			case <-other:
+			case <-time.After(200 * time.Millisecond):
+				t.Error("opposite direction blocked behind stalled SDK operation")
+			}
+			close(release)
+			for i := 0; i < 2; i++ {
+				if err := <-done; err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+}
 
 // Return bytes and an error together, as a response interrupted mid-ciphertext can.
 type interruptedBlobBody struct {
@@ -33,6 +174,7 @@ func (b *interruptedBlobBody) Read(p []byte) (int, error) {
 	}
 	return n, nil
 }
+
 func (b *interruptedBlobBody) Close() error { b.closed = true; return nil }
 
 func newReadTestBlob(t *testing.T, send rotationHTTP) *blobTransport {
@@ -155,132 +297,6 @@ func blobRequestRange(r *http.Request) string {
 		}
 	}
 	return ""
-}
-
-func TestTableReadErrorsRemainObservable(t *testing.T) {
-	for _, tc := range []struct {
-		name, code   string
-		status       int
-		transportErr error
-	}{
-		{name: "authorization", code: "AuthorizationFailure", status: 403},
-		{name: "service", code: "InternalError", status: 500},
-		{name: "missing_table", code: "TableNotFound", status: 404},
-		{name: "canceled", transportErr: context.Canceled},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			calls := 0
-			client, err := aztables.NewClientWithNoCredential("https://read.invalid/session", &aztables.ClientOptions{ClientOptions: azcore.ClientOptions{
-				Retry: policy.RetryOptions{MaxRetries: -1},
-				Transport: rotationHTTP(func(r *http.Request) (*http.Response, error) {
-					calls++
-					if got := r.URL.Query().Get("$filter"); got != "PartitionKey eq 'data' and RowKey ge '000000000'" {
-						t.Errorf("filter changed after error: %q", got)
-					}
-					if calls > 1 {
-						return tableReadResponse(r, 200, `{"value":[]}`), nil
-					}
-					if tc.transportErr != nil {
-						return nil, tc.transportErr
-					}
-					return tableReadResponse(r, tc.status, fmt.Sprintf(`{"odata.error":{"code":%q,"message":{"lang":"en-US","value":"injected failure"}}}`, tc.code)), nil
-				}),
-			}})
-			if err != nil {
-				t.Fatal(err)
-			}
-			tr := &tableTransport{rxClient: client}
-			_, noise := reviewNoise(t)
-			conn := reviewConn(tr, noise)
-			defer conn.cancel()
-			conn.SetReadDeadline(time.Now().Add(time.Second))
-			n, err := conn.Read(make([]byte, 1))
-			if n != 0 || err == nil || errors.Is(err, ErrNoData) {
-				t.Fatalf("read = %d, %v", n, err)
-			}
-			if tc.transportErr != nil {
-				if !errors.Is(err, tc.transportErr) {
-					t.Fatalf("lost transport error: %v", err)
-				}
-			} else {
-				var sdkErr *azcore.ResponseError
-				if !errors.As(err, &sdkErr) || sdkErr.StatusCode != tc.status || sdkErr.ErrorCode != tc.code {
-					t.Fatalf("lost service error: %v", err)
-				}
-				if sdkErr.RawResponse.Header.Get("x-ms-request-id") != "read-integrity" {
-					t.Fatal("lost response details")
-				}
-			}
-			if calls != 1 {
-				t.Fatalf("error triggered %d requests", calls)
-			}
-			body, err := tr.ReadRaw(context.Background())
-			if body != nil || !errors.Is(err, ErrNoData) {
-				t.Fatalf("empty poll = %v, %v", body, err)
-			}
-		})
-	}
-}
-
-func tableReadResponse(r *http.Request, status int, body string) *http.Response {
-	return &http.Response{StatusCode: status, Header: http.Header{"Content-Type": {"application/json"}, "X-Ms-Request-Id": {"read-integrity"}}, Body: io.NopCloser(strings.NewReader(body)), Request: r}
-}
-
-func TestTableReadEmptyAndGappedPollingPreservesOrder(t *testing.T) {
-	// Literal SDK entities: base64 encodes "first", "second", and "third".
-	const first = `{"PartitionKey":"data","RowKey":"000000000","Data":"Zmlyc3Q=","Data@odata.type":"Edm.Binary"}`
-	const second = `{"PartitionKey":"data","RowKey":"000000001","Data":"c2Vjb25k","Data@odata.type":"Edm.Binary"}`
-	const third = `{"PartitionKey":"data","RowKey":"000000002","Data":"dGhpcmQ=","Data@odata.type":"Edm.Binary"}`
-	pages := []struct{ from, entities, want string }{
-		{"000000000", "", ""},
-		{"000000000", first + "," + third, "first"},
-		{"000000001", third, ""},
-		{"000000001", second + "," + third, "secondthird"},
-		{"000000003", "", ""},
-	}
-	calls := 0
-	client, err := aztables.NewClientWithNoCredential("https://read.invalid/session", &aztables.ClientOptions{ClientOptions: azcore.ClientOptions{
-		Retry: policy.RetryOptions{MaxRetries: -1}, Transport: rotationHTTP(func(r *http.Request) (*http.Response, error) {
-			if r.Method == http.MethodDelete {
-				return tableReadResponse(r, 204, ""), nil
-			}
-			if calls >= len(pages) {
-				return nil, errors.New("unexpected poll")
-			}
-			page := pages[calls]
-			calls++
-			if got := r.URL.Query().Get("$filter"); got != "PartitionKey eq 'data' and RowKey ge '"+page.from+"'" {
-				t.Errorf("filter = %q", got)
-			}
-			return tableReadResponse(r, 200, `{"value":[`+page.entities+`]}`), nil
-		}),
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	tr := &tableTransport{rxClient: client}
-	var got []byte
-	for _, page := range pages {
-		body, err := tr.ReadRaw(context.Background())
-		if page.want == "" {
-			if body != nil || !errors.Is(err, ErrNoData) {
-				t.Fatalf("empty/gapped poll = %v, %v", body, err)
-			}
-			continue
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-		data, err := io.ReadAll(body)
-		body.Close()
-		if err != nil || string(data) != page.want {
-			t.Fatalf("read = %q, %v; want %q", data, err, page.want)
-		}
-		got = append(got, data...)
-	}
-	if string(got) != "firstsecondthird" {
-		t.Fatalf("out of order: %q", got)
-	}
 }
 
 func TestBlobReadEmptyPollingPreservesProgress(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"sync"
 	"time"
 
@@ -147,4 +148,24 @@ func deletionAbsent(err error) bool {
 	}
 	var response *azcore.ResponseError
 	return errors.As(err, &response) && response.StatusCode == 404
+}
+
+// Read the signed timestamps inside the adapter, so reported precision exactly
+// matches the SDK's issued SAS rather than an unsent high-resolution estimate.
+func issuedSessionTokens(req, res string) (SessionTokens, error) {
+	var earliest time.Time
+	for _, token := range []string{req, res} {
+		values, err := url.ParseQuery(token)
+		if err != nil {
+			return SessionTokens{}, fmt.Errorf("%w: invalid issued token encoding", ErrSASGenerationFailed)
+		}
+		end, err := time.Parse(time.RFC3339, values.Get("se"))
+		if err != nil {
+			return SessionTokens{}, fmt.Errorf("%w: missing or invalid issued expiry", ErrSASGenerationFailed)
+		}
+		if earliest.IsZero() || end.Before(earliest) {
+			earliest = end
+		}
+	}
+	return SessionTokens{Req: req, Res: res, ExpiresAt: earliest.UTC()}, nil
 }

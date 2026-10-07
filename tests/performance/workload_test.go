@@ -1,4 +1,4 @@
-package aznet
+package performance_test
 
 import (
 	"bytes"
@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/atsika/aznet"
 	"github.com/google/uuid"
 )
 
@@ -33,15 +34,15 @@ func TestSDKWorkloadMeasurement(t *testing.T) {
 				t.Run(fmt.Sprintf("%s/connections%d/%s", network, concurrency, workload), func(t *testing.T) {
 					ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 					defer cancel()
-					metrics := NewDefaultMetrics()
+					metrics := aznet.NewDefaultMetrics()
 					id := strings.ReplaceAll(uuid.NewString(), "-", "")
-					opts := []Option{WithContext(ctx), WithMetrics(metrics), WithEndpoints("h"+id, "t"+id), WithPing(0), WithAcceptPoll(time.Millisecond), WithDataPoll(10 * time.Millisecond), WithFastPoll(time.Millisecond)}
+					opts := []aznet.Option{aznet.WithContext(ctx), aznet.WithMetrics(metrics), aznet.WithEndpoints("h"+id, "t"+id), aznet.WithPing(0), aznet.WithAcceptPoll(time.Millisecond), aznet.WithDataPoll(10 * time.Millisecond), aznet.WithFastPoll(time.Millisecond)}
 					u := &url.URL{Scheme: "http", Host: fmt.Sprintf("127.0.0.1:%d", 10000+service), Path: "/devstoreaccount1", User: url.UserPassword("devstoreaccount1", key)}
-					ln, err := Listen(network, u.String(), opts...)
+					ln, err := aznet.Listen(network, u.String(), opts...)
 					if err != nil {
 						t.Fatal(err)
 					}
-					l := ln.(*Listener)
+					l := ln.(*aznet.Listener)
 					defer func() {
 						if err := l.Close(); err != nil {
 							t.Error(err)
@@ -64,7 +65,7 @@ func TestSDKWorkloadMeasurement(t *testing.T) {
 							err  error
 						}
 						dial := make(chan dialResult, 1)
-						go func() { c, e := Dial(network, address, opts...); dial <- dialResult{c, e} }()
+						go func() { c, e := aznet.Dial(network, address, opts...); dial <- dialResult{c, e} }()
 						server, e := l.Accept()
 						result := <-dial
 						if e != nil || result.err != nil {

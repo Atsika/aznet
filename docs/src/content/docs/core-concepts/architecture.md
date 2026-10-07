@@ -3,8 +3,7 @@ title: Architecture & Philosophy
 description: Understanding the underlying design and connection lifecycle of aznet.
 ---
 
-`aznet` is designed to be a transparent bridge between standard Go networking and Azure Storage services.
-This page explains the philosophy behind the project and how it manages data flow.
+`aznet` provides standard Go networking interfaces over a driver-agnostic core. Drivers supply discovery and transport operations. The examples below describe the built-in Azure Storage drivers; custom drivers use the same core interfaces.
 
 ## Philosophy
 

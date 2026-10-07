@@ -1,12 +1,12 @@
 ---
 title: Networking over Azure Storage
-description: Build ordered byte streams over Blob, Queue and Table with aznet.
+description: Connect applications through Azure Storage services with a driver-agnostic networking core.
 template: splash
 prev: false
 next: false
 hero:
   title: Networking over Azure Storage.
-  tagline: Connect applications through Azure Blob, Queue or Table storage. Use aznet natively in Go or compile to WebAssembly for other host environments.
+  tagline: Connect applications through Azure Storage services with a driver-agnostic networking core. Use aznet natively in Go or compile to WebAssembly for other host environments.
   image:
     file: ../../assets/aznet.png
   actions:
@@ -29,9 +29,9 @@ import { Card, CardGrid } from "@astrojs/starlight/components";
     Encrypts application frames using Noise NN. Peers are anonymous;
     handshake identifiers, lengths and traffic timing remain visible.
   </Card>
-  <Card title="Multiple Drivers" icon="list-format">
-    Choose between Blob, Queue, or Table storage based on your performance and
-    cost requirements.
+  <Card title="Pluggable Drivers" icon="list-format">
+    Use a built-in storage driver or implement your own transport. The core
+    networking interfaces stay the same.
   </Card>
   <Card title="Firewall Traversal" icon="random">
     Communicate through restrictive environments that block traditional TCP/UDP

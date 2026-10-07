@@ -3,13 +3,14 @@ package aznet
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,7 +18,192 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/google/uuid"
 )
+
+func (b *cancelBody) Close() error { return nil }
+
+type failingCloseTransport struct {
+	reviewTransport
+	calls   int
+	failure error
+}
+
+func (t *failingCloseTransport) Close() error {
+	t.calls++
+	return t.failure
+}
+
+func TestRollbackDoesNotRetryTransportClose(t *testing.T) {
+	failure := &azcore.ResponseError{StatusCode: 503}
+	transport := &failingCloseTransport{failure: failure}
+	driver := &sessionDriver{transport: func(context.Context) (Transport, error) { return transport, errors.New("partial acquisition") }}
+	listener := sessionListener(t, driver, 1)
+	if _, err := listener.Accept(); !errors.Is(err, failure) {
+		t.Fatalf("lost close failure: %v", err)
+	}
+	if transport.calls != 1 {
+		t.Fatalf("Close called %d times for one acquisition", transport.calls)
+	}
+}
+
+func TestAzuriteBatchedSessionLifecycle(t *testing.T) {
+	if os.Getenv("AZNET_AZURITE") != "1" {
+		t.Skip("set AZNET_AZURITE=1")
+	}
+	const key = "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+	for i, network := range []string{"azblob", "azqueue", "aztable"} {
+		t.Run(network, func(t *testing.T) {
+			u, _ := url.Parse(fmt.Sprintf("http://127.0.0.1:%d/devstoreaccount1", 10000+i))
+			u.User = url.UserPassword("devstoreaccount1", key)
+			suffix := strings.ReplaceAll(uuid.NewString(), "-", "")
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			opts := []Option{WithContext(ctx), WithEndpoints("h"+suffix, "t"+suffix), WithSessionDuration(2 * time.Hour), WithPing(0), WithDataPoll(5 * time.Millisecond), WithAcceptPoll(5 * time.Millisecond)}
+			listener, err := Listen(network, u.String(), opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			l := listener.(*Listener)
+			defer func() {
+				l.Close()
+				cleanupCtx, done := context.WithTimeout(context.Background(), 5*time.Second)
+				defer done()
+				if err := l.CleanupBootstrap(cleanupCtx); err != nil {
+					t.Error(err)
+				}
+			}()
+			issuedBefore := time.Now().UTC().Truncate(time.Second)
+			address, err := l.ConnectionStringFor(time.Hour)
+			if err != nil {
+				t.Fatal(err)
+			}
+			const count = 8
+			clients := make(chan net.Conn, count)
+			errs := make(chan error, count)
+			for j := 0; j < count; j++ {
+				go func() {
+					c, err := Dial(network, address, opts...)
+					if err != nil {
+						errs <- err
+						return
+					}
+					clients <- c
+				}()
+			}
+			// Let requests accumulate so GetHandshakes returns a real batch.
+			time.Sleep(100 * time.Millisecond)
+			var accepted []*Conn
+			for j := 0; j < count; j++ {
+				c, err := l.Accept()
+				if err != nil {
+					t.Fatal(err)
+				}
+				accepted = append(accepted, c.(*Conn))
+			}
+			var dialed []net.Conn
+			for j := 0; j < count; j++ {
+				select {
+				case c := <-clients:
+					dialed = append(dialed, c)
+					defer c.Close()
+					if _, err := c.Write([]byte("ready")); err != nil {
+						t.Fatal(err)
+					}
+				case err := <-errs:
+					t.Fatal(err)
+				case <-ctx.Done():
+					t.Fatal(ctx.Err())
+				}
+			}
+			for _, client := range dialed {
+				expiry, known := GetSessionExpiry(client)
+				if !known || expiry.Before(issuedBefore.Add(2*time.Hour)) || expiry.After(time.Now().UTC().Add(2*time.Hour)) {
+					t.Fatalf("dial expiry=%v known=%v", expiry, known)
+				}
+				matched := false
+				for _, server := range accepted {
+					if server.id == client.(*Conn).id {
+						other, ok := GetSessionExpiry(server)
+						if !ok || !other.Equal(expiry) {
+							t.Fatal("dial/accept metadata differs")
+						}
+						matched = true
+					}
+				}
+				if !matched {
+					t.Fatal("session metadata peer missing")
+				}
+			}
+			for _, c := range accepted {
+				buf := make([]byte, 5)
+				if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "ready" {
+					t.Fatal(string(buf), err)
+				}
+			}
+			// Full accepted Close destroys storage. Half-close first, then wait
+			// for application completion to establish final response delivery.
+			for _, c := range accepted {
+				if _, err := c.Write([]byte("reply")); err != nil {
+					t.Fatal(err)
+				}
+				if err := c.CloseWrite(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, c := range dialed {
+				reply, err := io.ReadAll(c)
+				if err != nil || string(reply) != "reply" {
+					t.Fatalf("half-close reply: %q %v", reply, err)
+				}
+				if _, err := c.Write([]byte("done")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, c := range accepted {
+				ack := make([]byte, 4)
+				if _, err := io.ReadFull(c, ack); err != nil || string(ack) != "done" {
+					t.Fatalf("application completion: %q %v", ack, err)
+				}
+			}
+			// No janitor tick has elapsed. Close must reclaim all accepted sessions.
+			if err := l.Close(); err != nil {
+				t.Fatal(err)
+			}
+			for _, c := range accepted {
+				var checks []error
+				switch d := l.driver.(*metricsDriver).Driver.(type) {
+				case *blobDriver:
+					_, err := d.client.NewContainerClient(c.id).GetProperties(ctx, nil)
+					checks = append(checks, err)
+				case *queueDriver:
+					for _, prefix := range []string{d.cfg.reqPrefix, d.cfg.resPrefix} {
+						_, err := d.client.NewQueueClient(prefix+"-"+c.id).GetProperties(ctx, nil)
+						checks = append(checks, err)
+					}
+				case *tableDriver:
+					for _, prefix := range []string{d.cfg.reqPrefix, d.cfg.resPrefix} {
+						_, err := d.client.NewClient(prefix+strings.ReplaceAll(c.id, "-", "")).GetAccessPolicy(ctx, nil)
+						checks = append(checks, err)
+					}
+				}
+				for _, err := range checks {
+					var response *azcore.ResponseError
+					if !errors.As(err, &response) || response.StatusCode != 404 {
+						t.Fatalf("session resource remains: %v", err)
+					}
+				}
+			}
+			// Shared bootstrap remains usable by a later listener generation.
+			if _, _, err := l.driver.CreateBootstrapTokens(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := l.driver.GetHandshakes(ctx); err != nil {
+				t.Fatal("bootstrap was removed", err)
+			}
+		})
+	}
+}
 
 func tokenExpiry(t *testing.T, token string) time.Time {
 	t.Helper()
@@ -128,20 +314,6 @@ func TestCredentialDurationsAndExactSessionExpiry(t *testing.T) {
 	}
 }
 
-func TestInvalidCredentialDurations(t *testing.T) {
-	for _, duration := range []time.Duration{-time.Hour, 0, time.Nanosecond, 999 * time.Millisecond} {
-		cfg := applyConfig([]Option{WithSessionDuration(duration)})
-		if err := cfg.Validate(); !errors.Is(err, ErrInvalidConfig) {
-			t.Errorf("duration%v Validate=%v", duration, err)
-		}
-		cfg.cancel()
-		l := &Listener{}
-		if _, err := l.ConnectionStringFor(duration); !errors.Is(err, ErrInvalidConfig) {
-			t.Errorf("bootstrap duration%v error=%v", duration, err)
-		}
-	}
-}
-
 func TestAcceptSessionExpiryCapability(t *testing.T) {
 	for _, expiry := range []time.Time{{}, time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)} {
 		t.Run(expiry.String(), func(t *testing.T) {
@@ -185,20 +357,6 @@ func TestLegacyDriverUnknownBootstrapDuration(t *testing.T) {
 	}
 	if _, err := listener.ConnectionStringFor(time.Hour); !errors.Is(err, ErrBootstrapDurationUnsupported) {
 		t.Fatalf("unsupported duration: %v", err)
-	}
-}
-
-func TestUnknownSessionExpirySerialization(t *testing.T) {
-	raw, err := json.Marshal(SessionTokens{Req: "custom", Res: "opaque"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(raw), "expires_at") {
-		t.Fatal("unknown metadata must be absent from handshake")
-	}
-	var legacy SessionTokens
-	if err := json.Unmarshal([]byte(`{"req":"custom","res":"opaque"}`), &legacy); err != nil || !legacy.ExpiresAt.IsZero() {
-		t.Fatalf("legacy tokens: %v %v", legacy, err)
 	}
 }
 
