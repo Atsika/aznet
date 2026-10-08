@@ -1092,6 +1092,13 @@ type batchRecorder struct {
 	seqs    []uint64
 	data    []byte
 	writes  int
+	raws    [][]byte      // ciphertext of every attempt, in order
+	chunks  [][]frameInfo // frame layout of every delivered chunk
+}
+
+type frameInfo struct {
+	kind byte
+	size int
 }
 
 func (r *batchRecorder) write(ctx context.Context, seq uint64, rs io.ReadSeeker) error {
@@ -1109,6 +1116,7 @@ func (r *batchRecorder) write(ctx context.Context, seq uint64, rs io.ReadSeeker)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.seqs = append(r.seqs, seq)
+	r.raws = append(r.raws, raw)
 	if r.fail > 0 {
 		r.fail--
 		return io.ErrUnexpectedEOF
@@ -1118,13 +1126,16 @@ func (r *batchRecorder) write(ctx context.Context, seq uint64, rs io.ReadSeeker)
 		r.t.Error("unseal:", err)
 		return err
 	}
+	var frames []frameInfo
 	for len(plain) > 0 {
 		n := int(binary.BigEndian.Uint32(plain))
+		frames = append(frames, frameInfo{plain[4], n})
 		if plain[4] == MsgTypeData {
 			r.data = append(r.data, plain[FrameHeaderSize:FrameHeaderSize+n]...)
 		}
 		plain = plain[FrameHeaderSize+n:]
 	}
+	r.chunks = append(r.chunks, frames)
 	r.writes++
 	return nil
 }
@@ -1231,5 +1242,133 @@ func TestBatchedFailureResendsSameChunk(t *testing.T) {
 	}
 	if r.seqs[0] != r.seqs[1] {
 		t.Fatal("retry used a new sequence", r.seqs)
+	}
+}
+
+// Writes queued while a chunk is in flight extend one DATA frame instead of
+// each adding a frame, so chunks fill to the MTU; the sealed chunk in flight is
+// never modified and bytes stay in order.
+func TestSmallWritesExtendOneFrame(t *testing.T) {
+	r := &batchRecorder{release: make(chan struct{})}
+	c := batchConn(t, r) // 1 KiB transport: MTU just under 1 KiB
+	var want []byte
+	write := func(b []byte) {
+		t.Helper()
+		want = append(want, b...)
+		if n, err := c.Write(b); n != len(b) || err != nil {
+			t.Fatal(n, err)
+		}
+	}
+	write([]byte("first"))
+	// Let the first chunk be sealed and held in flight before the next writes.
+	deadline := time.Now().Add(time.Second)
+	for {
+		c.wmu.Lock()
+		sealed := c.sealedLen
+		c.wmu.Unlock()
+		if sealed > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("first chunk not sealed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	for i := range 200 {
+		write(bytes.Repeat([]byte{byte(i)}, 7))
+	}
+	close(r.release)
+	if err := c.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !bytes.Equal(r.data, want) {
+		t.Fatal("extended frames lost or reordered bytes")
+	}
+	frames := 0
+	for _, chunk := range r.chunks {
+		for _, f := range chunk {
+			if f.kind == MsgTypeData {
+				frames++
+				if f.size > c.MTU() {
+					t.Fatalf("frame of %d bytes exceeds MTU %d", f.size, c.MTU())
+				}
+			}
+		}
+	}
+	// 1405 bytes need two frames at a ~1 KiB MTU, plus the first: three, not 201.
+	if frames > 3 {
+		t.Fatalf("%d DATA frames for 201 writes", frames)
+	}
+}
+
+// A retried chunk resends its exact ciphertext even though writes made after
+// it was sealed extended the tail; those bytes follow in later chunks.
+func TestExtensionKeepsRetriedChunkIntact(t *testing.T) {
+	r := &batchRecorder{fail: 1}
+	c := batchConn(t, r)
+	if _, err := c.Write([]byte("sealed")); err != nil {
+		t.Fatal(err)
+	}
+	owedFailure(t, c)
+	// The owed failure surfaces on the next Write, which accepts nothing.
+	if n, err := c.Write([]byte("later")); n != 0 || !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatal(n, err)
+	}
+	if _, err := c.Write([]byte("later")); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !bytes.Equal(r.raws[0], r.raws[1]) || r.seqs[0] != r.seqs[1] {
+		t.Fatal("retry changed the sealed chunk")
+	}
+	if string(r.data) != "sealedlater" {
+		t.Fatalf("delivered %q", r.data)
+	}
+}
+
+// Control frames end the extendable tail: data never merges across a PING.
+func TestExtensionStopsAtControlFrames(t *testing.T) {
+	r := &batchRecorder{release: make(chan struct{})}
+	c := batchConn(t, r)
+	if _, err := c.Write([]byte("in flight")); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		c.wmu.Lock()
+		sealed := c.sealedLen
+		c.wmu.Unlock()
+		if sealed > 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := c.Write([]byte("before")); err != nil {
+		t.Fatal(err)
+	}
+	c.wmu.Lock()
+	c.appendControl(MsgTypePing)
+	c.wmu.Unlock()
+	if _, err := c.Write([]byte("after")); err != nil {
+		t.Fatal(err)
+	}
+	close(r.release)
+	if err := c.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var layout []frameInfo
+	for _, chunk := range r.chunks[1:] {
+		layout = append(layout, chunk...)
+	}
+	want := []frameInfo{{MsgTypeData, 6}, {MsgTypePing, 0}, {MsgTypeData, 5}, {MsgTypeFin, 0}}
+	if fmt.Sprint(layout) != fmt.Sprint(want) {
+		t.Fatalf("frames %v, want %v", layout, want)
 	}
 }
