@@ -26,6 +26,70 @@ import (
 	"github.com/google/uuid"
 )
 
+// The real SDK must request a bodyless acknowledgement while preserving the
+// exact entity on an uncertain retry. Simulate commit followed by response loss,
+// then Azure's EntityAlreadyExists receipt, as well as ordinary 204 success.
+func TestTableWriteOmitsResponseEcho(t *testing.T) {
+	for _, uncertain := range []bool{false, true} {
+		t.Run(fmt.Sprint(uncertain), func(t *testing.T) {
+			calls := 0
+			var first []byte
+			lost := errors.New("response lost after commit")
+			client, err := aztables.NewClientWithNoCredential("https://table.invalid/session", &aztables.ClientOptions{ClientOptions: azcore.ClientOptions{
+				Retry: policy.RetryOptions{MaxRetries: -1},
+				Transport: rotationHTTP(func(r *http.Request) (*http.Response, error) {
+					calls++
+					if got := r.Header.Get("Prefer"); got != "return-no-content" {
+						t.Errorf("Prefer = %q; unused entity echo still requested", got)
+					}
+					body, err := io.ReadAll(r.Body)
+					if err != nil {
+						return nil, err
+					}
+					if calls == 1 {
+						first = body
+					} else if !bytes.Equal(body, first) {
+						t.Error("retry changed entity")
+					}
+					if uncertain {
+						if calls == 1 {
+							return nil, lost
+						}
+						return tableReadResponse(r, 409, `{"odata.error":{"code":"EntityAlreadyExists","message":{"value":"exists"}}}`), nil
+					}
+					return tableReadResponse(r, 204, ""), nil
+				}),
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			tr := &tableTransport{txClient: client}
+			payload := bytes.Repeat([]byte{42}, 64<<10)
+			write := func() error { return tr.WriteRaw(context.Background(), 0, bytes.NewReader(payload)) }
+			if err := write(); uncertain {
+				if !errors.Is(err, lost) || tr.txHasConfirmed {
+					t.Fatalf("uncertain write: %v, confirmed=%t", err, tr.txHasConfirmed)
+				}
+				if err := write(); err != nil {
+					t.Fatal(err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(extractTableData(first), payload) {
+				t.Fatal("stored payload differs")
+			}
+			confirmedCalls := calls
+			if err := write(); err != nil {
+				t.Fatal(err)
+			}
+			if calls != confirmedCalls || !tr.txHasConfirmed {
+				t.Fatal("confirmed retry sent again")
+			}
+		})
+	}
+}
+
 func TestTableFetchDoesNotConsumeRows(t *testing.T) {
 	client, err := aztables.NewClientWithNoCredential("https://table.invalid/session", &aztables.ClientOptions{ClientOptions: azcore.ClientOptions{
 		Retry: policy.RetryOptions{MaxRetries: -1},
@@ -254,7 +318,7 @@ func tableBatchResponse(r *http.Request, status, count int) *http.Response {
 	return resp
 }
 
-func newTableStore(t *testing.T) (*tableStore, *tableTransport, *tableTransport) {
+func newTableStore(t testing.TB) (*tableStore, *tableTransport, *tableTransport) {
 	t.Helper()
 	s := &tableStore{rows: make(map[string]json.RawMessage), requests: make(map[string]int)}
 	client, err := aztables.NewClientWithNoCredential("https://table.invalid/session", &aztables.ClientOptions{ClientOptions: azcore.ClientOptions{
@@ -566,9 +630,10 @@ func TestTableConnUncertainWriteAfterConsumption(t *testing.T) {
 	defer sender.cancel()
 	defer receiver.cancel()
 	s.uncertainWrite = formatRowKey(0)
-	if n, err := sender.Write([]byte("first")); n != 5 || err == nil {
+	if n, err := sender.Write([]byte("first")); n != 5 || err != nil {
 		t.Fatal(n, err)
 	}
+	owedFailure(t, sender)
 	got := make([]byte, 5)
 	if _, err := io.ReadFull(receiver, got); err != nil || string(got) != "first" {
 		t.Fatal(string(got), err)
@@ -1162,8 +1227,13 @@ func TestAzuriteTableReclamation(t *testing.T) {
 		tx, rx := pair[0].(*tableTransport), pair[1].(*tableTransport)
 		for seq := range tableCleanupRows + 1 {
 			payload := bytes.Repeat([]byte{byte(seq)}, 128)
-			if err := tx.WriteRaw(ctx, uint64(seq), bytes.NewReader(payload)); err != nil {
+			var response *http.Response
+			writeCtx := policy.WithCaptureResponse(ctx, &response)
+			if err := tx.WriteRaw(writeCtx, uint64(seq), bytes.NewReader(payload)); err != nil {
 				t.Fatal(err)
+			}
+			if response == nil || response.StatusCode != http.StatusNoContent || response.ContentLength != 0 {
+				t.Fatal("session insert did not receive a bodyless acknowledgement")
 			}
 			body, err := rx.ReadRaw(ctx)
 			if err != nil {
@@ -1206,5 +1276,28 @@ func TestAzuriteTableReclamation(t *testing.T) {
 		if retained != 1 {
 			t.Fatalf("retained %d rows; want last retry receipt only", retained)
 		}
+	}
+}
+
+// BenchmarkTableChunk moves full-size sealed chunks through the real SDK and
+// an in-memory Table fixture, isolating driver encoding cost from the network.
+func BenchmarkTableChunk(b *testing.B) {
+	_, tx, rx := newTableStore(b)
+	ctx := context.Background()
+	chunk := bytes.Repeat([]byte{42}, MaxTableEntitySize)
+	b.SetBytes(int64(len(chunk)))
+	b.ReportAllocs()
+	for i := range b.N {
+		if err := tx.WriteRaw(ctx, uint64(i), bytes.NewReader(chunk)); err != nil {
+			b.Fatal(err)
+		}
+		body, err := rx.ReadRaw(ctx)
+		if err != nil {
+			b.Fatal(err)
+		}
+		if n, err := io.Copy(io.Discard, body); err != nil || n != int64(len(chunk)) {
+			b.Fatal(n, err)
+		}
+		body.Close()
 	}
 }

@@ -1,0 +1,41 @@
+{
+  "checked_at": "2026-10-07T16:23:54.903189+00:00",
+  "service_tags_url": "https://download.microsoft.com/download/7/1/d/71d86715-5596-4529-9b13-da13a5de5b63/ServiceTags_Public_20261005.json",
+  "service_tags_sha256": "fed834a26c3847f6c66715c924259d9d6f437078b32decf0b5337e6414f96c98",
+  "change_number": 421,
+  "method": "live DNS mapped to Microsoft regional Storage IP prefixes; ARM account metadata unavailable (expired CLI refresh token AADSTS700082)",
+  "accounts": [
+    {
+      "account": "standardacct",
+      "hostname": "standardacct.blob.core.windows.net",
+      "dns": [
+        "blob.zrh22prdstr01a.store.core.windows.net.",
+        "52.239.251.164"
+      ],
+      "matches": [
+        {
+          "ip": "52.239.251.164",
+          "tag": "Storage.SwitzerlandNorth",
+          "region": "switzerlandn",
+          "prefix": "52.239.251.0/24"
+        }
+      ]
+    },
+    {
+      "account": "premiumblob",
+      "hostname": "premiumblob.blob.core.windows.net",
+      "dns": [
+        "blob.dm2prdstf01a.store.core.windows.net.",
+        "20.60.244.1"
+      ],
+      "matches": [
+        {
+          "ip": "20.60.244.1",
+          "tag": "Storage.CentralUS",
+          "region": "centralus",
+          "prefix": "20.60.244.0/23"
+        }
+      ]
+    }
+  ]
+}

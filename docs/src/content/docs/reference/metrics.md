@@ -79,7 +79,8 @@ The workload uses public Listen/Dial and net.Conn reads/writes through all three
 adapters, encryption and real SDK clients. It compares 1, 4 and 16 concurrent
 sessions: idle reads for 100 ms; sixteen 64-byte request/reply exchanges; four
 256 KiB bulk writes; and four 32 KiB writes consumed in 1 KiB pieces with 1 ms
-pauses. Byte identity is checked in both directions. Measurement-only poll settings
+pauses. The original bulk case is sequential (Write, then Read), not sustained
+streaming. Byte identity is checked in both directions. Measurement-only poll settings
 are 1 ms fast/accept and 10 ms data, with ping disabled; production defaults stay
 unchanged. Setup and final teardown are excluded; first-read token cleanup may be
 included in workload requests.
@@ -91,6 +92,100 @@ Sampling itself adds overhead. Run without race instrumentation for measurements
 The emulator's process memory is not included. These results establish a local
 baseline, not cloud latency, sustained capacity, a driver cost ranking, or a reason
 to tune defaults.
+
+## Additional workloads — 2026-10-07
+
+The same harness now also includes `stream`, `duplex` and `wake`. Streaming runs
+the sender and receiver concurrently; duplex runs both directions concurrently.
+Each direction sends 4 MiB in exact 64 KiB application writes by default. It
+checks byte identity and block order, sends FIN with `CloseWrite`, and waits for
+receiver EOF before stopping the timer. Application bytes are counted once at
+the receiver; duplex sums the two distinct directions. The wake case measures
+one-byte delivery after an outstanding read has polled through a silent interval.
+
+Use Go's subtest filter to select drivers, session counts and workloads:
+
+```sh
+AZNET_MEASURE=1 AZNET_MEASURE_WRITE_SIZE=262144 \
+  AZNET_MEASURE_STREAM_BYTES=67108864 AZNET_MEASURE_IDLE_MS=1000 \
+  go test -run '^TestSDKWorkloadMeasurement$/aztable/connections(1|4)$/stream$' \
+  -count=1 -v -timeout=12m ./tests/performance
+```
+
+All environment sizes are positive byte counts, write size must be at least
+8 bytes for the block-order check, and stream bytes must be a multiple of write
+size. `AZNET_MEASURE_IDLE_MS` controls both idle and wake silence
+(default 100 ms). Polling, ping and buffer settings remain as described above.
+
+`AZNET_MEASURE_READ_SIZE` caps each application Read in stream/duplex cases
+(default: write size). A separate log line reports `read_samples` and
+`read_p50_ns`/`read_p95_ns`/`read_p99_ns`. Timing storage is capped at 8,192
+systematically sampled calls per direction/session. These durations include
+both buffered and fetching reads; with small reads, the percentiles mostly
+describe draining authenticated plaintext. Systematic sampling can under- or overrepresent
+fetches when its interval aligns with frame boundaries; these are sample
+percentiles, not an unbiased estimate of the full call distribution. They are **not network RTT or whole-message delivery latency**. The
+same sampling overhead is present in both comparison binaries.
+
+Logs distinguish setup, measured work and complete lifecycle request totals,
+including both endpoints. Operation/status/retry labels use the existing SDK
+attempt collector. Setup time covers listener creation and sequential session
+establishment. `listener_cleanup_ms` covers listener/bootstrap cleanup after
+client Close; lifecycle counters include client Close too. The first receive may
+include asynchronous token deletion. Failed HTTP statuses include expected empty
+Blob polls; these are distinct from workload failures, which fail the test.
+
+`latency_kind=roundtrip` is request/reply completion, `delivery` is completion of
+the sequential bulk/slow case or wake, and `write` is Write call duration (time to queue, not to send)
+for streams. **Write latency is not delivery latency.** p50/p95/p99 use nearest
+rank; consult `samples` before interpreting tails. Throughput waits for delivery
+and EOF. Idle attempts/session-hour extrapolate the measured window, including
+initial poll backoff; they are not a long-duration steady-state estimate. Wake
+attempts include the preceding silence.
+
+Azurite 3.34 rejects Table cleanup batches using a session SAS. Default duplex
+stays below the 100-row reclamation threshold. Increasing the number of Table
+duplex writes beyond that threshold can fail on this emulator; errors are not
+suppressed. Longer forward streams use the accepted endpoint's shared-key receiver
+and do exercise reclamation. This is not evidence for sustained SAS-receiver
+duplex on Azure.
+
+`tests/performance/compare.sh [baseline-revision]` archives the baseline under
+`.scratch`, copies the current harness into it, builds both binaries with
+`GOWORK=off`, and alternates three pairs. It records revision, candidate patch,
+harness, settings, toolchain, per-case logs and process CPU time. It requires an
+already-running dedicated Azurite. `AZNET_MEASURE_FILTER` overrides its default
+all-driver comparison filter. `AZNET_MEASURE_BASELINE_PATCH` optionally applies
+and retains a patch to the archived baseline, for example to hold the Table
+response improvement constant while isolating a shared-core change.
+The [2026-10-07 report](/drivers/performance#table-response-echo--2026-10-07)
+retains results and limitations.
+
+### Explicit live measurements
+
+For an authorized live run, `AZNET_MEASURE_LIVE_CONFIG` selects a local JSON file
+containing `listeners`, each with `driver`, `address`, `storage_account` and
+`storage_account_key`. Also set `AZNET_MEASURE_AZBLOB_ACCOUNT`,
+`AZNET_MEASURE_AZQUEUE_ACCOUNT` and/or `AZNET_MEASURE_AZTABLE_ACCOUNT` for every
+driver selected by the test filter. The harness requires an exact HTTPS Azure
+Storage host/account match. It never selects a live account implicitly.
+
+```sh
+AZNET_MEASURE_LIVE_CONFIG=/path/to/private-config.json \
+AZNET_MEASURE_AZTABLE_ACCOUNT=youraccount \
+AZNET_MEASURE_WRITE_SIZE=262144 AZNET_MEASURE_STREAM_BYTES=16777216 \
+AZNET_MEASURE_FILTER='^TestSDKWorkloadMeasurement$/aztable/connections(1|4)$/(interactive|stream|duplex|wake)$' \
+  tests/performance/compare.sh
+```
+
+The harness uses unique bootstrap/session names and logs those owned resources
+for independent catalog verification. Cleanup is limited to the listener's own
+resources. SDK error text is omitted because it can contain SAS URLs; failures
+report an error type or service status/code instead. A successful cleanup call
+alone does not prove that deletion has finished. Independently compare catalogs
+before and after live runs and inspect the logged owned names. Live operations
+incur storage and transfer charges; select a finite workload within the intended
+budget. Record the account tier/region and both endpoint hosts separately.
 
 ## Local baseline — 2026-10-05
 

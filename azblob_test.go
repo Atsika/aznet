@@ -209,6 +209,9 @@ func TestBlobReadInterruptedCiphertextRetry(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			if _, err := sender.Write(nil); err != nil { // wait until sent
+				t.Fatal(err)
+			}
 			const cut = 7 // Inside the first encrypted record, before it can be decrypted.
 			broken := &interruptedBlobBody{data: append([]byte(nil), ciphertext[:cut]...), err: bodyErr}
 			calls := 0
