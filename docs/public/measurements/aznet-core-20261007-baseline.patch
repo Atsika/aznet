@@ -1,0 +1,24 @@
+diff --git a/aztable.go b/aztable.go
+index 0b08c51..62b60bc 100644
+--- a/aztable.go
++++ b/aztable.go
+@@ -14,6 +14,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
++	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+ 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+ 	"github.com/Azure/azure-sdk-for-go/sdk/data/aztables"
+ )
+@@ -364,6 +365,11 @@ func (t *tableTransport) WriteRaw(ctx context.Context, seq uint64, data io.ReadS
+ 	if err != nil {
+ 		return err
+ 	}
++	// Only the commit acknowledgement is needed. Without Prefer, Table echoes
++	// the entire entity and the SDK decodes/re-encodes that unused payload.
++	// A 204 still confirms the write; an uncertain outcome retains the same
++	// sequence and ciphertext for the existing EntityAlreadyExists retry path.
++	ctx = policy.WithHTTPHeader(ctx, http.Header{"Prefer": {"return-no-content"}})
+ 	_, err = t.txClient.AddEntity(ctx, edata, nil)
+ 	var respErr *azcore.ResponseError
+ 	if errors.As(err, &respErr) && respErr.ErrorCode == "EntityAlreadyExists" {

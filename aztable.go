@@ -1,6 +1,7 @@
 package aznet
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/data/aztables"
 )
@@ -41,13 +43,51 @@ func init() {
 }
 
 func buildTableEntity(pk, rk string, data []byte) ([]byte, error) {
-	m := map[string]any{"PartitionKey": pk, "RowKey": rk}
-	for i := 0; i < MaxTableProperties && len(data) > 0; i++ {
-		take := min(len(data), MaxTableBinaryPropertySize)
-		m[dataKeys[i]], m[dataKeys[i]+"@odata.type"] = data[:take], "Edm.Binary"
-		data = data[take:]
+	return encodeTableEntity(pk, rk, bytes.NewReader(data), len(data))
+}
+
+// tableScratch holds one Edm.Binary property of plaintext while it is encoded.
+var tableScratch = sync.Pool{New: func() any { return new([MaxTableBinaryPropertySize]byte) }}
+
+// encodeTableEntity writes the entity JSON in one exactly sized allocation,
+// base64-encoding size bytes from r property by property. Properties beyond
+// MaxTableProperties are not encoded.
+func encodeTableEntity(pk, rk string, r io.Reader, size int) ([]byte, error) {
+	pkJSON, err := json.Marshal(pk)
+	if err != nil {
+		return nil, err
 	}
-	return json.Marshal(m)
+	rkJSON, err := json.Marshal(rk)
+	if err != nil {
+		return nil, err
+	}
+	size = min(size, MaxTableEntitySize)
+	const perProperty = len(`,"Data14":"","Data14@odata.type":"Edm.Binary"`)
+	properties := (size + MaxTableBinaryPropertySize - 1) / MaxTableBinaryPropertySize
+	// Each property is padded separately, so size the base64 per property.
+	encoded := size/MaxTableBinaryPropertySize*base64.StdEncoding.EncodedLen(MaxTableBinaryPropertySize) + base64.StdEncoding.EncodedLen(size%MaxTableBinaryPropertySize)
+	buf := make([]byte, 0, len(`{"PartitionKey":,"RowKey":}`)+len(pkJSON)+len(rkJSON)+properties*perProperty+encoded)
+	buf = append(buf, `{"PartitionKey":`...)
+	buf = append(buf, pkJSON...)
+	buf = append(buf, `,"RowKey":`...)
+	buf = append(buf, rkJSON...)
+	scratch := tableScratch.Get().(*[MaxTableBinaryPropertySize]byte)
+	defer tableScratch.Put(scratch)
+	for i := 0; i < properties; i++ {
+		chunk := scratch[:min(size, MaxTableBinaryPropertySize)]
+		if _, err := io.ReadFull(r, chunk); err != nil {
+			return nil, err
+		}
+		size -= len(chunk)
+		buf = append(buf, `,"`...)
+		buf = append(buf, dataKeys[i]...)
+		buf = append(buf, `":"`...)
+		buf = base64.StdEncoding.AppendEncode(buf, chunk)
+		buf = append(buf, `","`...)
+		buf = append(buf, dataKeys[i]...)
+		buf = append(buf, `@odata.type":"Edm.Binary"`...)
+	}
+	return append(buf, '}'), nil
 }
 
 func extractTableData(raw []byte) []byte {
@@ -67,41 +107,68 @@ func extractTableData(raw []byte) []byte {
 	return res
 }
 
-// Session data is bounded before base64 decoding. Bootstrap parsing has a
-// separate lifetime; session rows must not bypass the receive byte allowance.
-func extractSessionTableData(raw []byte, limit int) ([]byte, error) {
-	var properties map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &properties); err != nil {
-		return nil, err
+// tableBinary decodes one Edm.Binary property while the row is parsed. The
+// JSON text passed to UnmarshalJSON must not be retained, so decode it there.
+type tableBinary []byte
+
+func (b *tableBinary) UnmarshalJSON(p []byte) error {
+	if len(p) < 2 || p[0] != '"' || bytes.IndexByte(p, '\\') >= 0 {
+		// Escaped (or non-string) values are legal JSON but never produced by
+		// Azure for base64; take the general path.
+		var s string
+		if err := json.Unmarshal(p, &s); err != nil {
+			return err
+		}
+		p = []byte(s)
+	} else {
+		p = p[1 : len(p)-1]
+	}
+	// DecodedLen includes up to two padding bytes, checked exactly below.
+	if base64.StdEncoding.DecodedLen(len(p)) > MaxTableBinaryPropertySize+2 {
+		return ErrBufferLimit
+	}
+	out := make([]byte, base64.StdEncoding.DecodedLen(len(p)))
+	n, err := base64.StdEncoding.Decode(out, p)
+	if err != nil {
+		return err
+	}
+	if n > MaxTableBinaryPropertySize {
+		return ErrBufferLimit
+	}
+	*b = out[:n]
+	return nil
+}
+
+// tableRow selects the data properties of a session row; json skips the rest
+// without building a map of every property.
+type tableRow struct {
+	Data, Data01, Data02, Data03, Data04, Data05, Data06, Data07 tableBinary
+	Data08, Data09, Data10, Data11, Data12, Data13, Data14       tableBinary
+}
+
+// appendSessionTableData decodes a session row's data onto dst. Each property
+// is bounded before base64 decoding and the row by limit. Bootstrap parsing
+// has a separate lifetime; session rows must not bypass the receive allowance.
+func appendSessionTableData(dst, raw []byte, limit int) ([]byte, error) {
+	var row tableRow
+	if err := json.Unmarshal(raw, &row); err != nil {
+		return dst, err
 	}
 	limit = min(limit, MaxTableEntitySize)
-	var data []byte
-	for _, key := range dataKeys {
-		value, ok := properties[key]
-		if !ok {
+	start := len(dst)
+	for _, value := range [...]tableBinary{row.Data, row.Data01, row.Data02, row.Data03, row.Data04, row.Data05, row.Data06, row.Data07, row.Data08, row.Data09, row.Data10, row.Data11, row.Data12, row.Data13, row.Data14} {
+		if value == nil {
 			break
 		}
-		var encoded string
-		if err := json.Unmarshal(value, &encoded); err != nil {
-			return nil, err
+		if len(value) > limit-(len(dst)-start) {
+			return dst[:start], ErrBufferLimit
 		}
-		// DecodedLen includes up to two padding bytes, checked exactly below.
-		if base64.StdEncoding.DecodedLen(len(encoded)) > min(MaxTableBinaryPropertySize, limit-len(data))+2 {
-			return nil, ErrBufferLimit
-		}
-		chunk, err := base64.StdEncoding.DecodeString(encoded)
-		if err != nil {
-			return nil, err
-		}
-		if len(chunk) > MaxTableBinaryPropertySize || len(chunk) > limit-len(data) {
-			return nil, ErrBufferLimit
-		}
-		data = append(data, chunk...)
+		dst = append(dst, value...)
 	}
-	if len(data) == 0 {
-		return nil, errors.New("empty session row")
+	if len(dst) == start {
+		return dst, errors.New("empty session row")
 	}
-	return data, nil
+	return dst, nil
 }
 
 type tableFactory struct{}
@@ -353,17 +420,25 @@ func (t *tableTransport) WriteRaw(ctx context.Context, seq uint64, data io.ReadS
 	if seq >= 1_000_000_000 {
 		return fmt.Errorf("table sequence exhausted: %w", ErrBufferLimit)
 	}
-	raw, err := io.ReadAll(io.LimitReader(data, MaxTableEntitySize+1))
+	size, err := data.Seek(0, io.SeekEnd)
+	if err == nil {
+		_, err = data.Seek(0, io.SeekStart)
+	}
+	if err != nil {
+		return fmt.Errorf("size table write: %w", err)
+	}
+	if size > MaxTableEntitySize {
+		return ErrBufferLimit
+	}
+	edata, err := encodeTableEntity("data", formatRowKey(int(seq)), data, int(size))
 	if err != nil {
 		return fmt.Errorf("read table write: %w", err)
 	}
-	if len(raw) > MaxTableEntitySize {
-		return ErrBufferLimit
-	}
-	edata, err := buildTableEntity("data", formatRowKey(int(seq)), raw)
-	if err != nil {
-		return err
-	}
+	// Only the commit acknowledgement is needed. Without Prefer, Table echoes
+	// the entire entity and the SDK decodes/re-encodes that unused payload.
+	// A 204 still confirms the write; an uncertain outcome retains the same
+	// sequence and ciphertext for the existing EntityAlreadyExists retry path.
+	ctx = policy.WithHTTPHeader(ctx, http.Header{"Prefer": {"return-no-content"}})
 	_, err = t.txClient.AddEntity(ctx, edata, nil)
 	var respErr *azcore.ResponseError
 	if errors.As(err, &respErr) && respErr.ErrorCode == "EntityAlreadyExists" {
@@ -435,7 +510,7 @@ func (t *tableTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read table entities: %w", err)
 	}
-	t.pending, t.ends, t.position = nil, nil, 0
+	t.pending, t.ends, t.position = t.pending[:0], t.ends[:0], 0
 	for _, e := range resp.Entities {
 		var meta struct{ RowKey string }
 		if err := json.Unmarshal(e, &meta); err != nil {
@@ -444,16 +519,17 @@ func (t *tableTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 		if meta.RowKey != formatRowKey(t.rxSeq+len(t.ends)) {
 			break
 		}
-		data, err := extractSessionTableData(e, t.cfg.limits().Pending-len(t.pending))
-		if err == nil && len(t.ends) >= rows {
+		var err error
+		if len(t.ends) >= rows {
 			err = ErrBufferLimit
+		} else {
+			t.pending, err = appendSessionTableData(t.pending, e, t.cfg.limits().Pending-len(t.pending))
 		}
 		if err != nil {
 			t.rxErr = fmt.Errorf("table receive page: %w", err)
 			t.pending, t.ends = nil, nil
 			return nil, t.rxErr
 		}
-		t.pending = append(t.pending, data...)
 		t.ends = append(t.ends, len(t.pending))
 	}
 	if len(t.pending) == 0 {
@@ -499,7 +575,8 @@ func (b *tableBody) Close() error {
 		b.closed = true
 		b.t.active = false
 		if b.t.position == len(b.t.pending) {
-			b.t.pending, b.t.ends, b.t.position = nil, nil, 0
+			// Keep capacity: the next page reuses it within the Pending allowance.
+			b.t.pending, b.t.ends, b.t.position = b.t.pending[:0], b.t.ends[:0], 0
 		}
 	}
 	return nil
