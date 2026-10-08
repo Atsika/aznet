@@ -40,6 +40,11 @@ type Conn struct {
 	writeDeadline ioDeadline
 	pending       pendingChunk // sealed chunk awaiting write or rotation retry; guarded by flushGate
 	chunkSeq      uint64       // next chunk sequence; guarded by flushGate
+	// tailFrame is the offset in bufs.Write of the last frame if it is DATA and
+	// may still grow, else -1; sealedLen is the leading bytes already sealed
+	// into a chunk, which must never change. Both guarded by wmu.
+	tailFrame int
+	sealedLen int
 
 	lastActive   atomic.Int64
 	peerLastSeen atomic.Int64
@@ -99,6 +104,7 @@ func newConn(ctx context.Context, cancel context.CancelFunc, t Transport, cfg *C
 		flushKick:  make(chan struct{}, 1),
 		writeSpace: make(chan struct{}, 1),
 		bufs:       buffersPool.Get().(*Buffers),
+		tailFrame:  -1,
 		mtu:        min(t.MaxRawSize()-NoiseOverhead, cfg.limits().Retry-NoiseOverhead, cfg.limits().Write-FrameHeaderSize) - FrameHeaderSize,
 	}
 	if r, ok := t.(Rotator); ok {
@@ -136,7 +142,7 @@ func (c *Conn) Close() error {
 			c.wmu.Lock()
 			hadBuffered := c.bufs != nil && c.bufs.Write.Len() > 0
 			if c.closedWrite.Swap(1) == 0 && c.bufs != nil {
-				BuildFrame(&c.bufs.Write, Frame{Type: MsgTypeFin})
+				c.appendControl(MsgTypeFin)
 			}
 			c.wmu.Unlock()
 			ctx, finish := c.writeDeadline.operation(c.ctx)
@@ -181,6 +187,7 @@ func (c *Conn) recycleBuffers() {
 	if c.bufs != nil {
 		c.bufs.Read.Reset()
 		c.bufs.Write.Reset()
+		c.tailFrame, c.sealedLen = -1, 0
 		c.bufs.Noise.Reset()
 		c.bufs.Enc = c.bufs.Enc[:0]
 		c.bufs.Dec = c.bufs.Dec[:0]
@@ -675,11 +682,19 @@ func (c *Conn) Write(p []byte) (int, error) {
 		}
 		// Reserve a FIN header so shutdown never needs to exceed the allowance.
 		available := c.cfg.limits().Write - FrameHeaderSize - c.bufs.Write.Len()
+		// Grow the last DATA frame while it is unsealed, so consecutive small
+		// writes share one frame and fill chunks; a chunk still ends on a frame.
+		if n := c.extendTail(p, available); n > 0 {
+			p = p[n:]
+			accepted += n
+			available -= n
+		}
 		for len(p) > 0 && available > FrameHeaderSize {
 			size := min(len(p), c.mtu)
 			if size+FrameHeaderSize > available {
 				break
 			}
+			c.tailFrame = c.bufs.Write.Len()
 			BuildFrame(&c.bufs.Write, Frame{Type: MsgTypeData, Payload: p[:size]})
 			p = p[size:]
 			accepted += size
@@ -724,6 +739,30 @@ func (c *Conn) signalWriteSpace() {
 	}
 }
 
+// extendTail appends up to available bytes of p to the last frame when it is
+// an unsealed DATA frame below the MTU, and returns how many it took. The
+// frame's length header is rewritten in place. Caller holds wmu.
+func (c *Conn) extendTail(p []byte, available int) int {
+	if c.tailFrame < c.sealedLen {
+		return 0
+	}
+	length := int(binary.BigEndian.Uint32(c.bufs.Write.Bytes()[c.tailFrame:]))
+	n := min(len(p), c.mtu-length, available)
+	if n <= 0 {
+		return 0
+	}
+	c.bufs.Write.Write(p[:n])
+	binary.BigEndian.PutUint32(c.bufs.Write.Bytes()[c.tailFrame:], uint32(length+n))
+	return n
+}
+
+// appendControl queues a control frame, which data never merges across.
+// Caller holds wmu.
+func (c *Conn) appendControl(t byte) {
+	BuildFrame(&c.bufs.Write, Frame{Type: t})
+	c.tailFrame = -1
+}
+
 // CloseWrite shuts down the writing side of the connection. It sends a FIN frame
 // to the peer to indicate that no more data will be sent.
 func (c *Conn) CloseWrite() error {
@@ -735,7 +774,7 @@ func (c *Conn) CloseWrite() error {
 		c.wmu.Unlock()
 		return net.ErrClosed
 	}
-	BuildFrame(&c.bufs.Write, Frame{Type: MsgTypeFin})
+	c.appendControl(MsgTypeFin)
 	c.wmu.Unlock()
 
 	err := c.flush()
@@ -764,7 +803,7 @@ func (c *Conn) keepAlive() {
 					return
 				}
 				if c.bufs.Write.Len()+2*FrameHeaderSize <= c.cfg.limits().Write {
-					BuildFrame(&c.bufs.Write, Frame{Type: MsgTypePing})
+					c.appendControl(MsgTypePing)
 				}
 				c.wmu.Unlock()
 				_ = c.flush()
@@ -860,6 +899,7 @@ func (c *Conn) flushContext(ctx context.Context) (err error) {
 			return err
 		}
 		c.bufs.Enc = sealed[:0]
+		c.sealedLen = takeLen
 		c.wmu.Unlock()
 
 		if err := c.sendChunk(ctx, sealed, takeLen, false, c.chunkSeq); err != nil {
@@ -912,6 +952,10 @@ func (c *Conn) sendChunk(ctx context.Context, sealed []byte, consume int, rotate
 	if consume > 0 {
 		c.wmu.Lock()
 		c.bufs.Write.Next(consume)
+		c.sealedLen = 0
+		if c.tailFrame -= consume; c.tailFrame < 0 {
+			c.tailFrame = -1
+		}
 		c.wmu.Unlock()
 		c.signalWriteSpace()
 	}
