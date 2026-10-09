@@ -447,3 +447,29 @@ func TestSDKClientOptionsUsesProxyClient(t *testing.T) {
 		t.Fatal("nil config overrides the transport")
 	}
 }
+
+func TestProxyFuncResultIsValidated(t *testing.T) {
+	var lastDial string
+	srv := startProxy(t, func(conn net.Conn, br *bufio.Reader) {
+		if req := readConnect(t, br); req != nil {
+			lastDial = req.RequestURI
+		}
+		respond(conn, "403 Forbidden")
+	})
+	host := strings.TrimPrefix(srv, "http://")
+	for _, bad := range []*url.URL{{Scheme: "socks5", Host: host}, {Scheme: "http"}, {Scheme: "ftp", Host: host}} {
+		d := &proxyDialer{resolve: func(context.Context, *url.URL) (*ProxyConfig, error) {
+			return &ProxyConfig{URL: bad}, nil
+		}}
+		if _, err := d.DialContext(context.Background(), "tcp", "storage.example:443"); !errors.Is(err, ErrInvalidProxy) {
+			t.Errorf("%v: %v", bad, err)
+		}
+	}
+	// A resolver that returns a bare host, as Windows system settings do, means http.
+	d := &proxyDialer{resolve: func(context.Context, *url.URL) (*ProxyConfig, error) {
+		return &ProxyConfig{URL: &url.URL{Host: host}}, nil
+	}}
+	if _, err := d.DialContext(context.Background(), "tcp", "storage.example:443"); !errors.Is(err, ErrProxyConnect) || lastDial != "storage.example:443" {
+		t.Fatalf("bare host: %v, dialled %q", err, lastDial)
+	}
+}

@@ -94,14 +94,26 @@ func (c *Config) setProxy(fn ProxyFunc) {
 	c.httpClient = newProxyClient(fn)
 }
 
-// parseProxyURL accepts "host:port" as shorthand for an http proxy and fills
-// in the scheme's default port.
+// parseProxyURL accepts "host:port" as shorthand for an http proxy.
 func parseProxyURL(address string) (*url.URL, error) {
 	if !strings.Contains(address, "://") {
 		address = "http://" + address
 	}
 	u, err := url.Parse(address)
-	if err != nil || u.Hostname() == "" {
+	if err != nil {
+		return nil, fmt.Errorf("%w: invalid proxy address", ErrInvalidProxy)
+	}
+	return normalizeProxyURL(u)
+}
+
+// normalizeProxyURL returns a copy of u that is safe to dial: http or https
+// (a missing scheme means http), with the scheme's default port filled in.
+func normalizeProxyURL(in *url.URL) (*url.URL, error) {
+	u := *in
+	if u.Scheme == "" {
+		u.Scheme = "http"
+	}
+	if u.Hostname() == "" {
 		return nil, fmt.Errorf("%w: invalid proxy address", ErrInvalidProxy)
 	}
 	switch u.Scheme {
@@ -116,7 +128,7 @@ func parseProxyURL(address string) (*url.URL, error) {
 		}
 		u.Host = net.JoinHostPort(u.Hostname(), port)
 	}
-	return u, nil
+	return &u, nil
 }
 
 // newProxyClient builds the HTTP client the SDK clients use when a proxy is
@@ -154,7 +166,15 @@ func (d *proxyDialer) DialContext(ctx context.Context, network, addr string) (ne
 	if pc == nil || pc.URL == nil {
 		return d.dialer.DialContext(ctx, network, addr)
 	}
-	return dialViaProxy(ctx, &d.dialer, pc, addr)
+	// A resolver can return anything, such as a socks5 URL from the
+	// environment, so check it the way WithProxy does.
+	u, err := normalizeProxyURL(pc.URL)
+	if err != nil {
+		return nil, err
+	}
+	resolved := *pc
+	resolved.URL = u
+	return dialViaProxy(ctx, &d.dialer, &resolved, addr)
 }
 
 // targetURL describes the destination for a ProxyFunc.
