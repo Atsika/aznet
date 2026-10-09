@@ -179,3 +179,40 @@ the original Driver method set: their ordinary `ConnectionString()` still works;
 explicit per-string duration returns `ErrBootstrapDurationUnsupported` until the
 capability is implemented. Implementations must not mutate shared configuration to
 satisfy a single issuance request.
+
+## Egress Proxy
+
+### WithProxy
+
+```go
+func WithProxy(address string, auth ProxyAuth, user, pass string) Option
+```
+
+Sends every storage request through an HTTP egress proxy using `CONNECT`. `address` is `http://host:port` or `https://host:port` (TLS to the proxy itself); a bare `host:port` means `http`. Credentials may be given as `user` and `pass`, or in the address (`http://user:pass@host:port`). With neither, the proxy is tried without credentials.
+
+`auth` selects the scheme:
+
+| Value | Behaviour |
+| --- | --- |
+| `ProxyAuto` | Waits for the proxy's challenge, then uses the strongest offered scheme the credentials allow: Negotiate, NTLM, Basic. |
+| `ProxyBasic` | Sends Basic credentials with the first request. |
+| `ProxyNTLM` | NTLM with explicit credentials. `DOMAIN\user` and `user@domain` are accepted. |
+| `ProxyNegotiate` | SPNEGO (Kerberos). |
+
+Basic over an `http://` proxy sends the password unencrypted to the proxy. NTLM and Negotiate authenticate the TCP connection, so aznet keeps one connection for the whole exchange.
+
+Only HTTP and HTTPS proxies are supported; `socks5://` is rejected with `ErrInvalidProxy`. A plain-HTTP storage endpoint such as an emulator is also tunnelled with `CONNECT`, which most proxies allow only for port 443.
+
+- **Default**: no option set; the SDK's standard transport is used, which honors `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`.
+
+### WithProxyFunc
+
+```go
+type ProxyFunc func(ctx context.Context, target *url.URL) (*ProxyConfig, error)
+
+func WithProxyFunc(fn ProxyFunc) Option
+```
+
+Chooses the proxy for each new connection. `target` has scheme `https` for port 443 and `http` otherwise. Return a nil `*ProxyConfig` to connect directly. Use it when the proxy depends on the destination or can change between reconnects, for example when it comes from a PAC file.
+
+Errors: `ErrInvalidProxy`, `ErrProxyConnect`, `ErrProxyAuthRequired`, `ErrProxyAuthUnsupported`, `ErrProxyAuthFailed`.

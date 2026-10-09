@@ -12,6 +12,8 @@ github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.8.1-beta.1.0.20260803061
 github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.8.1-beta.1.0.20260803061759-b14dfcfec94a/go.mod h1:V1W7QnOB5vDNzPOkwyTYm9Y36IrifG2OzwEbD9BlsNo=
 github.com/Azure/azure-sdk-for-go/sdk/storage/azqueue v1.0.1 h1:qvrrnQ2mIjwY7IVlQuNB0ma43Nr74+9ZTZJ60KlmlV4=
 github.com/Azure/azure-sdk-for-go/sdk/storage/azqueue v1.0.1/go.mod h1:FkF/Az07vR3S4sBdjCuisznWfFWOD8u6Ibm/g/oyDAk=
+github.com/Azure/go-ntlmssp v0.1.1 h1:l+FM/EEMb0U9QZE7mKNEDw5Mu3mFiaa2GKOoTSsNDPw=
+github.com/Azure/go-ntlmssp v0.1.1/go.mod h1:NYqdhxd/8aAct/s4qSYZEerdPuH1liG2/X9DiVTbhpk=
 github.com/AzureAD/microsoft-authentication-library-for-go v1.7.2 h1:RHK7bS+HQMslb1sZpAokUt+zTVmue0hKSs2C791hhzU=
 github.com/AzureAD/microsoft-authentication-library-for-go v1.7.2/go.mod h1:HKpQxkWaGLJ+D/5H8QRpyQXA1eKjxkFlOMwck5+33Jk=
 github.com/andybalholm/brotli v1.2.2 h1:HzTuoo2ErYQqf5qvcJInB8uvqSVxRttzkFexPWtnceM=

@@ -144,6 +144,20 @@ var (
 	ErrHandshakeExchangeFailed = errors.New("failed to exchange handshake")
 	// ErrInvalidConfig is returned when the provided options result in an invalid configuration.
 	ErrInvalidConfig = errors.New("invalid configuration")
+	// ErrInvalidProxy is returned when the address given to WithProxy is not an
+	// http or https proxy URL.
+	ErrInvalidProxy = errors.New("invalid proxy")
+	// ErrProxyConnect is returned when the egress proxy cannot be reached or
+	// refuses to open a tunnel.
+	ErrProxyConnect = errors.New("proxy connect failed")
+	// ErrProxyAuthRequired is returned when the proxy demands authentication
+	// and no credentials were supplied.
+	ErrProxyAuthRequired = errors.New("proxy requires credentials")
+	// ErrProxyAuthUnsupported is returned when the proxy offers no
+	// authentication scheme this build can answer.
+	ErrProxyAuthUnsupported = errors.New("proxy authentication scheme unsupported")
+	// ErrProxyAuthFailed is returned when the proxy rejects the credentials.
+	ErrProxyAuthFailed = errors.New("proxy authentication failed")
 	// ErrNoData is returned when no data is available to read.
 	ErrNoData = errors.New("no data available")
 	// ErrFrameTooLarge is returned when a queued frame exceeds one chunk.

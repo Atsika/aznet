@@ -9,8 +9,10 @@ require (
 	github.com/Azure/azure-sdk-for-go/sdk/data/aztables v1.4.1
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.8.1-beta.1.0.20260803061759-b14dfcfec94a
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azqueue v1.0.1
+	github.com/Azure/go-ntlmssp v0.1.1
 	github.com/flynn/noise v1.1.0
 	github.com/google/uuid v1.6.0
+	golang.org/x/net v0.57.0
 )
 
 require (
@@ -24,7 +26,6 @@ require (
 	github.com/zeebo/xxh3 v1.1.0 // indirect
 	golang.org/x/crypto v0.54.0 // indirect
 	golang.org/x/exp v0.0.0-20260727155853-b88d891fe743 // indirect
-	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
 )
