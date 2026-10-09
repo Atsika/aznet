@@ -197,7 +197,16 @@ Sends every storage request through an HTTP egress proxy using `CONNECT`. `addre
 | `ProxyAuto` | Waits for the proxy's challenge, then uses the strongest offered scheme the credentials allow: Negotiate, NTLM, Basic. |
 | `ProxyBasic` | Sends Basic credentials with the first request. |
 | `ProxyNTLM` | NTLM with explicit credentials. `DOMAIN\user` and `user@domain` are accepted. |
-| `ProxyNegotiate` | SPNEGO (Kerberos). |
+| `ProxyNegotiate` | SPNEGO. Kerberos on every platform; see below. |
+
+#### Kerberos and single sign-on
+
+`ProxyConfig.SPN` overrides the service name, which defaults to `HTTP/` plus the proxy's lower-cased host name. Set it when the proxy is addressed by an alias or an IP.
+
+- **Windows**: Negotiate uses SSPI, which tries Kerberos and falls back to NTLM itself. With no credentials it uses the logged-on user, and an NTLM-only proxy is also answered as that user. Explicit credentials may be `DOMAIN\user` or a UPN.
+- **Linux and macOS**: with `user` and `pass`, aznet logs in to the KDC (`user@REALM`, or the `default_realm` of `krb5.conf`; `KRB5_CONFIG` or `/etc/krb5.conf`, falling back to DNS lookup of the KDC). Without a password it reads the ticket cache named by `KRB5CCNAME` (default `/tmp/krb5cc_<uid>`). Only file caches are readable: the macOS default `API:` cache, `KCM:` and `KEYRING:` are not, so run `kinit` against `KRB5CCNAME=FILE:/path`. A cache is read on every connection, so renewed tickets are picked up.
+- Outside Windows there is no NTLM inside Negotiate, so `ProxyAuto` falls back to the NTLM scheme if the proxy offers it and credentials were given.
+- WASM builds do not support Negotiate or ambient NTLM.
 
 Basic over an `http://` proxy sends the password unencrypted to the proxy. NTLM and Negotiate authenticate the TCP connection, so aznet keeps one connection for the whole exchange.
 

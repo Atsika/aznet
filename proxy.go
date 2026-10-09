@@ -49,6 +49,9 @@ type ProxyConfig struct {
 	// user@domain. Both empty means no explicit credentials: Negotiate then
 	// uses the identity of the running process where the platform allows it.
 	User, Pass string
+	// SPN is the Kerberos service name, HTTP/ plus the proxy's host name when
+	// empty. Set it when the proxy is reached by an alias or an address.
+	SPN string
 }
 
 // ProxyFunc chooses the egress proxy for a new connection to target, a URL
@@ -241,6 +244,11 @@ func selectProxyAuth(pc *ProxyConfig, user, pass string, offered map[string]stri
 			return auth, nil
 		case ProxyNTLM:
 			if user == "" {
+				// Without credentials only the platform can answer, as the
+				// logged-on user.
+				if auth, err := newAmbientNTLMAuth(); err == nil {
+					return auth, nil
+				}
 				needCreds = true
 				continue
 			}
@@ -335,12 +343,29 @@ type proxyState struct {
 	authz string
 }
 
+// release frees platform resources held by the authenticator once the tunnel
+// is up or has failed.
+func (st *proxyState) release() {
+	if r, ok := st.auth.(interface{ release() }); ok {
+		r.release()
+	}
+}
+
+// proxySPN is the Kerberos service name for the proxy.
+func proxySPN(pc *ProxyConfig) string {
+	if pc.SPN != "" {
+		return pc.SPN
+	}
+	return "HTTP/" + strings.ToLower(pc.URL.Hostname())
+}
+
 // dialViaProxy opens a tunnel to addr through the proxy with HTTP CONNECT,
 // answering any authentication challenge on the same connection. The caller's
 // TLS then runs inside the tunnel.
 func dialViaProxy(ctx context.Context, dialer *net.Dialer, pc *ProxyConfig, addr string) (net.Conn, error) {
 	user, pass := proxyCredentials(pc)
 	st := &proxyState{}
+	defer st.release()
 	if pc.Auth == ProxyBasic && user != "" {
 		st.auth = &basicAuth{user: user, pass: pass}
 		st.authz, _ = st.auth.respond("")
@@ -464,8 +489,3 @@ type bufferedConn struct {
 }
 
 func (c *bufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
-
-// newNegotiateAuth builds the SPNEGO authenticator. Not available yet.
-func newNegotiateAuth(*ProxyConfig, string, string) (proxyAuthenticator, error) {
-	return nil, ErrProxyAuthUnsupported
-}
