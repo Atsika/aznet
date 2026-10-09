@@ -101,6 +101,7 @@ func WithBufferLimits(limits BufferLimits) Option
 | `Decrypted` | 8 MiB | Decrypted framed bytes awaiting application reads |
 | `Write` | 4 MiB | Accepted framed plaintext, including control frames |
 | `Retry` | 4 MiB | One sealed outgoing chunk retained for an uncertain write |
+| `WriteChunks` | 0 (off) | Caps `Write` at this many of the driver's chunks (`MaxRawSize - NoiseOverhead` each) |
 
 `Write` returns once its bytes are queued in the `Write` allowance; a per-connection sender delivers them in order. Bytes queued while one storage request is in flight leave together as the next chunk, so small writes share requests. There is no coalescing timer: the first write on an idle connection is sent immediately.
 
@@ -110,6 +111,8 @@ func WithBufferLimits(limits BufferLimits) Option
 - `Write(nil)` and `CloseWrite()` wait until everything queued has been sent, and return any failure. `Close` allows only 250 ms for queued bytes, so call `CloseWrite` first when the peer must receive them.
 
 The batching gain depends on how far application writes fall below the driver chunk size: large for Blob and Table, none for Queue. With 64 KiB writes on one live account (median of three), Blob rose from 1.74 to 8.76 MiB/s (34 to 1.9 requests/MiB), Table from 1.50 to 5.55 MiB/s (27 to 2.5 requests/MiB), and Queue stayed at 0.83 MiB/s. A connection now fills its `Write` allowance, so chunks and the receiver's buffers grow to several MiB: a Blob sender/receiver pair peaked at about 24 MB instead of 5 MB. Lowering `Write` to 1 MiB kept 6.9 MiB/s at a 9 MB peak. The effective MTU is also constrained by the write and retry allowances. One FIN header is reserved; redundant pings may be skipped when the buffer is full.
+
+Queued bytes leave one chunk at a time, so a small write waits behind every chunk already queued. A byte allowance that suits Blob's 4 MiB chunks is about 21 sequential messages on Queue. `WriteChunks` expresses the allowance in chunks instead: `BufferLimits{Write: 1 << 20, WriteChunks: 5}` resolves to 1 MiB on Blob and Table and about 240 KiB on Queue. In ProxyBlob end-to-end runs during a bulk upload, Queue's 64-byte round-trip p95 fell from about 1.2–1.4 s at 1 MiB to about 550 ms at 256 KiB, with unchanged throughput (about 1.1 MiB/s).
 
 Receive overflow returns `ErrBufferLimit`, cancels connection I/O, and remains terminal on subsequent operations. Call `Close` to dispose of the transport and session. Smaller receive limits can reject valid larger chunks from a peer; configure both endpoints accordingly. Nonpositive fields leave defaults unchanged; `Write` must fit two frame headers plus one byte and `Retry` must fit a framed byte plus encryption overhead.
 

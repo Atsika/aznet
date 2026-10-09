@@ -1218,6 +1218,29 @@ func TestBatchedWriteBlocksAtLimitAndHonorsDeadline(t *testing.T) {
 	}
 }
 
+func TestWriteChunksCapsAllowance(t *testing.T) {
+	r := &batchRecorder{release: make(chan struct{})}
+	// The default 4 MiB allowance is capped at two 1 KiB test chunks.
+	c := batchConn(t, r, WithBufferLimits(BufferLimits{WriteChunks: 2}))
+	limit := 2 * (1024 - NoiseOverhead)
+	c.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+	n, err := c.Write(make([]byte, 64<<10))
+	if !errors.Is(err, os.ErrDeadlineExceeded) || n <= 0 || n >= 64<<10 {
+		t.Fatal(n, err)
+	}
+	if n := queued(c); n > limit {
+		t.Fatalf("queued %d bytes beyond the %d-byte chunk allowance", n, limit)
+	}
+	close(r.release)
+	c.SetWriteDeadline(time.Time{})
+	if err := c.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	if len(r.data) != n {
+		t.Fatalf("delivered %d of %d accepted bytes", len(r.data), n)
+	}
+}
+
 func TestBatchedFailureResendsSameChunk(t *testing.T) {
 	r := &batchRecorder{fail: 1}
 	c := batchConn(t, r)

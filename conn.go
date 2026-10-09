@@ -64,6 +64,7 @@ type Conn struct {
 	closedRead  atomic.Uint32
 	closedWrite atomic.Uint32
 	mtu         int
+	writeLimit  int // BufferLimits.Write, capped by WriteChunks
 	readRemain  int
 }
 
@@ -105,8 +106,14 @@ func newConn(ctx context.Context, cancel context.CancelFunc, t Transport, cfg *C
 		writeSpace: make(chan struct{}, 1),
 		bufs:       buffersPool.Get().(*Buffers),
 		tailFrame:  -1,
-		mtu:        min(t.MaxRawSize()-NoiseOverhead, cfg.limits().Retry-NoiseOverhead, cfg.limits().Write-FrameHeaderSize) - FrameHeaderSize,
 	}
+	limits := cfg.limits()
+	c.writeLimit = limits.Write
+	if limits.WriteChunks > 0 {
+		// A chunk carries at most MaxRawSize-NoiseOverhead framed plaintext.
+		c.writeLimit = min(c.writeLimit, limits.WriteChunks*(t.MaxRawSize()-NoiseOverhead))
+	}
+	c.mtu = min(t.MaxRawSize()-NoiseOverhead, limits.Retry-NoiseOverhead, c.writeLimit-FrameHeaderSize) - FrameHeaderSize
 	if r, ok := t.(Rotator); ok {
 		c.rotator = r
 	}
@@ -681,7 +688,7 @@ func (c *Conn) Write(p []byte) (int, error) {
 			return accepted, c.overflow("transport capacity")
 		}
 		// Reserve a FIN header so shutdown never needs to exceed the allowance.
-		available := c.cfg.limits().Write - FrameHeaderSize - c.bufs.Write.Len()
+		available := c.writeLimit - FrameHeaderSize - c.bufs.Write.Len()
 		// Grow the last DATA frame while it is unsealed, so consecutive small
 		// writes share one frame and fill chunks; a chunk still ends on a frame.
 		if n := c.extendTail(p, available); n > 0 {
@@ -802,7 +809,7 @@ func (c *Conn) keepAlive() {
 					c.wmu.Unlock()
 					return
 				}
-				if c.bufs.Write.Len()+2*FrameHeaderSize <= c.cfg.limits().Write {
+				if c.bufs.Write.Len()+2*FrameHeaderSize <= c.writeLimit {
 					c.appendControl(MsgTypePing)
 				}
 				c.wmu.Unlock()
