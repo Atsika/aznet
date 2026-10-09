@@ -268,17 +268,23 @@ func WithBufferLimits(limits BufferLimits) Option {
 		if limits.Retry >= NoiseOverhead+FrameHeaderSize+1 {
 			c.bufferLimits.Retry = limits.Retry
 		}
+		if limits.WriteChunks > 0 {
+			c.bufferLimits.WriteChunks = limits.WriteChunks
+		}
 	}
 }
 
 // BufferLimits bounds live bytes per connection in each ownership stage.
 // Pending bounds received ciphertext and, separately, Queue reassembly.
 // Decrypted bounds framed plaintext awaiting Read. Write bounds queued framed
-// plaintext (including control frames). Retry bounds one sealed outgoing chunk.
+// plaintext (including control frames). WriteChunks, when positive, further
+// caps Write at that many of the transport's chunks: queued bytes leave one
+// chunk at a time, so a small write waits behind every chunk queued ahead of
+// it. Retry bounds one sealed outgoing chunk.
 // Encryption/decryption scratch and allocator capacity are additional, finite
 // storage; these allowances are not a process heap or cloud storage quota.
 type BufferLimits struct {
-	Pending, Decrypted, Write, Retry int
+	Pending, Decrypted, Write, Retry, WriteChunks int
 }
 
 // DefaultBufferLimits accommodates two maximum Blob chunks on receive, and one
