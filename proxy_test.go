@@ -73,7 +73,7 @@ func connectThrough(t *testing.T, pc *ProxyConfig) (net.Conn, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	t.Cleanup(cancel)
-	return dialViaProxy(ctx, &net.Dialer{}, pc, "storage.example:443")
+	return dialViaProxy(ctx, &net.Dialer{}, pc, "storage.example:443", nil)
 }
 
 func mustProxyURL(t *testing.T, addr string) *url.URL {
@@ -327,7 +327,7 @@ func TestProxyContextCancelStopsStalledProxy(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err := dialViaProxy(ctx, &net.Dialer{}, &ProxyConfig{URL: mustProxyURL(t, addr)}, "storage.example:443")
+	_, err := dialViaProxy(ctx, &net.Dialer{}, &ProxyConfig{URL: mustProxyURL(t, addr)}, "storage.example:443", nil)
 	if err == nil || time.Since(start) > 3*time.Second {
 		t.Fatalf("err %v after %v", err, time.Since(start))
 	}
@@ -388,7 +388,7 @@ func TestProxyClientReachesHTTPSOriginThroughTunnel(t *testing.T) {
 		io.Copy(conn, up)
 	})
 	pc := &ProxyConfig{URL: mustProxyURL(t, addr)}
-	client := newProxyClient(func(context.Context, *url.URL) (*ProxyConfig, error) { return pc, nil })
+	client := newProxyClient(func(context.Context, *url.URL) (*ProxyConfig, error) { return pc, nil }, nil)
 	// httptest's certificate is self-signed.
 	tr := client.Transport.(*http.Transport)
 	tr.TLSClientConfig.InsecureSkipVerify = true
@@ -471,5 +471,58 @@ func TestProxyFuncResultIsValidated(t *testing.T) {
 	}}
 	if _, err := d.DialContext(context.Background(), "tcp", "storage.example:443"); !errors.Is(err, ErrProxyConnect) || lastDial != "storage.example:443" {
 		t.Fatalf("bare host: %v, dialled %q", err, lastDial)
+	}
+}
+
+func TestProxyLogTracesTheExchangeWithoutSecrets(t *testing.T) {
+	addr := startProxy(t, func(conn net.Conn, br *bufio.Reader) {
+		for {
+			req := readConnect(t, br)
+			if req == nil {
+				return
+			}
+			if req.Header.Get("Proxy-Authorization") == "" {
+				respond(conn, "407 Proxy Authentication Required", `Proxy-Authenticate: Basic realm="corp"`)
+				continue
+			}
+			tunnelEcho(conn, br)
+			return
+		}
+	})
+	var mu sync.Mutex
+	var lines []string
+	logf := func(format string, args ...any) {
+		mu.Lock()
+		defer mu.Unlock()
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}
+	cfg := applyConfig([]Option{
+		WithProxyLog(logf), // before the proxy: option order must not matter
+		WithProxy(strings.Replace(addr, "http://", "http://alice:hunter2@", 1), ProxyAuto, "", ""),
+	})
+	defer cfg.cancel()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	d := cfg.httpClient.Transport.(*http.Transport).DialContext
+	conn, err := d(ctx, "tcp", "storage.example:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+
+	log := strings.Join(lines, "\n")
+	for _, want := range []string{
+		"via http://127.0.0.1:", "auth=auto", "credentials supplied=true",
+		"sending no credentials", "proxy replied 407", "proxy offers basic",
+		"answering with basic", "sending Basic", "proxy replied 200", "tunnel established",
+	} {
+		if !strings.Contains(log, want) {
+			t.Errorf("log lacks %q:\n%s", want, log)
+		}
+	}
+	for _, secret := range []string{"hunter2", "alice", base64.StdEncoding.EncodeToString([]byte("alice:hunter2"))} {
+		if strings.Contains(log, secret) {
+			t.Errorf("log leaks %q:\n%s", secret, log)
+		}
 	}
 }

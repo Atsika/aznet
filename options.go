@@ -70,6 +70,8 @@ type Config struct {
 
 	// httpClient replaces the SDK's default transport; nil keeps the default.
 	httpClient *http.Client
+	proxyFn    ProxyFunc
+	proxyLog   func(string, ...any)
 	proxyErr   error
 }
 
@@ -120,6 +122,7 @@ func applyConfig(opts []Option) *Config {
 	for _, o := range opts {
 		o(cfg)
 	}
+	cfg.finishProxy()
 	return cfg
 }
 

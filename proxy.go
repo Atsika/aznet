@@ -37,6 +37,19 @@ const (
 	ProxyNegotiate
 )
 
+func (a ProxyAuth) String() string {
+	switch a {
+	case ProxyBasic:
+		return "basic"
+	case ProxyNTLM:
+		return "ntlm"
+	case ProxyNegotiate:
+		return "negotiate"
+	default:
+		return "auto"
+	}
+}
+
 // ProxyConfig describes the egress proxy to use for one connection.
 type ProxyConfig struct {
 	// URL is the proxy address. Its scheme is http or https (TLS to the proxy
@@ -90,8 +103,28 @@ func WithProxyFunc(fn ProxyFunc) Option {
 	}
 }
 
+// WithProxyLog reports how connections are made through the proxy: which proxy
+// was chosen, the CONNECT exchange, the schemes the proxy offers and which one
+// answered. Credentials, tokens and user names are never included. It has no
+// effect without WithProxy or WithProxyFunc, and may be given in any order.
+func WithProxyLog(logf func(format string, args ...any)) Option {
+	return func(c *Config) { c.proxyLog = logf }
+}
+
 func (c *Config) setProxy(fn ProxyFunc) {
-	c.httpClient = newProxyClient(fn)
+	c.proxyFn = fn
+}
+
+// finishProxy builds the HTTP client once every option has been applied.
+func (c *Config) finishProxy() {
+	if c.proxyFn != nil {
+		c.httpClient = newProxyClient(c.proxyFn, c.proxyLog)
+	}
+}
+
+// proxyLabel names a proxy for logs: scheme and address, never credentials.
+func proxyLabel(u *url.URL) string {
+	return u.Scheme + "://" + u.Host
 }
 
 // parseProxyURL accepts "host:port" as shorthand for an http proxy.
@@ -134,8 +167,8 @@ func normalizeProxyURL(in *url.URL) (*url.URL, error) {
 // newProxyClient builds the HTTP client the SDK clients use when a proxy is
 // configured. It mirrors the SDK's default transport so behaviour only differs
 // in how the TCP connection is established.
-func newProxyClient(fn ProxyFunc) *http.Client {
-	d := &proxyDialer{resolve: fn, dialer: net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}}
+func newProxyClient(fn ProxyFunc, logf func(string, ...any)) *http.Client {
+	d := &proxyDialer{resolve: fn, logf: logf, dialer: net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}}
 	tr := &http.Transport{
 		DialContext:           d.DialContext,
 		ForceAttemptHTTP2:     true,
@@ -155,6 +188,7 @@ func newProxyClient(fn ProxyFunc) *http.Client {
 
 type proxyDialer struct {
 	resolve ProxyFunc
+	logf    func(string, ...any)
 	dialer  net.Dialer
 }
 
@@ -164,6 +198,9 @@ func (d *proxyDialer) DialContext(ctx context.Context, network, addr string) (ne
 		return nil, err
 	}
 	if pc == nil || pc.URL == nil {
+		if d.logf != nil {
+			d.logf("proxy: %s: direct connection", addr)
+		}
 		return d.dialer.DialContext(ctx, network, addr)
 	}
 	// A resolver can return anything, such as a socks5 URL from the
@@ -174,7 +211,7 @@ func (d *proxyDialer) DialContext(ctx context.Context, network, addr string) (ne
 	}
 	resolved := *pc
 	resolved.URL = u
-	return dialViaProxy(ctx, &d.dialer, &resolved, addr)
+	return dialViaProxy(ctx, &d.dialer, &resolved, addr, d.logf)
 }
 
 // targetURL describes the destination for a ProxyFunc.
@@ -287,12 +324,20 @@ func selectProxyAuth(pc *ProxyConfig, user, pass string, offered map[string]stri
 	case lastErr != nil:
 		return nil, lastErr
 	}
+	return nil, fmt.Errorf("%w: proxy offers %s", ErrProxyAuthUnsupported, offeredSchemes(offered))
+}
+
+// offeredSchemes lists the schemes in a challenge set, for messages.
+func offeredSchemes(offered map[string]string) string {
 	names := make([]string, 0, len(offered))
 	for name := range offered {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	return nil, fmt.Errorf("%w: proxy offers %q", ErrProxyAuthUnsupported, strings.Join(names, ", "))
+	if len(names) == 0 {
+		return "none"
+	}
+	return strings.Join(names, ", ")
 }
 
 type basicAuth struct {
@@ -361,6 +406,13 @@ var errProxyReconnect = errors.New("proxy closed the connection")
 type proxyState struct {
 	auth  proxyAuthenticator
 	authz string
+	logf  func(string, ...any)
+}
+
+func (st *proxyState) log(format string, args ...any) {
+	if st.logf != nil {
+		st.logf("proxy: "+format, args...)
+	}
 }
 
 // release frees platform resources held by the authenticator once the tunnel
@@ -382,10 +434,11 @@ func proxySPN(pc *ProxyConfig) string {
 // dialViaProxy opens a tunnel to addr through the proxy with HTTP CONNECT,
 // answering any authentication challenge on the same connection. The caller's
 // TLS then runs inside the tunnel.
-func dialViaProxy(ctx context.Context, dialer *net.Dialer, pc *ProxyConfig, addr string) (net.Conn, error) {
+func dialViaProxy(ctx context.Context, dialer *net.Dialer, pc *ProxyConfig, addr string, logf func(string, ...any)) (net.Conn, error) {
 	user, pass := proxyCredentials(pc)
-	st := &proxyState{}
+	st := &proxyState{logf: logf}
 	defer st.release()
+	st.log("%s: via %s (auth=%s, credentials supplied=%t)", addr, proxyLabel(pc.URL), pc.Auth, user != "")
 	if pc.Auth == ProxyBasic && user != "" {
 		st.auth = &basicAuth{user: user, pass: pass}
 		st.authz, _ = st.auth.respond("")
@@ -393,19 +446,23 @@ func dialViaProxy(ctx context.Context, dialer *net.Dialer, pc *ProxyConfig, addr
 	for attempt := 0; ; attempt++ {
 		conn, err := dialProxyConn(ctx, dialer, pc)
 		if err != nil {
+			st.log("%s: cannot reach the proxy: %v", addr, err)
 			return nil, err
 		}
 		tunnel, err := connectOnce(ctx, conn, pc, user, pass, addr, st)
 		if err == nil {
+			st.log("%s: tunnel established", addr)
 			return tunnel, nil
 		}
 		conn.Close()
 		if errors.Is(err, errProxyReconnect) {
 			if attempt < 2 {
+				st.log("%s: proxy closed the connection after the challenge, reconnecting", addr)
 				continue
 			}
 			err = fmt.Errorf("%w: proxy keeps closing the connection", ErrProxyConnect)
 		}
+		st.log("%s: failed: %v", addr, err)
 		return nil, err
 	}
 }
@@ -448,11 +505,14 @@ func connectOnce(ctx context.Context, conn net.Conn, pc *ProxyConfig, user, pass
 
 func connectRounds(conn net.Conn, pc *ProxyConfig, user, pass, addr string, st *proxyState) (net.Conn, error) {
 	br := bufio.NewReader(conn)
-	for range maxProxyRounds {
+	for round := 1; round <= maxProxyRounds; round++ {
 		req := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: addr}, Host: addr, Header: make(http.Header)}
+		sending := "no credentials"
 		if st.authz != "" {
 			req.Header.Set("Proxy-Authorization", st.authz)
+			sending, _, _ = strings.Cut(st.authz, " ")
 		}
+		st.log("%s: CONNECT round %d, sending %s", addr, round, sending)
 		if err := req.Write(conn); err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrProxyConnect, unwrapURLError(err))
 		}
@@ -460,6 +520,7 @@ func connectRounds(conn net.Conn, pc *ProxyConfig, user, pass, addr string, st *
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrProxyConnect, unwrapURLError(err))
 		}
+		st.log("%s: proxy replied %s", addr, resp.Status)
 		if resp.StatusCode/100 == 2 {
 			if br.Buffered() > 0 {
 				return &bufferedConn{Conn: conn, r: br}, nil
@@ -474,12 +535,16 @@ func connectRounds(conn net.Conn, pc *ProxyConfig, user, pass, addr string, st *
 			return nil, fmt.Errorf("%w: %s", ErrProxyConnect, status)
 		}
 
+		st.log("%s: proxy offers %s", addr, offeredSchemes(challenges))
 		if st.auth == nil {
 			if st.auth, err = selectProxyAuth(pc, user, pass, challenges); err != nil {
+				st.log("%s: cannot answer the challenge: %v", addr, err)
 				return nil, err
 			}
+			st.log("%s: answering with %s", addr, st.auth.scheme())
 		}
 		if st.authz, err = st.auth.respond(challenges[st.auth.scheme()]); err != nil {
+			st.log("%s: %s authentication failed: %v", addr, st.auth.scheme(), err)
 			return nil, err
 		}
 		if closing {
