@@ -51,9 +51,24 @@ func TestKerberosCachePath(t *testing.T) {
 			t.Errorf("%s: %v", kind, err)
 		}
 	}
+	// When KRB5CCNAME is empty and the default file exists, it is returned.
+	// When the file does not exist (as on macOS without kinit), an error asks
+	// the user to create one.
 	t.Setenv("KRB5CCNAME", "")
-	if p, err := kerberosCachePath(); err != nil || !strings.HasPrefix(p, "/tmp/krb5cc_") {
-		t.Fatalf("default %q, %v", p, err)
+	p, err := kerberosCachePath()
+	if err == nil {
+		if !strings.HasPrefix(p, "/tmp/krb5cc_") {
+			t.Fatalf("default %q", p)
+		}
+	} else if !errors.Is(err, ErrProxyAuthRequired) {
+		t.Fatalf("default: unexpected error: %v", err)
+	}
+	// With a file that exists, it is always returned.
+	tmp := filepath.Join(t.TempDir(), "krb5cc_test")
+	os.WriteFile(tmp, []byte("test"), 0o600)
+	t.Setenv("KRB5CCNAME", tmp)
+	if p, err := kerberosCachePath(); err != nil || p != tmp {
+		t.Fatalf("explicit file %q, %v", p, err)
 	}
 }
 

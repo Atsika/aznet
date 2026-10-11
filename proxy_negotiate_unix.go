@@ -154,13 +154,29 @@ func kerberosCacheClient() (*client.Client, error) {
 func kerberosCachePath() (string, error) {
 	name := os.Getenv("KRB5CCNAME")
 	if name == "" {
-		return "/tmp/krb5cc_" + strconv.Itoa(os.Getuid()), nil
+		path := "/tmp/krb5cc_" + strconv.Itoa(os.Getuid())
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
+		}
+		// On macOS the default cache uses the API type (managed by
+		// securityd), which Go cannot read without cgo. Try the Heimdal
+		// temp path that kinit writes when used from the terminal.
+		if alt := "/tmp/krb5cc_" + os.Getenv("USER"); alt != path {
+			if _, err := os.Stat(alt); err == nil {
+				return alt, nil
+			}
+		}
+		return "", fmt.Errorf(
+			"%w: no file-based Kerberos ticket cache found; "+
+				"run \"kinit\" to create one or set KRB5CCNAME=FILE:<path>",
+			ErrProxyAuthRequired,
+		)
 	}
 	if kind, rest, ok := strings.Cut(name, ":"); ok && len(kind) > 1 {
 		if strings.EqualFold(kind, "FILE") {
 			return rest, nil
 		}
-		return "", fmt.Errorf("%w: Kerberos cache type %s: is not readable; set KRB5CCNAME=FILE:<path>", ErrProxyAuthUnsupported, strings.ToUpper(kind))
+		return "", fmt.Errorf("%w: Kerberos cache type %s is not readable; set KRB5CCNAME=FILE:<path>", ErrProxyAuthUnsupported, strings.ToUpper(kind))
 	}
 	return name, nil
 }

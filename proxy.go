@@ -545,6 +545,24 @@ func connectRounds(conn net.Conn, pc *ProxyConfig, user, pass, addr string, st *
 		}
 		if st.authz, err = st.auth.respond(challenges[st.auth.scheme()]); err != nil {
 			st.log("%s: %s authentication failed: %v", addr, st.auth.scheme(), err)
+			// When ProxyAuto chose Negotiate and it failed, fall back to
+			// NTLM on the same connection if the proxy offers it.
+			if pc.Auth == ProxyAuto && st.auth.scheme() == "negotiate" {
+				if r, ok := st.auth.(interface{ release() }); ok {
+					r.release()
+				}
+				st.auth = nil
+				st.authz = ""
+				fallback, ferr := selectProxyAuth(&ProxyConfig{URL: pc.URL, Auth: ProxyNTLM, User: pc.User, Pass: pc.Pass, SPN: pc.SPN}, user, pass, challenges)
+				if ferr == nil {
+					st.auth = fallback
+					st.log("%s: falling back to %s", addr, st.auth.scheme())
+					st.authz, err = st.auth.respond("")
+					if err == nil {
+						continue
+					}
+				}
+			}
 			return nil, err
 		}
 		if closing {
