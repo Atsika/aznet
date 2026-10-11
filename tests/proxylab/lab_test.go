@@ -273,3 +273,48 @@ func echo(c net.Conn) error {
 	}
 	return nil
 }
+
+// TestDirect checks that the proxy code leaves a direct connection alone: no
+// proxy option at all, and a resolver that answers "no proxy".
+func TestDirect(t *testing.T) {
+	startEcho(t)
+	direct := labConn // the listener's own address, reachable without a proxy
+	for _, tc := range []struct {
+		name string
+		opts []aznet.Option
+		log  string
+	}{
+		{name: "no proxy option"},
+		{name: "resolver says direct", opts: []aznet.Option{
+			aznet.WithProxyFunc(func(context.Context, *url.URL) (*aznet.ProxyConfig, error) { return nil, nil }),
+		}, log: "direct connection"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var logBuf bytes.Buffer
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			opts := append(tc.opts, aznet.WithContext(ctx), aznet.WithProxyLog(func(f string, a ...any) {
+				mu.Lock()
+				defer mu.Unlock()
+				fmt.Fprintf(&logBuf, f+"\n", a...)
+			}))
+			c, err := aznet.Dial("azblob", direct, opts...)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer c.Close()
+			if err := echo(c); err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if tc.log != "" && !strings.Contains(logBuf.String(), tc.log) {
+				t.Errorf("log lacks %q:\n%s", tc.log, logBuf.String())
+			}
+			if strings.Contains(logBuf.String(), "via ") {
+				t.Errorf("went through a proxy:\n%s", logBuf.String())
+			}
+		})
+	}
+}
