@@ -1,0 +1,70 @@
+# A small corporate network: an Active Directory domain controller (Samba),
+# domain-joined Squid proxies that each ask for different authentication, and
+# an Azurite storage emulator behind them.
+#
+#   port    service          offers
+#   3128    proxy-basic      Basic (checked against AD)
+#   3129    proxy-ntlm       NTLM
+#   3130    proxy-negotiate  Negotiate (Kerberos)
+#   3131    proxy-all        Negotiate, NTLM, Basic (what a typical company runs)
+#
+# Users (password Passw0rd!2024): alice, bob, and carol (disabled).
+x-squid: &squid
+  build: ./squid
+  depends_on: [dc]
+  dns: [10.77.0.2]
+  networks: [corp]
+
+services:
+  dc:
+    build: ./dc
+    hostname: dc
+    domainname: corp.test
+    privileged: true
+    ports:
+      - "88:88/tcp"
+      - "88:88/udp"
+    volumes:
+      - dc_data:/var/lib/samba
+    networks:
+      corp: { ipv4_address: 10.77.0.2 }
+
+  proxy-basic:
+    <<: *squid
+    hostname: proxy-basic
+    environment: { SCHEMES: basic, PORT: "3128" }
+    ports: ["3128:3128"]
+
+  proxy-ntlm:
+    <<: *squid
+    hostname: proxy-ntlm
+    environment: { SCHEMES: ntlm, PORT: "3128" }
+    ports: ["3129:3128"]
+
+  proxy-negotiate:
+    <<: *squid
+    hostname: proxy-negotiate
+    environment: { SCHEMES: negotiate, PORT: "3128" }
+    ports: ["3130:3128"]
+
+  proxy-all:
+    <<: *squid
+    hostname: proxy-all
+    environment: { SCHEMES: "negotiate,ntlm,basic", PORT: "3128" }
+    ports: ["3131:3128"]
+
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    command: >
+      azurite --blobHost 0.0.0.0 --queueHost 0.0.0.0 --tableHost 0.0.0.0
+      --location /data --skipApiVersionCheck --disableTelemetry
+    ports: ["10000:10000", "10001:10001", "10002:10002"]
+    networks: [corp]
+
+volumes:
+  dc_data: {}
+
+networks:
+  corp:
+    ipam:
+      config: [{ subnet: 10.77.0.0/24 }]

@@ -526,3 +526,47 @@ func TestProxyLogTracesTheExchangeWithoutSecrets(t *testing.T) {
 		}
 	}
 }
+
+// The Azure SDK retries any dial error unless it carries NonRetriable. A
+// rejected login must not be repeated (against a directory it counts toward
+// locking the account), while an unreachable proxy may be.
+func TestProxyAuthFailuresAreNotRetried(t *testing.T) {
+	type nonRetriable interface{ NonRetriable() }
+	rejecting := startProxy(t, func(conn net.Conn, br *bufio.Reader) {
+		readConnect(t, br)
+		respond(conn, "407 Proxy Authentication Required", "Proxy-Authenticate: Basic realm=\"x\"")
+		readConnect(t, br)
+		respond(conn, "407 Proxy Authentication Required", "Proxy-Authenticate: Basic realm=\"x\"")
+	})
+	refusing := startProxy(t, func(conn net.Conn, br *bufio.Reader) {
+		readConnect(t, br)
+		respond(conn, "403 Forbidden")
+	})
+	for _, tc := range []struct {
+		name      string
+		pc        *ProxyConfig
+		want      error
+		permanent bool
+	}{
+		{"wrong password", &ProxyConfig{URL: mustProxyURL(t, rejecting), User: "u", Pass: "bad"}, ErrProxyAuthFailed, true},
+		{"no credentials", &ProxyConfig{URL: mustProxyURL(t, rejecting)}, ErrProxyAuthRequired, true},
+		{"unsupported scheme", &ProxyConfig{URL: mustProxyURL(t, rejecting), Auth: ProxyNTLM, User: "u", Pass: "p"}, ErrProxyAuthUnsupported, true},
+		{"refused", &ProxyConfig{URL: mustProxyURL(t, refusing)}, ErrProxyConnect, false},
+		{"unreachable", &ProxyConfig{URL: mustProxyURL(t, "127.0.0.1:1")}, ErrProxyConnect, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &proxyDialer{
+				resolve: func(context.Context, *url.URL) (*ProxyConfig, error) { return tc.pc, nil },
+				dialer:  net.Dialer{Timeout: 2 * time.Second},
+			}
+			_, err := d.DialContext(context.Background(), "tcp", "storage.example:443")
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err %v, want %v", err, tc.want)
+			}
+			var nr nonRetriable
+			if got := errors.As(err, &nr); got != tc.permanent {
+				t.Fatalf("non-retriable %t, want %t (%v)", got, tc.permanent, err)
+			}
+		})
+	}
+}

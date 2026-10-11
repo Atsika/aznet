@@ -211,8 +211,27 @@ func (d *proxyDialer) DialContext(ctx context.Context, network, addr string) (ne
 	}
 	resolved := *pc
 	resolved.URL = u
-	return dialViaProxy(ctx, &d.dialer, &resolved, addr, d.logf)
+	conn, err := dialViaProxy(ctx, &d.dialer, &resolved, addr, d.logf)
+	if err != nil && isProxyAuthError(err) {
+		err = permanentError{err}
+	}
+	return conn, err
 }
+
+// isProxyAuthError reports failures that repeating cannot fix. A proxy that
+// rejects credentials would only reject them again, and against a directory
+// service each attempt counts toward locking the account.
+func isProxyAuthError(err error) bool {
+	return errors.Is(err, ErrProxyAuthRequired) || errors.Is(err, ErrProxyAuthFailed) || errors.Is(err, ErrProxyAuthUnsupported)
+}
+
+// permanentError tells the Azure SDK's retry policy (which looks for a
+// NonRetriable method) not to retry the request.
+type permanentError struct{ error }
+
+func (permanentError) NonRetriable() {}
+
+func (e permanentError) Unwrap() error { return e.error }
 
 // targetURL describes the destination for a ProxyFunc.
 func targetURL(addr string) *url.URL {
