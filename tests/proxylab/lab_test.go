@@ -7,6 +7,9 @@ package proxylab
 //	cd tests/proxylab && docker compose up -d --build
 //	AZNET_PROXYLAB=1 go test -v -count=1 ./tests/proxylab/
 //
+// AZNET_PROXYLAB_HOST=<address> points the tests at a lab running on another
+// machine (its published ports must be reachable).
+//
 // Without AZNET_PROXYLAB the tests are skipped, so `go test ./...` stays
 // offline.
 
@@ -21,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -32,14 +36,40 @@ import (
 const (
 	password = "Passw0rd!2024"
 
-	basicProxy     = "http://localhost:3128"
-	ntlmProxy      = "http://localhost:3129"
-	negotiateProxy = "http://localhost:3130"
-	allProxy       = "http://localhost:3131"
-
-	// Azurite as the proxies see it; the listener reaches it as localhost.
-	azuriteURL = "http://devstoreaccount1:Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq%2FK1SZFPTOtr%2FKBHBeksoGMGw%3D%3D@localhost:10000/devstoreaccount1"
+	account = "devstoreaccount1:Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq%2FK1SZFPTOtr%2FKBHBeksoGMGw%3D%3D"
 )
+
+// By default the tests run on the host that runs docker compose, reaching the
+// proxies through their published ports. With AZNET_PROXYLAB_INSIDE=1 they run
+// inside the lab network (docker compose run runner), reaching everything by
+// service name, which is how a Linux machine on a corporate network sees it.
+var (
+	inside = os.Getenv("AZNET_PROXYLAB_INSIDE") != ""
+
+	basicProxy, ntlmProxy, negotiateProxy, allProxy string
+	labHost                                         string
+	azuriteURL                                      string // where the listener reaches Azurite
+	krb5ConfFile                                    string
+)
+
+func init() {
+	if inside {
+		labHost = "azurite"
+		basicProxy, ntlmProxy = "http://proxy-basic:3128", "http://proxy-ntlm:3128"
+		negotiateProxy, allProxy = "http://proxy-negotiate:3128", "http://proxy-all:3128"
+		azuriteURL = "http://" + account + "@azurite:10000/devstoreaccount1"
+		krb5ConfFile = "krb5-inside.conf"
+		return
+	}
+	labHost = "localhost"
+	if h := os.Getenv("AZNET_PROXYLAB_HOST"); h != "" {
+		labHost = h // the lab runs on another machine
+	}
+	basicProxy, ntlmProxy = "http://"+labHost+":3128", "http://"+labHost+":3129"
+	negotiateProxy, allProxy = "http://"+labHost+":3130", "http://"+labHost+":3131"
+	azuriteURL = "http://" + account + "@" + labHost + ":10000/devstoreaccount1"
+	krb5ConfFile = "krb5.conf"
+}
 
 func TestMain(m *testing.M) {
 	if os.Getenv("AZNET_PROXYLAB") == "" {
@@ -80,7 +110,7 @@ func startEcho(t *testing.T) string {
 		t.Fatalf("listener (is Azurite up?): %v", labErr)
 	}
 	// Proxies reach Azurite by its service name, not through the host port.
-	return strings.Replace(labConn, "localhost:10000", "azurite:10000", 1)
+	return strings.Replace(labConn, labHost+":10000", "azurite:10000", 1)
 }
 
 // kinit logs user in with a Heimdal/MIT kinit into a file cache and returns
@@ -88,8 +118,23 @@ func startEcho(t *testing.T) string {
 func kinit(t *testing.T, user string) string {
 	t.Helper()
 	cache := "FILE:" + filepath.Join(t.TempDir(), "krb5cc_lab")
-	cmd := exec.Command("kinit", "--password-file=STDIN", user)
-	cmd.Env = append(os.Environ(), "KRB5CCNAME="+cache, "KRB5_CONFIG="+krb5Conf(t))
+	return kinitTo(t, user, cache)
+}
+
+// kinitTo logs in with the platform's kinit: Heimdal on macOS takes the
+// password from --password-file, MIT reads it from a piped stdin. An empty
+// cache leaves KRB5CCNAME unset, so kinit writes the platform default.
+func kinitTo(t *testing.T, user, cache string) string {
+	t.Helper()
+	args := []string{user}
+	if runtime.GOOS == "darwin" {
+		args = []string{"--password-file=STDIN", user}
+	}
+	cmd := exec.Command("kinit", args...)
+	cmd.Env = append(envWithout("KRB5CCNAME"), "KRB5_CONFIG="+krb5Conf(t))
+	if cache != "" {
+		cmd.Env = append(cmd.Env, "KRB5CCNAME="+cache)
+	}
 	cmd.Stdin = strings.NewReader(password + "\n")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("kinit %s: %v\n%s", user, err, out)
@@ -97,9 +142,19 @@ func kinit(t *testing.T, user string) string {
 	return cache
 }
 
+func envWithout(name string) []string {
+	var out []string
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, name+"=") {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
 func krb5Conf(t *testing.T) string {
 	t.Helper()
-	p, err := filepath.Abs("krb5.conf")
+	p, err := filepath.Abs(krb5ConfFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,6 +169,15 @@ type scenario struct {
 	pass  string
 	spn   string // Kerberos service name; defaults to the proxy's own
 	cache string // "kinit:<user>" logs in first, "none" points KRB5CCNAME at nothing
+	// kerberos marks scenarios that need Kerberos realm access from the
+	// client. On Windows that means a machine that can find the lab KDC
+	// (joined to the domain, or configured with ksetup); they are skipped
+	// there unless AZNET_PROXYLAB_KDC=1.
+	kerberos bool
+	// ambient marks scenarios that use the identity of the running process:
+	// run them with AZNET_PROXYLAB_AMBIENT=1 under
+	// `runas /netonly /user:CORP\alice` on Windows.
+	ambient bool
 	// noKerberos points KRB5_CONFIG at nothing, as on a machine with no
 	// Kerberos setup, so a bare user name has no realm to log in to.
 	noKerberos bool
@@ -147,32 +211,44 @@ func TestProxyLab(t *testing.T) {
 		{name: "ntlm/no-credentials", proxy: ntlmProxy, auth: aznet.ProxyAuto, want: aznet.ErrProxyAuthRequired},
 
 		// Negotiate, with real Kerberos tickets from the lab KDC.
-		{name: "negotiate/ticket-cache", proxy: negotiateProxy, auth: aznet.ProxyNegotiate, cache: "kinit:alice@CORP.TEST",
+		{name: "negotiate/ticket-cache", kerberos: true, proxy: negotiateProxy, auth: aznet.ProxyNegotiate, cache: "kinit:alice@CORP.TEST",
 			spn: "HTTP/proxy-negotiate.corp.test", logHas: []string{"answering with negotiate", "tunnel established"}},
-		{name: "negotiate/password-login", proxy: negotiateProxy, auth: aznet.ProxyNegotiate, user: "alice@CORP.TEST", pass: password,
+		{name: "negotiate/password-login", kerberos: true, proxy: negotiateProxy, auth: aznet.ProxyNegotiate, user: "alice@CORP.TEST", pass: password,
 			spn: "HTTP/proxy-negotiate.corp.test"},
-		{name: "negotiate/auto", proxy: negotiateProxy, auth: aznet.ProxyAuto, cache: "kinit:bob@CORP.TEST",
+		{name: "negotiate/auto", kerberos: true, proxy: negotiateProxy, auth: aznet.ProxyAuto, cache: "kinit:bob@CORP.TEST",
 			spn: "HTTP/proxy-negotiate.corp.test", logHas: []string{"proxy offers negotiate", "answering with negotiate"}},
-		{name: "negotiate/no-ticket-cache", proxy: negotiateProxy, auth: aznet.ProxyNegotiate, cache: "none",
+		{name: "negotiate/no-ticket-cache", kerberos: true, proxy: negotiateProxy, auth: aznet.ProxyNegotiate, cache: "none",
 			spn: "HTTP/proxy-negotiate.corp.test", want: aznet.ErrProxyAuthRequired},
-		{name: "negotiate/wrong-password", proxy: negotiateProxy, auth: aznet.ProxyNegotiate, user: "alice@CORP.TEST", pass: "nope",
+		{name: "negotiate/default-cache-path", kerberos: true, proxy: negotiateProxy, auth: aznet.ProxyNegotiate, cache: "default:alice@CORP.TEST",
+			spn: "HTTP/proxy-negotiate.corp.test", logHas: []string{"answering with negotiate"}},
+		{name: "negotiate/wrong-password", kerberos: true, proxy: negotiateProxy, auth: aznet.ProxyNegotiate, user: "alice@CORP.TEST", pass: "nope",
 			spn: "HTTP/proxy-negotiate.corp.test", want: aznet.ErrProxyAuthFailed},
-		{name: "negotiate/unknown-service-name", proxy: negotiateProxy, auth: aznet.ProxyNegotiate, cache: "kinit:alice@CORP.TEST",
+		{name: "negotiate/unknown-service-name", kerberos: true, proxy: negotiateProxy, auth: aznet.ProxyNegotiate, cache: "kinit:alice@CORP.TEST",
 			spn: "HTTP/nobody.corp.test", want: aznet.ErrProxyAuthFailed},
 
 		// A company proxy offering everything: Negotiate, NTLM, Basic.
-		{name: "all/auto-prefers-negotiate", proxy: allProxy, auth: aznet.ProxyAuto, cache: "kinit:alice@CORP.TEST",
+		{name: "all/auto-prefers-negotiate", kerberos: true, proxy: allProxy, auth: aznet.ProxyAuto, cache: "kinit:alice@CORP.TEST",
 			spn: "HTTP/proxy-all.corp.test", logHas: []string{"proxy offers basic, negotiate, ntlm", "answering with negotiate"}},
-		{name: "all/auto-password-uses-kerberos", proxy: allProxy, auth: aznet.ProxyAuto, user: "alice@CORP.TEST", pass: password,
+		{name: "all/auto-password-uses-kerberos", kerberos: true, proxy: allProxy, auth: aznet.ProxyAuto, user: "alice@CORP.TEST", pass: password,
 			spn: "HTTP/proxy-all.corp.test", logHas: []string{"answering with negotiate"}},
-		{name: "all/auto-ntlm-when-kerberos-unconfigured", proxy: allProxy, auth: aznet.ProxyAuto, user: "alice", pass: password,
+		{name: "all/auto-ntlm-when-kerberos-unconfigured", kerberos: true, proxy: allProxy, auth: aznet.ProxyAuto, user: "alice", pass: password,
 			cache: "none", noKerberos: true, logHas: []string{"answering with ntlm", "tunnel established"}},
-		{name: "all/auto-falls-back-to-ntlm", proxy: allProxy, auth: aznet.ProxyAuto, user: "alice@CORP.TEST", pass: password,
+		{name: "all/auto-falls-back-to-ntlm", kerberos: true, proxy: allProxy, auth: aznet.ProxyAuto, user: "alice@CORP.TEST", pass: password,
 			spn: "HTTP/nobody.corp.test", logHas: []string{"falling back to ntlm", "tunnel established"}},
 		{name: "all/explicit-ntlm", proxy: allProxy, auth: aznet.ProxyNTLM, user: "alice", pass: password,
 			logHas: []string{"answering with ntlm"}},
 		{name: "all/explicit-basic", proxy: allProxy, auth: aznet.ProxyBasic, user: "alice", pass: password,
 			logHas: []string{"sending Basic"}},
+
+		// The identity of the running process (Windows SSPI; skipped elsewhere).
+		{name: "ambient/ntlm-only-proxy", ambient: true, proxy: ntlmProxy, auth: aznet.ProxyNTLM,
+			logHas: []string{"answering with ntlm", "tunnel established"}},
+		{name: "ambient/auto-ntlm-only-proxy", ambient: true, proxy: ntlmProxy, auth: aznet.ProxyAuto,
+			logHas: []string{"proxy offers ntlm", "tunnel established"}},
+		{name: "ambient/negotiate", ambient: true, kerberos: true, proxy: negotiateProxy, auth: aznet.ProxyNegotiate,
+			spn: "HTTP/proxy-negotiate.corp.test", logHas: []string{"answering with negotiate", "tunnel established"}},
+		{name: "ambient/auto-all-proxy", ambient: true, proxy: allProxy, auth: aznet.ProxyAuto,
+			spn: "HTTP/proxy-all.corp.test", logHas: []string{"tunnel established"}},
 
 		// Scheme the proxy does not offer.
 		{name: "basic-proxy/negotiate-requested", proxy: basicProxy, auth: aznet.ProxyNegotiate, cache: "none", want: aznet.ErrProxyAuthUnsupported},
@@ -186,6 +262,16 @@ func TestProxyLab(t *testing.T) {
 }
 
 func run(t *testing.T, connString string, sc scenario) {
+	switch {
+	case sc.ambient && os.Getenv("AZNET_PROXYLAB_AMBIENT") == "":
+		t.Skip("ambient identity: set AZNET_PROXYLAB_AMBIENT=1 (Windows, under runas /netonly)")
+	case !sc.ambient && os.Getenv("AZNET_PROXYLAB_AMBIENT") != "":
+		t.Skip("only ambient-identity scenarios run in AZNET_PROXYLAB_AMBIENT mode")
+	case sc.ambient && runtime.GOOS != "windows":
+		t.Skip("there is no logged-on identity to borrow outside Windows")
+	case sc.kerberos && runtime.GOOS == "windows" && os.Getenv("AZNET_PROXYLAB_KDC") == "":
+		t.Skip("needs a Windows client that can reach the lab KDC: set AZNET_PROXYLAB_KDC=1 (see README)")
+	}
 	t.Setenv("KRB5_CONFIG", krb5Conf(t))
 	if sc.noKerberos {
 		t.Setenv("KRB5_CONFIG", filepath.Join(t.TempDir(), "absent.conf"))
@@ -195,6 +281,13 @@ func run(t *testing.T, connString string, sc scenario) {
 		t.Setenv("KRB5CCNAME", "FILE:"+filepath.Join(t.TempDir(), "absent"))
 	case strings.HasPrefix(sc.cache, "kinit:"):
 		t.Setenv("KRB5CCNAME", kinit(t, strings.TrimPrefix(sc.cache, "kinit:")))
+	case strings.HasPrefix(sc.cache, "default:"):
+		// No KRB5CCNAME: the agent must find the platform's default file cache.
+		if runtime.GOOS != "linux" {
+			t.Skip("the default ticket cache is a readable file only on Linux")
+		}
+		t.Setenv("KRB5CCNAME", "")
+		kinitTo(t, strings.TrimPrefix(sc.cache, "default:"), "")
 	}
 
 	var logBuf bytes.Buffer

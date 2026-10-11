@@ -53,6 +53,22 @@ services:
     environment: { SCHEMES: "negotiate,ntlm,basic", PORT: "3128" }
     ports: ["3131:3128"]
 
+  # A Linux client inside the network. Run it with `make-linux-test.sh`.
+  runner:
+    build: ./runner
+    profiles: [test]
+    depends_on: [proxy-basic, proxy-ntlm, proxy-negotiate, proxy-all, azurite]
+    dns: [10.77.0.2]
+    working_dir: /lab
+    volumes:
+      - .:/lab:ro
+      - ${LAB_TEST_BIN:-/dev/null}:/usr/local/bin/lab.test:ro
+    environment:
+      AZNET_PROXYLAB: "1"
+      AZNET_PROXYLAB_INSIDE: "1"
+    command: ["lab.test", "-test.v", "-test.count=1"]
+    networks: [corp]
+
   azurite:
     image: mcr.microsoft.com/azure-storage/azurite:latest
     command: >
