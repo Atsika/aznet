@@ -36,6 +36,10 @@ import (
 const (
 	password = "Passw0rd!2024"
 
+	// The Active Directory lab (ecorp.local on VMware); see README.
+	adPassword = "Root1234*"
+	adSPN      = "HTTP/proxy.ecorp.local"
+
 	account = "devstoreaccount1:Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq%2FK1SZFPTOtr%2FKBHBeksoGMGw%3D%3D"
 )
 
@@ -118,24 +122,28 @@ func startEcho(t *testing.T) string {
 func kinit(t *testing.T, user string) string {
 	t.Helper()
 	cache := "FILE:" + filepath.Join(t.TempDir(), "krb5cc_lab")
-	return kinitTo(t, user, cache)
+	return kinitTo(t, user, cache, password)
 }
 
 // kinitTo logs in with the platform's kinit: Heimdal on macOS takes the
 // password from --password-file, MIT reads it from a piped stdin. An empty
 // cache leaves KRB5CCNAME unset, so kinit writes the platform default.
-func kinitTo(t *testing.T, user, cache string) string {
+func kinitTo(t *testing.T, user, cache, pass string) string {
 	t.Helper()
 	args := []string{user}
 	if runtime.GOOS == "darwin" {
 		args = []string{"--password-file=STDIN", user}
 	}
 	cmd := exec.Command("kinit", args...)
-	cmd.Env = append(envWithout("KRB5CCNAME"), "KRB5_CONFIG="+krb5Conf(t))
+	conf := os.Getenv("KRB5_CONFIG")
+	if conf == "" {
+		conf = krb5Conf(t)
+	}
+	cmd.Env = append(envWithout("KRB5CCNAME"), "KRB5_CONFIG="+conf)
 	if cache != "" {
 		cmd.Env = append(cmd.Env, "KRB5CCNAME="+cache)
 	}
-	cmd.Stdin = strings.NewReader(password + "\n")
+	cmd.Stdin = strings.NewReader(pass + "\n")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("kinit %s: %v\n%s", user, err, out)
 	}
@@ -183,6 +191,8 @@ type scenario struct {
 	// http://proxy.ecorp.local:3140, and the client must be a domain-joined
 	// Windows machine.
 	ad bool
+	// windowsOnly marks scenarios that need Windows (the logged-on identity).
+	windowsOnly bool
 	// noKerberos points KRB5_CONFIG at nothing, as on a machine with no
 	// Kerberos setup, so a bare user name has no realm to log in to.
 	noKerberos bool
@@ -261,14 +271,23 @@ func TestProxyLab(t *testing.T) {
 
 		// A real Active Directory: Negotiate against a keytab issued by the domain
 		// controller, from a domain-joined Windows client (SSPI, real Kerberos).
-		{name: "ad/negotiate-ambient", ad: true, auth: aznet.ProxyNegotiate,
+		{name: "ad/negotiate-ambient", ad: true, windowsOnly: true, auth: aznet.ProxyNegotiate, spn: adSPN,
 			logHas: []string{"answering with negotiate", "tunnel established"}},
-		{name: "ad/auto-ambient", ad: true, auth: aznet.ProxyAuto,
+		{name: "ad/auto-ambient", ad: true, windowsOnly: true, auth: aznet.ProxyAuto, spn: adSPN,
 			logHas: []string{"proxy offers negotiate", "answering with negotiate", "tunnel established"}},
-		{name: "ad/explicit-password", ad: true, auth: aznet.ProxyNegotiate, user: `ECORP\user`, pass: "Root1234*",
+		{name: "ad/explicit-password", ad: true, auth: aznet.ProxyNegotiate, user: `ECORP\user`, pass: adPassword, spn: adSPN,
 			logHas: []string{"answering with negotiate", "tunnel established"}},
-		{name: "ad/wrong-password", ad: true, auth: aznet.ProxyNegotiate, user: `ECORP\user`, pass: "nope", want: aznet.ErrProxyAuthFailed},
-		{name: "ad/unknown-service-name", ad: true, auth: aznet.ProxyNegotiate, spn: "HTTP/nobody.ecorp.local", want: aznet.ErrProxyAuthFailed},
+		{name: "ad/password-upn", ad: true, auth: aznet.ProxyNegotiate, user: "user@ECORP.LOCAL", pass: adPassword, spn: adSPN,
+			logHas: []string{"answering with negotiate", "tunnel established"}},
+		{name: "ad/auto-password", ad: true, auth: aznet.ProxyAuto, user: "user@ECORP.LOCAL", pass: adPassword, spn: adSPN,
+			logHas: []string{"proxy offers negotiate", "answering with negotiate", "tunnel established"}},
+		{name: "ad/kinit-cache", ad: true, auth: aznet.ProxyNegotiate, cache: "kinitad:user@ECORP.LOCAL", spn: adSPN,
+			logHas: []string{"answering with negotiate", "tunnel established"}},
+		{name: "ad/auto-kinit-cache", ad: true, auth: aznet.ProxyAuto, cache: "kinitad:lowpriv@ECORP.LOCAL", spn: adSPN,
+			logHas: []string{"proxy offers negotiate", "answering with negotiate", "tunnel established"}},
+		{name: "ad/no-ticket-cache", ad: true, auth: aznet.ProxyNegotiate, cache: "none", spn: adSPN, want: aznet.ErrProxyAuthRequired},
+		{name: "ad/wrong-password", ad: true, auth: aznet.ProxyNegotiate, user: `ECORP\user`, pass: "nope", spn: adSPN, want: aznet.ErrProxyAuthFailed},
+		{name: "ad/unknown-service-name", ad: true, auth: aznet.ProxyNegotiate, user: "user@ECORP.LOCAL", pass: adPassword, spn: "HTTP/nobody.ecorp.local", want: aznet.ErrProxyAuthFailed},
 
 		// Scheme the proxy does not offer.
 		{name: "basic-proxy/negotiate-requested", proxy: basicProxy, auth: aznet.ProxyNegotiate, cache: "none", want: aznet.ErrProxyAuthUnsupported},
@@ -289,6 +308,10 @@ func run(t *testing.T, connString string, sc scenario) {
 		sc.proxy = os.Getenv("AZNET_PROXYLAB_AD")
 	}
 	switch {
+	case sc.windowsOnly && runtime.GOOS != "windows":
+		t.Skip("uses the logged-on Windows identity")
+	case sc.ad && runtime.GOOS != "windows" && os.Getenv("AZNET_PROXYLAB_AD_KDC") == "":
+		t.Skip("needs the domain controller's KDC: set AZNET_PROXYLAB_AD_KDC=<address>:88")
 	case sc.ambient && os.Getenv("AZNET_PROXYLAB_AMBIENT") == "":
 		t.Skip("ambient identity: set AZNET_PROXYLAB_AMBIENT=1 (Windows, under runas /netonly)")
 	case !sc.ambient && os.Getenv("AZNET_PROXYLAB_AMBIENT") != "":
@@ -301,6 +324,15 @@ func run(t *testing.T, connString string, sc scenario) {
 		t.Skip("needs a Windows client that can reach the lab KDC: set AZNET_PROXYLAB_KDC=1 (see README)")
 	}
 	t.Setenv("KRB5_CONFIG", krb5Conf(t))
+	if sc.ad && runtime.GOOS != "windows" {
+		// Realm ECORP.LOCAL, found through the KDC address given by the user.
+		conf := filepath.Join(t.TempDir(), "krb5-ad.conf")
+		text := "[libdefaults]\n default_realm = ECORP.LOCAL\n dns_lookup_kdc = false\n dns_lookup_realm = false\n rdns = false\n udp_preference_limit = 1\n[realms]\n ECORP.LOCAL = {\n  kdc = " + os.Getenv("AZNET_PROXYLAB_AD_KDC") + "\n }\n"
+		if err := os.WriteFile(conf, []byte(text), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("KRB5_CONFIG", conf)
+	}
 	if sc.noKerberos {
 		t.Setenv("KRB5_CONFIG", filepath.Join(t.TempDir(), "absent.conf"))
 	}
@@ -309,13 +341,15 @@ func run(t *testing.T, connString string, sc scenario) {
 		t.Setenv("KRB5CCNAME", "FILE:"+filepath.Join(t.TempDir(), "absent"))
 	case strings.HasPrefix(sc.cache, "kinit:"):
 		t.Setenv("KRB5CCNAME", kinit(t, strings.TrimPrefix(sc.cache, "kinit:")))
+	case strings.HasPrefix(sc.cache, "kinitad:"):
+		t.Setenv("KRB5CCNAME", kinitTo(t, strings.TrimPrefix(sc.cache, "kinitad:"), "FILE:"+filepath.Join(t.TempDir(), "krb5cc_ad"), adPassword))
 	case strings.HasPrefix(sc.cache, "default:"):
 		// No KRB5CCNAME: the agent must find the platform's default file cache.
 		if runtime.GOOS != "linux" {
 			t.Skip("the default ticket cache is a readable file only on Linux")
 		}
 		t.Setenv("KRB5CCNAME", "")
-		kinitTo(t, strings.TrimPrefix(sc.cache, "default:"), "")
+		kinitTo(t, strings.TrimPrefix(sc.cache, "default:"), "", password)
 	}
 
 	var logBuf bytes.Buffer
@@ -367,6 +401,11 @@ func run(t *testing.T, connString string, sc scenario) {
 		if err == nil {
 			c.Close()
 			t.Fatalf("dial succeeded, want %v", sc.want)
+		}
+		// A network failure also reads as an authentication failure; only a
+		// real answer from the server counts as a rejection.
+		if strings.Contains(err.Error(), "Networking_Error") || strings.Contains(err.Error(), "i/o timeout") {
+			t.Fatalf("failed with a network error, not a rejection by the server: %v", err)
 		}
 		if !errors.Is(err, sc.want) && !strings.Contains(err.Error(), sc.want.Error()) {
 			t.Fatalf("dial: %v, want %v", err, sc.want)

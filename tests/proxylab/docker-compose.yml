@@ -78,6 +78,8 @@ services:
     environment:
       AZNET_PROXYLAB: "1"
       AZNET_PROXYLAB_INSIDE: "1"
+      AZNET_PROXYLAB_AD: ${AZNET_PROXYLAB_AD:-}
+      AZNET_PROXYLAB_AD_KDC: ${AZNET_PROXYLAB_AD_KDC:-}
     command: ["lab.test", "-test.v", "-test.count=1"]
     networks: [corp]
 

@@ -113,6 +113,20 @@ through a keytab only: it is not joined to the domain and never contacts the DC.
    `docker compose --profile ad up -d --build proxy-ad` (port 3140).
 3. On the Windows client, point the client at the lab with `AZNET_PROXYLAB_HOST` and run
    the `ad/` scenarios with `AZNET_PROXYLAB_AD=http://proxy.ecorp.local:3140`.
+4. On macOS or Linux, the client needs a network path to the domain controller's KDC (a
+   bridged VM, or `devbox/kdc-forward.ps1` for a NAT VM). Then:
+
+   ```bash
+   AZNET_PROXYLAB=1 AZNET_PROXYLAB_AD=http://localhost:3140 \
+     AZNET_PROXYLAB_AD_KDC=<dc address>:88 go test -v -run TestProxyLab/ad ./tests/proxylab/
+   ```
+
+   The tests run `kinit` against the domain, so that ticket cache comes from Active
+   Directory, and also log in with a password through `gokrb5`. `adprobe` checks a KDC on
+   its own: `go run ./tests/proxylab/adprobe <dc>:88 ECORP.LOCAL user password`.
+   A container on this lab's Docker network may not reach other LAN machines (macOS Local
+   Network privacy for the container runtime), so `run-linux.sh` cannot test against a DC
+   on the LAN there; run the tests on a Linux host instead.
 
 Pitfalls found on the way: a client whose DNS lists a public resolver (such as `1.1.1.1`)
 after the DC can intermittently fail to find the domain controller or the proxy's name,
@@ -125,8 +139,10 @@ Run so far: steps 1, 2 and 3 above on a standalone Windows machine against this 
 (static Internet Options proxy and a PAC file included), and the Active Directory
 scenarios on a domain-joined Windows 10 client against a Windows Server 2022 DC: ambient
 Kerberos, explicit credentials, wrong password and an unknown service name, plus the
-agent's system-proxy detection with a static proxy and a PAC file. Not run: Linux or
-macOS against Active Directory, and commercial proxy products.
+agent's system-proxy detection with a static proxy and a PAC file. On macOS: login by
+password and by a Heimdal `kinit` cache issued by Active Directory, for two accounts, with
+`gokrb5`. Not run: Linux (MIT `kinit`) against Active Directory, and commercial proxy
+products.
 
 ProxyBlob has a matching test for its environment-variable detection:
 `AZNET_PROXYLAB=1 go test -run TestProxyLab ./internal/bootstrap/`.
