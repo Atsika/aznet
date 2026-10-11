@@ -273,6 +273,8 @@ func run(t *testing.T, connString string, sc scenario) {
 		t.Skip("only ambient-identity scenarios run in AZNET_PROXYLAB_AMBIENT mode")
 	case sc.ambient && runtime.GOOS != "windows":
 		t.Skip("there is no logged-on identity to borrow outside Windows")
+	case runtime.GOOS == "windows" && (sc.cache != "" || sc.noKerberos):
+		t.Skip("exercises a Unix ticket cache or krb5.conf; Windows uses SSPI")
 	case sc.kerberos && runtime.GOOS == "windows" && os.Getenv("AZNET_PROXYLAB_KDC") == "":
 		t.Skip("needs a Windows client that can reach the lab KDC: set AZNET_PROXYLAB_KDC=1 (see README)")
 	}

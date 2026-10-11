@@ -77,7 +77,13 @@ $env:AZNET_PROXYLAB_SYSTEM = "1"
 ```
 
 Kerberos on Windows needs the client to find the `CORP.TEST` KDC (`ksetup /addkdc
-CORP.TEST <lab address>` as administrator, then `AZNET_PROXYLAB_KDC=1`). The ambient
+CORP.TEST <lab address>` as administrator, then `AZNET_PROXYLAB_KDC=1`). This was
+tried from a workgroup machine against the Samba KDC and did not work: Windows gets
+a ticket-granting ticket, then the service-ticket request over UDP is answered with
+"response too big" and Windows does not retry over TCP (`kerbprobe` shows it: it asks
+the Kerberos package for a ticket directly, with no proxy involved). Use a domain-joined
+client for Kerberos on Windows. Clean up `ksetup` changes with `ksetup /delkdc` and by
+deleting `HKLM\SYSTEM\CurrentControlSet\Control\Lsa\Kerberos\Domains\CORP.TEST`. The ambient
 `runas /netonly` runs use NTLM unless Kerberos is also set up. Proxies are reached by
 address, so Kerberos scenarios set the service name explicitly.
 
