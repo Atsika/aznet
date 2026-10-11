@@ -178,6 +178,11 @@ type scenario struct {
 	// run them with AZNET_PROXYLAB_AMBIENT=1 under
 	// `runas /netonly /user:CORP\alice` on Windows.
 	ambient bool
+	// ad marks scenarios against a real Active Directory (the ecorp.local lab on
+	// VMware, see README): AZNET_PROXYLAB_AD is the proxy's URL, such as
+	// http://proxy.ecorp.local:3140, and the client must be a domain-joined
+	// Windows machine.
+	ad bool
 	// noKerberos points KRB5_CONFIG at nothing, as on a machine with no
 	// Kerberos setup, so a bare user name has no realm to log in to.
 	noKerberos bool
@@ -254,6 +259,17 @@ func TestProxyLab(t *testing.T) {
 		{name: "ambient/auto-all-proxy", ambient: true, proxy: allProxy, auth: aznet.ProxyAuto,
 			spn: "HTTP/proxy-all.corp.test", logHas: []string{"tunnel established"}},
 
+		// A real Active Directory: Negotiate against a keytab issued by the domain
+		// controller, from a domain-joined Windows client (SSPI, real Kerberos).
+		{name: "ad/negotiate-ambient", ad: true, auth: aznet.ProxyNegotiate,
+			logHas: []string{"answering with negotiate", "tunnel established"}},
+		{name: "ad/auto-ambient", ad: true, auth: aznet.ProxyAuto,
+			logHas: []string{"proxy offers negotiate", "answering with negotiate", "tunnel established"}},
+		{name: "ad/explicit-password", ad: true, auth: aznet.ProxyNegotiate, user: `ECORP\user`, pass: "Root1234*",
+			logHas: []string{"answering with negotiate", "tunnel established"}},
+		{name: "ad/wrong-password", ad: true, auth: aznet.ProxyNegotiate, user: `ECORP\user`, pass: "nope", want: aznet.ErrProxyAuthFailed},
+		{name: "ad/unknown-service-name", ad: true, auth: aznet.ProxyNegotiate, spn: "HTTP/nobody.ecorp.local", want: aznet.ErrProxyAuthFailed},
+
 		// Scheme the proxy does not offer.
 		{name: "basic-proxy/negotiate-requested", proxy: basicProxy, auth: aznet.ProxyNegotiate, cache: "none", want: aznet.ErrProxyAuthUnsupported},
 		{name: "ntlm-proxy/basic-requested", proxy: ntlmProxy, auth: aznet.ProxyBasic, user: "alice", pass: password, want: aznet.ErrProxyAuthFailed},
@@ -266,6 +282,12 @@ func TestProxyLab(t *testing.T) {
 }
 
 func run(t *testing.T, connString string, sc scenario) {
+	if sc.ad {
+		if os.Getenv("AZNET_PROXYLAB_AD") == "" {
+			t.Skip("needs the Active Directory lab: set AZNET_PROXYLAB_AD=http://proxy.ecorp.local:3140 on a domain-joined Windows client")
+		}
+		sc.proxy = os.Getenv("AZNET_PROXYLAB_AD")
+	}
 	switch {
 	case sc.ambient && os.Getenv("AZNET_PROXYLAB_AMBIENT") == "":
 		t.Skip("ambient identity: set AZNET_PROXYLAB_AMBIENT=1 (Windows, under runas /netonly)")

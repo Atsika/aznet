@@ -92,9 +92,41 @@ ticket. Squid's Kerberos helper rejects that, whereas many commercial proxies ac
 it, so a failure of `ambient/negotiate` without Kerberos configured says more about
 Squid than about aznet. Use the `all` proxy (3131), which also offers NTLM.
 
+## Active Directory (Kerberos from a domain-joined Windows client)
+
+The Samba lab cannot give a Windows client real Kerberos (see above), so there is a
+second setup against a real Microsoft domain controller. It needs a domain
+(`ecorp.local` here), a domain-joined Windows client, and a Squid that accepts tickets
+through a keytab only: it is not joined to the domain and never contacts the DC.
+
+1. On the DC, create a service account with the proxy's SPN, a DNS record for the
+   proxy name pointing at the machine that runs Squid, and export a keytab:
+
+   ```powershell
+   New-ADUser -Name svc-proxy -SamAccountName svc-proxy -AccountPassword (ConvertTo-SecureString 'Root1234*' -AsPlainText -Force) -Enabled $true -PasswordNeverExpires $true
+   Set-ADUser svc-proxy -KerberosEncryptionType AES128,AES256
+   setspn -S HTTP/proxy.ecorp.local svc-proxy
+   Add-DnsServerResourceRecordA -ZoneName ecorp.local -Name proxy -IPv4Address <squid host>
+   ktpass -princ HTTP/proxy.ecorp.local@ECORP.LOCAL -mapuser ECORP\svc-proxy -pass 'Root1234*' -ptype KRB5_NT_PRINCIPAL -crypto AES256-SHA1 -out proxy.keytab
+   ```
+2. Put the keytab at `tests/proxylab/ad/proxy.keytab` (git-ignored) and start Squid:
+   `docker compose --profile ad up -d --build proxy-ad` (port 3140).
+3. On the Windows client, point the client at the lab with `AZNET_PROXYLAB_HOST` and run
+   the `ad/` scenarios with `AZNET_PROXYLAB_AD=http://proxy.ecorp.local:3140`.
+
+Pitfalls found on the way: a client whose DNS lists a public resolver (such as `1.1.1.1`)
+after the DC can intermittently fail to find the domain controller or the proxy's name,
+because the public resolver answers NXDOMAIN; Windows then falls back from Kerberos to
+NTLM, which Squid's Kerberos helper rejects (`received type 1 NTLM token`). A domain
+client should use the domain controller's DNS only. Also, `vmrun` guest commands
+start on a headless VM only from a process outside the SSH session that launched it.
+
 Run so far: steps 1, 2 and 3 above on a standalone Windows machine against this lab
-(static Internet Options proxy and a PAC file included). Not run: Kerberos on Windows
-(SSPI with a KDC) and a domain-joined client.
+(static Internet Options proxy and a PAC file included), and the Active Directory
+scenarios on a domain-joined Windows 10 client against a Windows Server 2022 DC: ambient
+Kerberos, explicit credentials, wrong password and an unknown service name, plus the
+agent's system-proxy detection with a static proxy and a PAC file. Not run: Linux or
+macOS against Active Directory, and commercial proxy products.
 
 ProxyBlob has a matching test for its environment-variable detection:
 `AZNET_PROXYLAB=1 go test -run TestProxyLab ./internal/bootstrap/`.

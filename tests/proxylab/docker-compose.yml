@@ -53,6 +53,18 @@ services:
     environment: { SCHEMES: "negotiate,ntlm,basic", PORT: "3128" }
     ports: ["3131:3128"]
 
+  # Kerberos for a real Active Directory (the ecorp.local lab on VMware): a Squid
+  # with a keytab exported by ktpass, no domain join. See README, "Active Directory".
+  proxy-ad:
+    build: ./squid
+    profiles: [ad]
+    entrypoint: ["/ad-entrypoint.sh"]
+    volumes:
+      - ./squid/entrypoint-ad.sh:/ad-entrypoint.sh:ro
+      - ./ad/proxy.keytab:/ad/proxy.keytab:ro
+    ports: ["3140:3128"]
+    networks: [corp]
+
   # A Linux client inside the network. Run it with `make-linux-test.sh`.
   runner:
     build: ./runner
