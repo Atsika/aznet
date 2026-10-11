@@ -298,6 +298,9 @@ func authSchemeName(a ProxyAuth) string {
 	}
 }
 
+// newNegotiateAuthFunc is replaced by tests to script a Negotiate exchange.
+var newNegotiateAuthFunc = newNegotiateAuth
+
 // selectProxyAuth chooses the scheme to answer the first challenge with.
 func selectProxyAuth(pc *ProxyConfig, user, pass string, offered map[string]string) (proxyAuthenticator, error) {
 	order := []ProxyAuth{pc.Auth}
@@ -312,7 +315,7 @@ func selectProxyAuth(pc *ProxyConfig, user, pass string, offered map[string]stri
 		}
 		switch a {
 		case ProxyNegotiate:
-			auth, err := newNegotiateAuth(pc, user, pass)
+			auth, err := newNegotiateAuthFunc(pc, user, pass)
 			if err != nil {
 				lastErr = err
 				continue
@@ -564,22 +567,18 @@ func connectRounds(conn net.Conn, pc *ProxyConfig, user, pass, addr string, st *
 		}
 		if st.authz, err = st.auth.respond(challenges[st.auth.scheme()]); err != nil {
 			st.log("%s: %s authentication failed: %v", addr, st.auth.scheme(), err)
-			// When ProxyAuto chose Negotiate and it failed, fall back to
-			// NTLM on the same connection if the proxy offers it.
+			// When ProxyAuto chose Negotiate and it failed, start over with
+			// NTLM if the proxy offers it. This is a new connection: a proxy
+			// that has refused a Negotiate token on this one keeps that
+			// state and answers an NTLM message with a fresh challenge list.
 			if pc.Auth == ProxyAuto && st.auth.scheme() == "negotiate" {
-				if r, ok := st.auth.(interface{ release() }); ok {
-					r.release()
-				}
-				st.auth = nil
-				st.authz = ""
+				st.release()
+				st.auth, st.authz = nil, ""
 				fallback, ferr := selectProxyAuth(&ProxyConfig{URL: pc.URL, Auth: ProxyNTLM, User: pc.User, Pass: pc.Pass, SPN: pc.SPN}, user, pass, challenges)
 				if ferr == nil {
 					st.auth = fallback
-					st.log("%s: falling back to %s", addr, st.auth.scheme())
-					st.authz, err = st.auth.respond("")
-					if err == nil {
-						continue
-					}
+					st.log("%s: falling back to %s on a new connection", addr, st.auth.scheme())
+					return nil, errProxyReconnect
 				}
 			}
 			return nil, err

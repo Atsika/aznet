@@ -183,6 +183,9 @@ type scenario struct {
 	noKerberos bool
 	// want is the sentinel the dial must fail with, or nil for success.
 	want error
+	// wantWindows replaces want on Windows, where a missing password means
+	// "authenticate as the logged-on user" rather than "no credentials".
+	wantWindows error
 	// logHas lists strings the proxy log must contain.
 	logHas []string
 }
@@ -208,7 +211,8 @@ func TestProxyLab(t *testing.T) {
 			logHas: []string{"proxy offers ntlm", "answering with ntlm"}},
 		{name: "ntlm/wrong-password", proxy: ntlmProxy, auth: aznet.ProxyNTLM, user: "alice", pass: "nope", want: aznet.ErrProxyAuthFailed},
 		{name: "ntlm/disabled-account", proxy: ntlmProxy, auth: aznet.ProxyNTLM, user: "carol", pass: password, want: aznet.ErrProxyAuthFailed},
-		{name: "ntlm/no-credentials", proxy: ntlmProxy, auth: aznet.ProxyAuto, want: aznet.ErrProxyAuthRequired},
+		{name: "ntlm/no-credentials", proxy: ntlmProxy, auth: aznet.ProxyAuto, want: aznet.ErrProxyAuthRequired,
+			wantWindows: aznet.ErrProxyAuthFailed}, // the logged-on user is not in the lab domain
 
 		// Negotiate, with real Kerberos tickets from the lab KDC.
 		{name: "negotiate/ticket-cache", kerberos: true, proxy: negotiateProxy, auth: aznet.ProxyNegotiate, cache: "kinit:alice@CORP.TEST",
@@ -327,6 +331,9 @@ func run(t *testing.T, connString string, sc scenario) {
 		}
 	}
 
+	if runtime.GOOS == "windows" && sc.wantWindows != nil {
+		sc.want = sc.wantWindows
+	}
 	if sc.want != nil {
 		// A rejected login is permanent: the SDK must not repeat it, since
 		// against a directory every attempt counts toward locking the account.

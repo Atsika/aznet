@@ -62,6 +62,8 @@ $env:AZNET_PROXYLAB = "1"; $env:AZNET_PROXYLAB_HOST = "192.168.1.17"
 
 # 2. The identity of the running process, without a domain: runas /netonly gives
 #    a process network credentials, which SSPI's "current user" then presents.
+#    From a non-interactive session (SSH), netonly.exe does the same with the
+#    password in NETONLY_PASS (build it: GOOS=windows go build ./tests/proxylab/netonly):
 runas /netonly /user:CORP\alice "powershell -NoExit"      # password Passw0rd!2024
 #    in the new window:
 $env:AZNET_PROXYLAB = "1"; $env:AZNET_PROXYLAB_HOST = "192.168.1.17"; $env:AZNET_PROXYLAB_AMBIENT = "1"
@@ -84,7 +86,9 @@ ticket. Squid's Kerberos helper rejects that, whereas many commercial proxies ac
 it, so a failure of `ambient/negotiate` without Kerberos configured says more about
 Squid than about aznet. Use the `all` proxy (3131), which also offers NTLM.
 
-Not run on any platform yet: everything in the Windows section.
+Run so far: steps 1, 2 and 3 above on a standalone Windows machine against this lab
+(static Internet Options proxy and a PAC file included). Not run: Kerberos on Windows
+(SSPI with a KDC) and a domain-joined client.
 
 ProxyBlob has a matching test for its environment-variable detection:
 `AZNET_PROXYLAB=1 go test -run TestProxyLab ./internal/bootstrap/`.

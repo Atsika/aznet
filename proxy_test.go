@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -568,5 +569,73 @@ func TestProxyAuthFailuresAreNotRetried(t *testing.T) {
 				t.Fatalf("non-retriable %t, want %t (%v)", got, tc.permanent, err)
 			}
 		})
+	}
+}
+
+// scriptedNegotiate sends one token and then reports the proxy's bare 407 as a
+// rejection, as SSPI does.
+type scriptedNegotiate struct{ sent bool }
+
+func (*scriptedNegotiate) scheme() string        { return "negotiate" }
+func (*scriptedNegotiate) connectionBound() bool { return true }
+func (a *scriptedNegotiate) respond(string) (string, error) {
+	if a.sent {
+		return "", ErrProxyAuthFailed
+	}
+	a.sent = true
+	return "Negotiate dG9rZW4=", nil
+}
+
+// A proxy that has rejected a Negotiate token keeps that state for the
+// connection and answers an NTLM message there with a fresh challenge list, so
+// the fallback to NTLM must happen on a new connection (seen with Squid).
+func TestProxyAutoFallsBackToNTLMOnANewConnectionAfterNegotiateIsRejected(t *testing.T) {
+	old := newNegotiateAuthFunc
+	newNegotiateAuthFunc = func(*ProxyConfig, string, string) (proxyAuthenticator, error) { return &scriptedNegotiate{}, nil }
+	t.Cleanup(func() { newNegotiateAuthFunc = old })
+
+	var conns atomic.Int32
+	var ntlmOnFirst atomic.Bool
+	addr := startProxy(t, func(conn net.Conn, br *bufio.Reader) {
+		n := conns.Add(1)
+		offer := []string{"Proxy-Authenticate: Negotiate", "Proxy-Authenticate: NTLM"}
+		readConnect(t, br)
+		respond(conn, "407 Proxy Authentication Required", offer...)
+		if n == 1 {
+			req := readConnect(t, br) // the Negotiate token
+			if req == nil || !strings.HasPrefix(req.Header.Get("Proxy-Authorization"), "Negotiate ") {
+				t.Errorf("first connection: %v", req)
+				return
+			}
+			respond(conn, "407 Proxy Authentication Required", offer...)
+			// Anything further on this connection gets the generic list.
+			if req := readConnect(t, br); req != nil {
+				ntlmOnFirst.Store(strings.HasPrefix(req.Header.Get("Proxy-Authorization"), "NTLM "))
+				respond(conn, "407 Proxy Authentication Required", offer...)
+			}
+			return
+		}
+		if req := readConnect(t, br); req == nil || !strings.HasPrefix(req.Header.Get("Proxy-Authorization"), "NTLM ") {
+			t.Errorf("second connection: %v", req)
+			return
+		}
+		respond(conn, "407 Proxy Authentication Required", "Proxy-Authenticate: NTLM "+base64.StdEncoding.EncodeToString(ntlmChallenge()))
+		if req := readConnect(t, br); req == nil || !strings.HasPrefix(req.Header.Get("Proxy-Authorization"), "NTLM ") {
+			t.Errorf("second connection, authenticate message: %v", req)
+			return
+		}
+		tunnelEcho(conn, br)
+	})
+	conn, err := connectThrough(t, &ProxyConfig{URL: mustProxyURL(t, addr), User: "alice", Pass: "pw"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	assertEcho(t, conn)
+	if ntlmOnFirst.Load() {
+		t.Error("NTLM was attempted on the connection that rejected Negotiate")
+	}
+	if got := conns.Load(); got != 2 {
+		t.Errorf("%d connections, want 2", got)
 	}
 }
