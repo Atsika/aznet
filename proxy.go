@@ -168,7 +168,7 @@ func normalizeProxyURL(in *url.URL) (*url.URL, error) {
 // configured. It mirrors the SDK's default transport so behaviour only differs
 // in how the TCP connection is established.
 func newProxyClient(fn ProxyFunc, logf func(string, ...any)) *http.Client {
-	d := &proxyDialer{resolve: fn, logf: logf, dialer: net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}}
+	d := NewProxyDialer(fn, logf)
 	tr := &http.Transport{
 		DialContext:           d.DialContext,
 		ForceAttemptHTTP2:     true,
@@ -186,13 +186,27 @@ func newProxyClient(fn ProxyFunc, logf func(string, ...any)) *http.Client {
 	return &http.Client{Transport: tr}
 }
 
-type proxyDialer struct {
+// ProxyDialer opens TCP connections the way storage requests are opened under
+// WithProxyFunc: the ProxyFunc picks a proxy for each destination, a nil
+// config connects directly, and anything else is reached through HTTP CONNECT
+// with the same authentication. Use it for traffic of your own that must
+// leave through the same egress proxy. It is safe for concurrent use.
+type ProxyDialer struct {
 	resolve ProxyFunc
 	logf    func(string, ...any)
 	dialer  net.Dialer
 }
 
-func (d *proxyDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+// NewProxyDialer returns a ProxyDialer that asks fn for the proxy of every
+// connection. logf, which may be nil, traces it as WithProxyLog does.
+func NewProxyDialer(fn ProxyFunc, logf func(string, ...any)) *ProxyDialer {
+	return &ProxyDialer{resolve: fn, logf: logf, dialer: net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}}
+}
+
+// DialContext connects to addr, a host:port, over TCP. The returned
+// connection supports CloseWrite whenever the underlying one does, so a
+// tunnel through the proxy can be half-closed like a direct connection.
+func (d *ProxyDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	pc, err := d.resolve(ctx, targetURL(addr))
 	if err != nil {
 		return nil, err
@@ -610,3 +624,11 @@ type bufferedConn struct {
 }
 
 func (c *bufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+
+// CloseWrite half-closes the tunnel, as the connection beneath it would.
+func (c *bufferedConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return errors.ErrUnsupported
+}

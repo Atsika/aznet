@@ -225,3 +225,13 @@ func WithProxyFunc(fn ProxyFunc) Option
 Chooses the proxy for each new connection. `target` has scheme `https` for port 443 and `http` otherwise. Return a nil `*ProxyConfig` to connect directly. Use it when the proxy depends on the destination or can change between reconnects, for example when it comes from a PAC file.
 
 Errors: `ErrInvalidProxy`, `ErrProxyConnect`, `ErrProxyAuthRequired`, `ErrProxyAuthUnsupported`, `ErrProxyAuthFailed`.
+
+### NewProxyDialer
+
+```go
+func NewProxyDialer(fn ProxyFunc, logf func(format string, args ...any)) *ProxyDialer
+
+func (d *ProxyDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error)
+```
+
+Opens your own TCP connections the way `WithProxyFunc` opens storage connections: `fn` picks the proxy for `addr`, a nil config connects directly, and anything else is tunnelled with `CONNECT` using the same authentication. `logf` may be nil; it traces like `WithProxyLog`. A tunnel supports `CloseWrite` when the connection beneath it does, so it can be half-closed like a direct connection. Errors are those of `WithProxyFunc`.

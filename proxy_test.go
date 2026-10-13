@@ -341,7 +341,7 @@ func TestProxyFuncDirectAndTarget(t *testing.T) {
 	}
 	defer direct.Close()
 	var seen []*url.URL
-	d := &proxyDialer{resolve: func(_ context.Context, target *url.URL) (*ProxyConfig, error) {
+	d := &ProxyDialer{resolve: func(_ context.Context, target *url.URL) (*ProxyConfig, error) {
 		seen = append(seen, target)
 		return nil, nil // direct
 	}}
@@ -459,7 +459,7 @@ func TestProxyFuncResultIsValidated(t *testing.T) {
 	})
 	host := strings.TrimPrefix(srv, "http://")
 	for _, bad := range []*url.URL{{Scheme: "socks5", Host: host}, {Scheme: "http"}, {Scheme: "ftp", Host: host}} {
-		d := &proxyDialer{resolve: func(context.Context, *url.URL) (*ProxyConfig, error) {
+		d := &ProxyDialer{resolve: func(context.Context, *url.URL) (*ProxyConfig, error) {
 			return &ProxyConfig{URL: bad}, nil
 		}}
 		if _, err := d.DialContext(context.Background(), "tcp", "storage.example:443"); !errors.Is(err, ErrInvalidProxy) {
@@ -467,7 +467,7 @@ func TestProxyFuncResultIsValidated(t *testing.T) {
 		}
 	}
 	// A resolver that returns a bare host, as Windows system settings do, means http.
-	d := &proxyDialer{resolve: func(context.Context, *url.URL) (*ProxyConfig, error) {
+	d := &ProxyDialer{resolve: func(context.Context, *url.URL) (*ProxyConfig, error) {
 		return &ProxyConfig{URL: &url.URL{Host: host}}, nil
 	}}
 	if _, err := d.DialContext(context.Background(), "tcp", "storage.example:443"); !errors.Is(err, ErrProxyConnect) || lastDial != "storage.example:443" {
@@ -556,7 +556,7 @@ func TestProxyAuthFailuresAreNotRetried(t *testing.T) {
 		{"unreachable", &ProxyConfig{URL: mustProxyURL(t, "127.0.0.1:1")}, ErrProxyConnect, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			d := &proxyDialer{
+			d := &ProxyDialer{
 				resolve: func(context.Context, *url.URL) (*ProxyConfig, error) { return tc.pc, nil },
 				dialer:  net.Dialer{Timeout: 2 * time.Second},
 			}
@@ -637,5 +637,43 @@ func TestProxyAutoFallsBackToNTLMOnANewConnectionAfterNegotiateIsRejected(t *tes
 	}
 	if got := conns.Load(); got != 2 {
 		t.Errorf("%d connections, want 2", got)
+	}
+}
+
+// A tunnel whose first bytes arrive with the CONNECT response is wrapped to
+// replay them; it must still half-close so relays can forward an EOF.
+func TestProxyDialerTunnelHalfCloses(t *testing.T) {
+	addr := startProxy(t, func(conn net.Conn, br *bufio.Reader) {
+		if readConnect(t, br) == nil {
+			return
+		}
+		fmt.Fprint(conn, "HTTP/1.1 200 Connection Established\r\n\r\nhi")
+		io.Copy(io.Discard, br) // until the client half-closes
+		conn.Write([]byte("bye"))
+	})
+	pc := &ProxyConfig{URL: mustProxyURL(t, addr)}
+	d := NewProxyDialer(func(context.Context, *url.URL) (*ProxyConfig, error) { return pc, nil }, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := d.DialContext(ctx, "tcp", "app.internal:443")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 2)
+	if _, err := io.ReadFull(conn, buf); err != nil || string(buf) != "hi" {
+		t.Fatalf("early bytes %q, %v", buf, err)
+	}
+	cw, ok := conn.(interface{ CloseWrite() error })
+	if !ok {
+		t.Fatalf("%T cannot half-close", conn)
+	}
+	if err := cw.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	rest, err := io.ReadAll(conn)
+	if err != nil || string(rest) != "bye" {
+		t.Fatalf("after half-close %q, %v", rest, err)
 	}
 }
