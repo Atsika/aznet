@@ -177,13 +177,21 @@ func (requestAttemptPolicy) Do(req *policy.Request) (*http.Response, error) {
 	return req.Next()
 }
 
-func sdkClientOptions(driver string, m Metrics, ep *Endpoint) azcore.ClientOptions {
+func sdkClientOptions(driver string, cfg *Config, ep *Endpoint) azcore.ClientOptions {
 	offset := 0
 	if !ep.IsAzure {
 		offset = 1
 	}
-	return azcore.ClientOptions{PerCallPolicies: []policy.Policy{requestAttemptPolicy{}}, PerRetryPolicies: []policy.Policy{&requestMetricsPolicy{driver: driver, metrics: m, resourceOffset: offset}}}
-
+	var m Metrics
+	opts := azcore.ClientOptions{PerCallPolicies: []policy.Policy{requestAttemptPolicy{}}}
+	if cfg != nil {
+		m = cfg.metrics
+		if cfg.httpClient != nil {
+			opts.Transport = cfg.httpClient
+		}
+	}
+	opts.PerRetryPolicies = []policy.Policy{&requestMetricsPolicy{driver: driver, metrics: m, resourceOffset: offset}}
+	return opts
 }
 
 func (p *requestMetricsPolicy) Do(req *policy.Request) (*http.Response, error) {

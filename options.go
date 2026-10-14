@@ -3,6 +3,7 @@ package aznet
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"time"
 )
 
@@ -66,6 +67,12 @@ type Config struct {
 	connectTimeout time.Duration
 	idleTimeout    time.Duration
 	bufferLimits   BufferLimits
+
+	// httpClient replaces the SDK's default transport; nil keeps the default.
+	httpClient *http.Client
+	proxyFn    ProxyFunc
+	proxyLog   func(string, ...any)
+	proxyErr   error
 }
 
 // Validate checks if the configuration is sane and valid.
@@ -82,7 +89,7 @@ func (c *Config) Validate() error {
 	if c.reqPrefix == c.resPrefix {
 		return ErrInvalidConfig
 	}
-	return nil
+	return c.proxyErr
 }
 
 // defaultConfig returns config with library defaults.
@@ -115,6 +122,7 @@ func applyConfig(opts []Option) *Config {
 	for _, o := range opts {
 		o(cfg)
 	}
+	cfg.finishProxy()
 	return cfg
 }
 

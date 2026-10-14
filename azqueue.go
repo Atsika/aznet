@@ -57,7 +57,7 @@ func init() {
 type queueFactory struct{}
 
 func (d *queueFactory) NewDriver(ep *Endpoint, cfg *Config) (Driver, error) {
-	client, err := newQueueClient(ep, cfg.metrics)
+	client, err := newQueueClient(ep, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -80,11 +80,11 @@ func (d *queueFactory) NewDriver(ep *Endpoint, cfg *Config) (Driver, error) {
 		hSAS, tSAS, _ = ep.ParseSAS(cfg)
 	}
 
-	hq, err := resolveQueueClient(client, ep, cfg.handshakeEndpoint, hSAS, cfg.metrics)
+	hq, err := resolveQueueClient(client, ep, cfg.handshakeEndpoint, hSAS, cfg)
 	if err != nil {
 		return nil, err
 	}
-	tq, err := resolveQueueClient(client, ep, cfg.tokenEndpoint, tSAS, cfg.metrics)
+	tq, err := resolveQueueClient(client, ep, cfg.tokenEndpoint, tSAS, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -98,11 +98,11 @@ func (d *queueFactory) NewDriver(ep *Endpoint, cfg *Config) (Driver, error) {
 	}, nil
 }
 
-func resolveQueueClient(client *azqueue.ServiceClient, ep *Endpoint, name, sasToken string, metrics Metrics) (*azqueue.QueueClient, error) {
+func resolveQueueClient(client *azqueue.ServiceClient, ep *Endpoint, name, sasToken string, cfg *Config) (*azqueue.QueueClient, error) {
 	if client != nil && sasToken == "" {
 		return client.NewQueueClient(name), nil
 	}
-	c, err := azqueue.NewQueueClientWithNoCredential(ep.JoinURL(name, sasToken), &azqueue.ClientOptions{ClientOptions: sdkClientOptions(queueDriverName, metrics, ep)})
+	c, err := azqueue.NewQueueClientWithNoCredential(ep.JoinURL(name, sasToken), &azqueue.ClientOptions{ClientOptions: sdkClientOptions(queueDriverName, cfg, ep)})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
 	}
@@ -249,11 +249,11 @@ func (p *queueDriver) NewTransport(_ context.Context, connID string, tokens Sess
 	var tx, rx *azqueue.QueueClient
 	if isInitiator {
 		var err error
-		tx, err = azqueue.NewQueueClientWithNoCredential(p.ep.JoinURL(reqName, tokens.Req), &azqueue.ClientOptions{ClientOptions: sdkClientOptions(queueDriverName, p.cfg.metrics, p.ep)})
+		tx, err = azqueue.NewQueueClientWithNoCredential(p.ep.JoinURL(reqName, tokens.Req), &azqueue.ClientOptions{ClientOptions: sdkClientOptions(queueDriverName, p.cfg, p.ep)})
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
 		}
-		rx, err = azqueue.NewQueueClientWithNoCredential(p.ep.JoinURL(resName, tokens.Res), &azqueue.ClientOptions{ClientOptions: sdkClientOptions(queueDriverName, p.cfg.metrics, p.ep)})
+		rx, err = azqueue.NewQueueClientWithNoCredential(p.ep.JoinURL(resName, tokens.Res), &azqueue.ClientOptions{ClientOptions: sdkClientOptions(queueDriverName, p.cfg, p.ep)})
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
 		}
@@ -490,13 +490,13 @@ func (t *queueTransport) RemoteAddr() net.Addr {
 	return ServiceAddr{queueDriverName, t.ep.ServiceURL(), t.rxName}
 }
 
-func newQueueClient(ep *Endpoint, metrics Metrics) (*azqueue.ServiceClient, error) {
+func newQueueClient(ep *Endpoint, cfg *Config) (*azqueue.ServiceClient, error) {
 	if ep.Account != "" && ep.Key != "" {
 		cred, err := azqueue.NewSharedKeyCredential(ep.Account, ep.Key)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
 		}
-		return azqueue.NewServiceClientWithSharedKeyCredential(ep.ServiceURL(), cred, &azqueue.ClientOptions{ClientOptions: sdkClientOptions(queueDriverName, metrics, ep)})
+		return azqueue.NewServiceClientWithSharedKeyCredential(ep.ServiceURL(), cred, &azqueue.ClientOptions{ClientOptions: sdkClientOptions(queueDriverName, cfg, ep)})
 	}
 	return nil, nil
 }

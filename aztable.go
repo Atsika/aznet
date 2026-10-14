@@ -174,7 +174,7 @@ func appendSessionTableData(dst, raw []byte, limit int) ([]byte, error) {
 type tableFactory struct{}
 
 func (d *tableFactory) NewDriver(ep *Endpoint, cfg *Config) (Driver, error) {
-	client, err := newTableClient(ep, cfg.metrics)
+	client, err := newTableClient(ep, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -202,11 +202,11 @@ func (d *tableFactory) NewDriver(ep *Endpoint, cfg *Config) (Driver, error) {
 	if client == nil {
 		hSAS, tSAS, _ = ep.ParseSAS(cfg)
 	}
-	ht, err := resolveTableClient(client, ep, cfg.handshakeEndpoint, hSAS, cfg.metrics)
+	ht, err := resolveTableClient(client, ep, cfg.handshakeEndpoint, hSAS, cfg)
 	if err != nil {
 		return nil, err
 	}
-	tt, err := resolveTableClient(client, ep, cfg.tokenEndpoint, tSAS, cfg.metrics)
+	tt, err := resolveTableClient(client, ep, cfg.tokenEndpoint, tSAS, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -220,11 +220,11 @@ func (d *tableFactory) NewDriver(ep *Endpoint, cfg *Config) (Driver, error) {
 	}, nil
 }
 
-func resolveTableClient(client *aztables.ServiceClient, ep *Endpoint, name, sasToken string, metrics Metrics) (*aztables.Client, error) {
+func resolveTableClient(client *aztables.ServiceClient, ep *Endpoint, name, sasToken string, cfg *Config) (*aztables.Client, error) {
 	if client != nil && sasToken == "" {
 		return client.NewClient(name), nil
 	}
-	c, err := aztables.NewClientWithNoCredential(ep.JoinURL(name, sasToken), &aztables.ClientOptions{ClientOptions: sdkClientOptions(tableDriverName, metrics, ep)})
+	c, err := aztables.NewClientWithNoCredential(ep.JoinURL(name, sasToken), &aztables.ClientOptions{ClientOptions: sdkClientOptions(tableDriverName, cfg, ep)})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
 	}
@@ -350,11 +350,11 @@ func (p *tableDriver) NewTransport(_ context.Context, connID string, tokens Sess
 	var tx, rx *aztables.Client
 	if isInitiator {
 		var err error
-		tx, err = aztables.NewClientWithNoCredential(p.ep.JoinURL(reqName, tokens.Req), &aztables.ClientOptions{ClientOptions: sdkClientOptions(tableDriverName, p.cfg.metrics, p.ep)})
+		tx, err = aztables.NewClientWithNoCredential(p.ep.JoinURL(reqName, tokens.Req), &aztables.ClientOptions{ClientOptions: sdkClientOptions(tableDriverName, p.cfg, p.ep)})
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
 		}
-		rx, err = aztables.NewClientWithNoCredential(p.ep.JoinURL(resName, tokens.Res), &aztables.ClientOptions{ClientOptions: sdkClientOptions(tableDriverName, p.cfg.metrics, p.ep)})
+		rx, err = aztables.NewClientWithNoCredential(p.ep.JoinURL(resName, tokens.Res), &aztables.ClientOptions{ClientOptions: sdkClientOptions(tableDriverName, p.cfg, p.ep)})
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
 		}
@@ -600,13 +600,13 @@ func formatRowKey(seq int) string {
 	return string(b[:])
 }
 
-func newTableClient(ep *Endpoint, metrics Metrics) (*aztables.ServiceClient, error) {
+func newTableClient(ep *Endpoint, cfg *Config) (*aztables.ServiceClient, error) {
 	if ep.Account != "" && ep.Key != "" {
 		cred, err := aztables.NewSharedKeyCredential(ep.Account, ep.Key)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
 		}
-		return aztables.NewServiceClientWithSharedKey(ep.ServiceURL(), cred, &aztables.ClientOptions{ClientOptions: sdkClientOptions(tableDriverName, metrics, ep)})
+		return aztables.NewServiceClientWithSharedKey(ep.ServiceURL(), cred, &aztables.ClientOptions{ClientOptions: sdkClientOptions(tableDriverName, cfg, ep)})
 	}
 	return nil, nil
 }

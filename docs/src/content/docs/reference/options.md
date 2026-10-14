@@ -179,3 +179,59 @@ the original Driver method set: their ordinary `ConnectionString()` still works;
 explicit per-string duration returns `ErrBootstrapDurationUnsupported` until the
 capability is implemented. Implementations must not mutate shared configuration to
 satisfy a single issuance request.
+
+## Egress Proxy
+
+### WithProxy
+
+```go
+func WithProxy(address string, auth ProxyAuth, user, pass string) Option
+```
+
+Sends every storage request through an HTTP egress proxy using `CONNECT`. `address` is `http://host:port` or `https://host:port` (TLS to the proxy itself); a bare `host:port` means `http`. Credentials may be given as `user` and `pass`, or in the address (`http://user:pass@host:port`). With neither, the proxy is tried without credentials.
+
+`auth` selects the scheme:
+
+| Value | Behaviour |
+| --- | --- |
+| `ProxyAuto` | Waits for the proxy's challenge, then uses the strongest offered scheme the credentials allow: Negotiate, NTLM, Basic. |
+| `ProxyBasic` | Sends Basic credentials with the first request. |
+| `ProxyNTLM` | NTLM with explicit credentials. `DOMAIN\user` and `user@domain` are accepted. |
+| `ProxyNegotiate` | SPNEGO. Kerberos on every platform; see below. |
+
+#### Kerberos and single sign-on
+
+`ProxyConfig.SPN` overrides the service name, which defaults to `HTTP/` plus the proxy's lower-cased host name. Set it when the proxy is addressed by an alias or an IP.
+
+- **Windows**: Negotiate uses SSPI, which tries Kerberos and falls back to NTLM itself. With no credentials it uses the logged-on user, and an NTLM-only proxy is also answered as that user. Explicit credentials may be `DOMAIN\user` or a UPN.
+- **Linux and macOS**: with `user` and `pass`, aznet logs in to the KDC (`user@REALM`, or the `default_realm` of `krb5.conf`; `KRB5_CONFIG` or `/etc/krb5.conf`, falling back to DNS lookup of the KDC). Without a password it reads the ticket cache named by `KRB5CCNAME` (default `/tmp/krb5cc_<uid>`). Only file caches are readable: the macOS default `API:` cache, `KCM:` and `KEYRING:` are not, so run `kinit` against `KRB5CCNAME=FILE:/path`. A cache is read on every connection, so renewed tickets are picked up.
+- Outside Windows there is no NTLM inside Negotiate, so `ProxyAuto` falls back to the NTLM scheme if the proxy offers it and credentials were given.
+- WASM builds do not support Negotiate or ambient NTLM.
+
+Basic over an `http://` proxy sends the password unencrypted to the proxy. NTLM and Negotiate authenticate the TCP connection, so aznet keeps one connection for the whole exchange.
+
+Only HTTP and HTTPS proxies are supported; `socks5://` is rejected with `ErrInvalidProxy`. A plain-HTTP storage endpoint such as an emulator is also tunnelled with `CONNECT`, which most proxies allow only for port 443.
+
+- **Default**: no option set; the SDK's standard transport is used, which honors `HTTPS_PROXY`, `HTTP_PROXY` and `NO_PROXY`.
+
+### WithProxyFunc
+
+```go
+type ProxyFunc func(ctx context.Context, target *url.URL) (*ProxyConfig, error)
+
+func WithProxyFunc(fn ProxyFunc) Option
+```
+
+Chooses the proxy for each new connection. `target` has scheme `https` for port 443 and `http` otherwise. Return a nil `*ProxyConfig` to connect directly. Use it when the proxy depends on the destination or can change between reconnects, for example when it comes from a PAC file.
+
+Errors: `ErrInvalidProxy`, `ErrProxyConnect`, `ErrProxyAuthRequired`, `ErrProxyAuthUnsupported`, `ErrProxyAuthFailed`.
+
+### NewProxyDialer
+
+```go
+func NewProxyDialer(fn ProxyFunc, logf func(format string, args ...any)) *ProxyDialer
+
+func (d *ProxyDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error)
+```
+
+Opens your own TCP connections the way `WithProxyFunc` opens storage connections: `fn` picks the proxy for `addr`, a nil config connects directly, and anything else is tunnelled with `CONNECT` using the same authentication. `logf` may be nil; it traces like `WithProxyLog`. A tunnel supports `CloseWrite` when the connection beneath it does, so it can be half-closed like a direct connection. Errors are those of `WithProxyFunc`.
