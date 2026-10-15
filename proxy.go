@@ -506,7 +506,7 @@ func dialViaProxy(ctx context.Context, dialer *net.Dialer, pc *ProxyConfig, addr
 func dialProxyConn(ctx context.Context, dialer *net.Dialer, pc *ProxyConfig) (net.Conn, error) {
 	conn, err := dialer.DialContext(ctx, "tcp", pc.URL.Host)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrProxyConnect, unwrapURLError(err))
+		return nil, fmt.Errorf("%w: %w: %v", ErrProxyConnect, ErrProxyUnreachable, unwrapURLError(err))
 	}
 	if pc.URL.Scheme != "https" {
 		return conn, nil
@@ -514,7 +514,7 @@ func dialProxyConn(ctx context.Context, dialer *net.Dialer, pc *ProxyConfig) (ne
 	tlsConn := tls.Client(conn, &tls.Config{ServerName: pc.URL.Hostname(), MinVersion: tls.VersionTLS12})
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("%w: TLS to proxy: %v", ErrProxyConnect, err)
+		return nil, fmt.Errorf("%w: %w: TLS to proxy: %v", ErrProxyConnect, ErrProxyUnreachable, err)
 	}
 	return tlsConn, nil
 }

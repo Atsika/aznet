@@ -564,6 +564,9 @@ func TestProxyAuthFailuresAreNotRetried(t *testing.T) {
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("err %v, want %v", err, tc.want)
 			}
+			if got, want := errors.Is(err, ErrProxyUnreachable), tc.name == "unreachable"; got != want {
+				t.Fatalf("unreachable %t, want %t (%v)", got, want, err)
+			}
 			var nr nonRetriable
 			if got := errors.As(err, &nr); got != tc.permanent {
 				t.Fatalf("non-retriable %t, want %t (%v)", got, tc.permanent, err)
