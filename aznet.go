@@ -150,6 +150,10 @@ var (
 	// ErrProxyConnect is returned when the egress proxy cannot be reached or
 	// refuses to open a tunnel.
 	ErrProxyConnect = errors.New("proxy connect failed")
+	// ErrProxyUnreachable accompanies ErrProxyConnect when no connection to the
+	// proxy itself could be made (or secured), as opposed to a proxy that
+	// answered and refused. Another proxy may then succeed.
+	ErrProxyUnreachable = errors.New("proxy unreachable")
 	// ErrProxyAuthRequired is returned when the proxy demands authentication
 	// and no credentials were supplied.
 	ErrProxyAuthRequired = errors.New("proxy requires credentials")

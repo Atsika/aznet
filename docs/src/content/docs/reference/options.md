@@ -224,7 +224,7 @@ func WithProxyFunc(fn ProxyFunc) Option
 
 Chooses the proxy for each new connection. `target` has scheme `https` for port 443 and `http` otherwise. Return a nil `*ProxyConfig` to connect directly. Use it when the proxy depends on the destination or can change between reconnects, for example when it comes from a PAC file.
 
-Errors: `ErrInvalidProxy`, `ErrProxyConnect`, `ErrProxyAuthRequired`, `ErrProxyAuthUnsupported`, `ErrProxyAuthFailed`.
+Errors: `ErrInvalidProxy`, `ErrProxyConnect`, `ErrProxyAuthRequired`, `ErrProxyAuthUnsupported`, `ErrProxyAuthFailed`. When no connection to the proxy itself could be made (or its TLS failed), the error also matches `ErrProxyUnreachable`, so a caller with several proxies knows another one is worth trying.
 
 ### NewProxyDialer
 
