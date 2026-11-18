@@ -122,16 +122,15 @@ func (p *blobDriver) GetHandshakes(ctx context.Context) ([]Handshake, error) {
 			return nil, err
 		}
 		for _, item := range resp.Segment.BlobItems {
-			if item.Name == nil || item.Metadata == nil {
+			if item.Name == nil {
 				continue
 			}
-			encoded, ok := item.Metadata["payload"]
-			if !ok || encoded == nil {
-				continue
-			}
-			data, err := base64.StdEncoding.DecodeString(*encoded)
-			if err != nil {
-				continue
+			// A blob without a decodable payload is still returned, with an
+			// empty one, so the listener deletes it instead of listing it on
+			// every poll.
+			var data []byte
+			if encoded := item.Metadata["payload"]; encoded != nil {
+				data, _ = base64.StdEncoding.DecodeString(*encoded)
 			}
 			handshakes = append(handshakes, Handshake{ID: *item.Name, Payload: data})
 		}
@@ -159,7 +158,10 @@ func (p *blobDriver) GetToken(ctx context.Context, connID string) ([]byte, error
 	}
 	defer resp.Body.Close()
 
-	data, _ := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read token: %w", err)
+	}
 	if len(data) == 0 {
 		return nil, ErrNoData
 	}
@@ -173,8 +175,12 @@ func (p *blobDriver) DeleteToken(ctx context.Context, connID string) error {
 
 func (p *blobDriver) makeSAS(name string, permissions sas.ContainerPermissions, duration time.Duration) (string, error) {
 	start, end := p.cfg.sasTimes(duration)
+	protocol := sas.ProtocolHTTPSandHTTP
+	if p.ep.URL.Scheme == "https" {
+		protocol = sas.ProtocolHTTPS
+	}
 	sv := sas.BlobSignatureValues{
-		Protocol: sas.ProtocolHTTPSandHTTP, ContainerName: name,
+		Protocol: protocol, ContainerName: name,
 		Permissions: permissions.String(), StartTime: start, ExpiryTime: end,
 	}
 
@@ -320,6 +326,12 @@ func (t *blobTransport) ReadRawLimit(ctx context.Context, limit int) (io.ReadClo
 	defer t.rxMu.Unlock()
 	resp, err := t.containerClient.NewBlobClient(t.rxBlob).DownloadStream(ctx, &blob.DownloadStreamOptions{Range: blob.HTTPRange{Offset: t.rxOffset, Count: int64(min(limit, t.MaxRawSize(), max(1, t.cfg.limits().Pending/2)))}})
 	if err != nil {
+		// A missing container is not an empty poll: the session's storage was
+		// deleted, so nothing will ever arrive. A missing blob is a rotation
+		// target the peer has not created yet.
+		if bloberror.HasCode(err, bloberror.ContainerNotFound) {
+			return nil, fmt.Errorf("%w: %w", ErrSessionGone, err)
+		}
 		if re, ok := err.(*azcore.ResponseError); ok && (re.StatusCode == http.StatusNotFound || re.StatusCode == http.StatusRequestedRangeNotSatisfiable) {
 			return nil, ErrNoData
 		}

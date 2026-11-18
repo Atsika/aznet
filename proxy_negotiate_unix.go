@@ -3,6 +3,7 @@
 package aznet
 
 import (
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -88,7 +89,7 @@ func newAmbientNTLMAuth() (proxyAuthenticator, error) { return nil, ErrProxyAuth
 // passwordClients keeps logged-in clients across connections, so reconnects
 // reuse the ticket-granting ticket (which gokrb5 renews) instead of asking the
 // KDC again.
-var passwordClients sync.Map // "name@realm\x00password" -> *client.Client
+var passwordClients sync.Map // name@realm plus a password digest -> *client.Client
 
 func kerberosPasswordClient(user, pass string) (*client.Client, error) {
 	name, realm := splitKerberosUser(user)
@@ -102,7 +103,9 @@ func kerberosPasswordClient(user, pass string) (*client.Client, error) {
 	if realm == "" {
 		return nil, fmt.Errorf("%w: no Kerberos realm: use user@REALM or set default_realm in krb5.conf", ErrProxyAuthRequired)
 	}
-	key := name + "@" + realm + "\x00" + pass
+	// Key on a digest so the map never holds the password itself.
+	digest := sha256.Sum256([]byte(pass))
+	key := name + "@" + realm + "\x00" + string(digest[:])
 	if cl, ok := passwordClients.Load(key); ok {
 		return cl.(*client.Client), nil
 	}

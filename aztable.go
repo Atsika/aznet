@@ -101,7 +101,16 @@ func extractTableData(raw []byte) []byte {
 		if !ok {
 			break
 		}
-		chunk, _ := base64.StdEncoding.DecodeString(v.(string))
+		// Bootstrap rows are written by whoever holds the credential; a
+		// property of another type is a malformed row, not a programming error.
+		s, ok := v.(string)
+		if !ok {
+			return nil
+		}
+		chunk, err := base64.StdEncoding.DecodeString(s)
+		if err != nil {
+			return nil
+		}
 		res = append(res, chunk...)
 	}
 	return res
@@ -169,6 +178,11 @@ func appendSessionTableData(dst, raw []byte, limit int) ([]byte, error) {
 		return dst, errors.New("empty session row")
 	}
 	return dst, nil
+}
+
+func tableErrorCode(err error, code aztables.TableErrorCode) bool {
+	var respErr *azcore.ResponseError
+	return errors.As(err, &respErr) && aztables.TableErrorCode(respErr.ErrorCode) == code
 }
 
 type tableFactory struct{}
@@ -254,7 +268,9 @@ func (p *tableDriver) GetHandshakes(ctx context.Context) ([]Handshake, error) {
 		}
 		for _, e := range resp.Entities {
 			var meta struct{ RowKey string }
-			json.Unmarshal(e, &meta)
+			if json.Unmarshal(e, &meta) != nil || meta.RowKey == "" {
+				continue // nothing to delete it by
+			}
 			handshakes = append(handshakes, Handshake{ID: meta.RowKey, Payload: extractTableData(e)})
 		}
 	}
@@ -290,7 +306,11 @@ func (p *tableDriver) DeleteToken(ctx context.Context, connID string) error {
 
 func (p *tableDriver) makeSAS(name string, permissions aztables.SASPermissions, duration time.Duration) (string, error) {
 	start, end := p.cfg.sasTimes(duration)
-	sv := aztables.SASSignatureValues{Protocol: aztables.SASProtocolHTTPSandHTTP, TableName: name, Permissions: permissions.String(), StartTime: start, ExpiryTime: end}
+	protocol := aztables.SASProtocolHTTPSandHTTP
+	if p.ep.URL.Scheme == "https" {
+		protocol = aztables.SASProtocolHTTPS
+	}
+	sv := aztables.SASSignatureValues{Protocol: protocol, TableName: name, Permissions: permissions.String(), StartTime: start, ExpiryTime: end}
 	cred, err := aztables.NewSharedKeyCredential(p.ep.Account, p.ep.Key)
 	if err != nil {
 		return "", fmt.Errorf("%w: %v", ErrClientCreationFailed, err)
@@ -327,11 +347,12 @@ func (p *tableDriver) CreateBootstrapTokensFor(duration time.Duration) (string, 
 func (p *tableDriver) CreateSession(ctx context.Context, connID string) (SessionTokens, error) {
 	name := p.cfg.reqPrefix + strings.ReplaceAll(connID, "-", "")
 	resName := p.cfg.resPrefix + strings.ReplaceAll(connID, "-", "")
-	if _, err := p.client.CreateTable(ctx, name, nil); err != nil {
-		return SessionTokens{}, fmt.Errorf("create session table %s: %w", name, err)
-	}
-	if _, err := p.client.CreateTable(ctx, resName, nil); err != nil {
-		return SessionTokens{}, fmt.Errorf("create session table %s: %w", resName, err)
+	// An uncertain first attempt may have created the table; like Blob and
+	// Queue, treat that as success.
+	for _, table := range []string{name, resName} {
+		if _, err := p.client.CreateTable(ctx, table, nil); err != nil && !tableErrorCode(err, aztables.TableAlreadyExists) {
+			return SessionTokens{}, fmt.Errorf("create session table %s: %w", table, err)
+		}
 	}
 	reqSAS, err := p.makeSAS(name, aztables.SASPermissions{Add: true}, p.cfg.sessionDuration)
 	if err != nil {
@@ -361,7 +382,11 @@ func (p *tableDriver) NewTransport(_ context.Context, connID string, tokens Sess
 	} else {
 		tx, rx = p.client.NewClient(resName), p.client.NewClient(reqName)
 	}
-	return &tableTransport{connID: connID, txClient: tx, rxClient: rx, ep: p.ep, txName: reqName, rxName: resName, cfg: p.cfg}, nil
+	txName, rxName := reqName, resName
+	if !isInitiator {
+		txName, rxName = resName, reqName
+	}
+	return &tableTransport{connID: connID, txClient: tx, rxClient: rx, ep: p.ep, txName: txName, rxName: rxName, cfg: p.cfg}, nil
 }
 
 func (p *tableDriver) CleanupBootstrap(ctx context.Context) error {
@@ -463,41 +488,9 @@ func (t *tableTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 		t.active = true
 		return &tableBody{t: t, ctx: ctx}, nil
 	}
-	// Consumption alone is insufficient: keep the newest row as the retry
-	// receipt. Consuming its successor proves the serialized writer advanced
-	// beyond it, so that row can no longer be the uncertain outgoing chunk.
-	// Start only at the threshold. Once started, finish the captured range even
-	// if a partial failure leaves fewer rows than the threshold. A failed delete
-	// keeps its cursor; 404 reconciles an uncertain successful delete on retry.
-	if t.reclaimSeq == t.reclaimEnd && t.rxSeq-1-t.reclaimSeq >= tableCleanupRows {
-		t.reclaimEnd = t.reclaimSeq + tableCleanupRows
+	if err := t.reclaim(ctx); err != nil {
+		return nil, err
 	}
-	for t.reclaimSeq < t.reclaimEnd && !t.reclaimSingles {
-		// Capture only a full 100-row batch, leaving any prefetched remainder
-		// for the next cleanup. Key-only actions stay below the 4 MiB cap.
-		end := min(t.reclaimEnd, t.reclaimSeq+100)
-		actions := make([]aztables.TransactionAction, 0, end-t.reclaimSeq)
-		for seq := t.reclaimSeq; seq < end; seq++ {
-			entity, _ := buildTableEntity("data", formatRowKey(seq), nil)
-			actions = append(actions, aztables.TransactionAction{ActionType: aztables.TransactionTypeDelete, Entity: entity})
-		}
-		if _, err := t.rxClient.SubmitTransaction(ctx, actions, nil); err != nil {
-			// A missing row rejects the entire atomic batch. A lost response may
-			// instead mean every delete committed. Surface the error now; the next
-			// call reconciles each row (404 included) without guessing the outcome.
-			t.reclaimSingles = true
-			return nil, fmt.Errorf("reclaim table batch [%d,%d): %w", t.reclaimSeq, end, err)
-		}
-		t.reclaimSeq = end
-	}
-	for t.reclaimSeq < t.reclaimEnd {
-		_, err := t.rxClient.DeleteEntity(ctx, "data", formatRowKey(t.reclaimSeq), nil)
-		if err = missingDelete(err); err != nil {
-			return nil, fmt.Errorf("reclaim table row %d: %w", t.reclaimSeq, err)
-		}
-		t.reclaimSeq++
-	}
-	t.reclaimSingles = false
 	if t.rxSeq >= 1_000_000_000 {
 		return nil, fmt.Errorf("table receive sequence exhausted: %w", ErrBufferLimit)
 	}
@@ -508,6 +501,9 @@ func (t *tableTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 	}
 	resp, err := pager.NextPage(ctx)
 	if err != nil {
+		if tableErrorCode(err, aztables.TableNotFound) {
+			return nil, fmt.Errorf("%w: %w", ErrSessionGone, err)
+		}
 		return nil, fmt.Errorf("read table entities: %w", err)
 	}
 	t.pending, t.ends, t.position = t.pending[:0], t.ends[:0], 0
@@ -537,6 +533,46 @@ func (t *tableTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 	}
 	t.active = true
 	return &tableBody{t: t, ctx: ctx}, nil
+}
+
+// reclaim deletes rows the receiver has consumed. Caller holds t.mu.
+func (t *tableTransport) reclaim(ctx context.Context) error {
+	// Consumption alone is insufficient: keep the newest row as the retry
+	// receipt. Consuming its successor proves the serialized writer advanced
+	// beyond it, so that row can no longer be the uncertain outgoing chunk.
+	// Start only at the threshold. Once started, finish the captured range even
+	// if a partial failure leaves fewer rows than the threshold. A failed delete
+	// keeps its cursor; 404 reconciles an uncertain successful delete on retry.
+	if t.reclaimSeq == t.reclaimEnd && t.rxSeq-1-t.reclaimSeq >= tableCleanupRows {
+		t.reclaimEnd = t.reclaimSeq + tableCleanupRows
+	}
+	for t.reclaimSeq < t.reclaimEnd && !t.reclaimSingles {
+		// Capture only a full 100-row batch, leaving any prefetched remainder
+		// for the next cleanup. Key-only actions stay below the 4 MiB cap.
+		end := min(t.reclaimEnd, t.reclaimSeq+100)
+		actions := make([]aztables.TransactionAction, 0, end-t.reclaimSeq)
+		for seq := t.reclaimSeq; seq < end; seq++ {
+			entity, _ := buildTableEntity("data", formatRowKey(seq), nil)
+			actions = append(actions, aztables.TransactionAction{ActionType: aztables.TransactionTypeDelete, Entity: entity})
+		}
+		if _, err := t.rxClient.SubmitTransaction(ctx, actions, nil); err != nil {
+			// A missing row rejects the entire atomic batch. A lost response may
+			// instead mean every delete committed. Surface the error now; the next
+			// call reconciles each row (404 included) without guessing the outcome.
+			t.reclaimSingles = true
+			return fmt.Errorf("reclaim table batch [%d,%d): %w", t.reclaimSeq, end, err)
+		}
+		t.reclaimSeq = end
+	}
+	for t.reclaimSeq < t.reclaimEnd {
+		_, err := t.rxClient.DeleteEntity(ctx, "data", formatRowKey(t.reclaimSeq), nil)
+		if err = missingDelete(err); err != nil {
+			return fmt.Errorf("reclaim table row %d: %w", t.reclaimSeq, err)
+		}
+		t.reclaimSeq++
+	}
+	t.reclaimSingles = false
+	return nil
 }
 
 // tableBody transfers ownership incrementally. Closing early preserves the

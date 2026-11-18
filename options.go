@@ -66,6 +66,7 @@ type Config struct {
 
 	connectTimeout time.Duration
 	idleTimeout    time.Duration
+	idleExplicit   bool // WithIdleTimeout was given; opts dialed connections in
 	bufferLimits   BufferLimits
 
 	// httpClient replaces the SDK's default transport; nil keeps the default.
@@ -229,12 +230,18 @@ func WithConnectTimeout(d time.Duration) Option {
 	}
 }
 
-// WithIdleTimeout sets the grace period after which background janitors purge half-closed
-// connections that never completed a FIN handshake. Zero disables automatic cleanup.
+// WithIdleTimeout sets how long a peer may stay silent before it is treated as
+// dead. A listener's janitor then closes the accepted connection and deletes
+// its session resources. Passing it to Dial opts the dialed connection in to
+// the same check: a Read that waits that long without a frame from the peer
+// fails with ErrIdleTimeout (without the option, dialed connections have no
+// idle timer). Keep-alive pings count as frames, so the timeout must exceed the
+// peer's ping interval. Zero or negative values leave the default unchanged.
 func WithIdleTimeout(d time.Duration) Option {
 	return func(c *Config) {
 		if d > 0 {
 			c.idleTimeout = d
+			c.idleExplicit = true
 		}
 	}
 }
