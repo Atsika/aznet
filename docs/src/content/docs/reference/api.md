@@ -137,9 +137,12 @@ Optionally implemented by transports that need resource rotation (e.g., blob app
 The `net.Listener` implementation returned by `Listen` also provides:
 
 - `ConnectionString() (string, error)`: Returns a connection URL with embedded SAS tokens that can be shared with clients.
-- `Accept() (net.Conn, error)`: Retains unprocessed batch entries. Empty polls wait normally; backend and setup failures return `*aznet.AcceptError`, whose `Op`, `Unwrap`, `Temporary`, and `Timeout` methods let callers inspect and classify failures. Callers own retry/backoff decisions.
+- `Accept() (net.Conn, error)`: Retains unprocessed batch entries. Empty polls wait normally; backend and setup failures return `*aznet.AcceptError`, whose `Op`, `Unwrap`, `Temporary`, and `Timeout` methods let callers inspect and classify failures. Callers own retry/backoff decisions. A handshake entry that fails to decrypt or carries an invalid session ID is deleted and skipped, and `Accept` keeps waiting; it is reported as an `AcceptError` only if the entry cannot be deleted.
+- `RejectedHandshakes() uint64`: Counts the malformed handshake entries `Accept` has discarded. Anyone holding a bootstrap credential can post such entries.
 - `Close() error`: Cancels acceptance and closes all owned sessions, independently of the janitor. Returns cleanup failures or a timeout if teardown remains incomplete. Repeated calls return the original result. Shared bootstrap endpoints remain intact.
 - `CleanupBootstrap(ctx context.Context) error`: Explicitly deletes the shared handshake/token namespace. Its administrator should call this only after every namespace user has stopped, with an uncancelled cleanup context. Deletion failures are returned.
+
+`Read` returns `aznet.ErrSessionGone` when the session's storage no longer exists (the listener closed the connection and deleted it), and `aznet.ErrIdleTimeout` on a dialed connection that opted in with [`WithIdleTimeout`](/reference/options#withidletimeout). Both are terminal.
 
 Deadlines are mutable and also interrupt operations waiting for an internal I/O gate. Moving or clearing a deadline before it expires updates pending operations. A canceled operation does not erase already accepted write bytes.
 

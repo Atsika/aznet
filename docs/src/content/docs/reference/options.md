@@ -59,8 +59,11 @@ The maximum duration of client setup. On a Queue listener, it also sets token-me
 func WithIdleTimeout(d time.Duration) Option
 ```
 
-The duration of inactivity before a connection is considered dead and
-its Azure resources are eligible for cleanup by the server's janitor. Zero or negative values retain the default; they do not disable idle cleanup.
+How long a peer may stay silent before it is considered dead. Zero or negative values retain the default; they do not disable idle cleanup. Keep-alive pings count as activity, so the timeout must exceed the peer's ping interval.
+
+**On a listener**, the janitor closes an accepted connection, and deletes its session resources, once nothing has arrived from the peer for this long. The application does not need to be reading: before closing a connection that looks idle, the janitor fetches and decrypts pending chunks itself, within the receive allowances, and leaves the frames buffered for the next `Read`. Two cases are still treated as idle: a peer that has half-closed with `CloseWrite` (it sends nothing further, pings included), and an application whose unread backlog has filled the receive allowances.
+
+**On `Dial`**, passing this option opts the dialed connection in to the same check: a `Read` that itself waits this long without any frame from the peer fails with `aznet.ErrIdleTimeout`. Without the option a dialed connection has no idle timer; set a read deadline to bound a wait. Do not enable it against a listener that runs with `WithPing(0)` unless the listener's application sends at least that often.
 
 - **Default**: `5m`
 
@@ -107,7 +110,7 @@ func WithBufferLimits(limits BufferLimits) Option
 
 - `Write` blocks only while the `Write` allowance is full. Concurrent writers wait interruptibly; write deadlines bound those waits, not a storage request already in flight.
 - The returned count identifies bytes owned by the connection, including on error; retry only `p[n:]`.
-- A failed background send is returned by the next `Write`, with `n == 0`. Failed chunks retain their exact ciphertext and sequence and are resent on the following flush; a failure recovered by that resend is not reported.
+- A failed background send is returned by the next `Write`, with `n == 0`. Failed chunks retain their exact ciphertext and sequence and are resent on the following flush; a failure recovered by that resend is not reported. The connection also retries a failed flush by itself, on a backoff that starts at the data poll interval and doubles up to 30 seconds, so a retained chunk does not wait for the application's next write. Retries stop when the connection closes or a buffer limit fails it.
 - `Write(nil)` and `CloseWrite()` wait until everything queued has been sent, and return any failure. `Close` allows only 250 ms for queued bytes, so call `CloseWrite` first when the peer must receive them.
 
 The batching gain depends on how far application writes fall below the driver chunk size: large for Blob and Table, none for Queue. With 64 KiB writes on one live account (median of three), Blob rose from 1.74 to 8.76 MiB/s (34 to 1.9 requests/MiB), Table from 1.50 to 5.55 MiB/s (27 to 2.5 requests/MiB), and Queue stayed at 0.83 MiB/s. A connection now fills its `Write` allowance, so chunks and the receiver's buffers grow to several MiB: a Blob sender/receiver pair peaked at about 24 MB instead of 5 MB. Lowering `Write` to 1 MiB kept 6.9 MiB/s at a 9 MB peak. The effective MTU is also constrained by the write and retry allowances. One FIN header is reserved; redundant pings may be skipped when the buffer is full.

@@ -25,7 +25,7 @@ Use Go with automatic toolchain selection enabled. To try the built-in storage d
 - [Security and authorization](docs/src/content/docs/core-concepts/security.md)
 - [Measured performance](docs/src/content/docs/drivers/performance.md)
 
-Full Close may delete unread session data. For delivery-sensitive responses, use CloseWrite and application-level completion before Close. Listener Close retains shared bootstrap resources; their administrator removes them explicitly after all namespace users stop. Neither credential renewal nor crash-proof remote cleanup is automatic.
+Full Close may delete unread session data. For delivery-sensitive responses, use CloseWrite and application-level completion before Close. Listener Close retains shared bootstrap resources; their administrator removes them explicitly after all namespace users stop. Neither credential renewal nor crash-proof remote cleanup is automatic. The listener's janitor closes accepted connections whose peer has sent nothing, keep-alive pings included, within the idle timeout (5 minutes by default). A dialed connection gets the same check only when `WithIdleTimeout` is passed to `Dial`; otherwise use read deadlines.
 
 ## Development
 

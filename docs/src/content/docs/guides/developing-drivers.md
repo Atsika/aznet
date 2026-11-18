@@ -68,7 +68,7 @@ func (f *myFactory) NewDriver(ep *aznet.Endpoint, cfg *aznet.Config) (aznet.Driv
 ```go
 ep.Account   // Storage account name
 ep.Key       // Storage account key
-ep.IsAzure   // true if *.core.windows.net
+ep.IsAzure   // true for *.core.windows.net and the sovereign-cloud suffixes
 ep.URL       // Parsed *url.URL
 ep.ServiceURL()            // Base service URL (e.g., https://account.blob.core.windows.net)
 ep.JoinURL(resource, sas)  // Append resource path and SAS token
