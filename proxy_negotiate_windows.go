@@ -54,7 +54,9 @@ func (a *sspiNegotiate) respond(challenge string) (string, error) {
 }
 
 func (a *sspiNegotiate) release() {
-	a.ctx.Release()
+	if a.ctx != nil {
+		a.ctx.Release()
+	}
 	a.cred.Release()
 }
 

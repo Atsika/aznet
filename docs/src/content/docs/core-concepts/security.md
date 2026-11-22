@@ -19,7 +19,7 @@ The listener uses account credentials to provision resources and issue SAS token
 | Queue | Add / Read | Add / Read/Process |
 | Table | Add / Read | Add / Read/Delete |
 
-Session resources are named using the client's validated UUID. Resource scoping reduces cross-session access, but Blob's container token does not isolate the two directions. Bootstrap credentials are bearer secrets for a shared namespace, not proof of a particular peer's identity. Protect them accordingly.
+Session resources are named using the client's validated UUID. Resource scoping reduces cross-session access, but Blob's container token does not isolate the two directions. Bootstrap credentials are bearer secrets for a shared namespace, not proof of a particular peer's identity. Protect them accordingly. SAS tokens issued by a listener on an `https` endpoint are restricted to HTTPS. Only a listener on a plain-`http` endpoint, such as a local emulator, issues tokens that also permit HTTP.
 
 ## Lifetime and cleanup
 

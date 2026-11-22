@@ -130,10 +130,16 @@ func (p *queueDriver) GetHandshakes(ctx context.Context) ([]Handshake, error) {
 	}
 	var handshakes []Handshake
 	for _, msg := range resp.Messages {
-		if msg.MessageText != nil {
-			data, _ := base64.StdEncoding.DecodeString(*msg.MessageText)
-			handshakes = append(handshakes, Handshake{ID: *msg.MessageID + ":" + *msg.PopReceipt, Payload: data})
+		if msg.MessageID == nil || msg.PopReceipt == nil {
+			continue
 		}
+		// An undecodable message is still returned, with an empty payload, so
+		// the listener deletes it instead of dequeuing it again every minute.
+		var data []byte
+		if msg.MessageText != nil {
+			data, _ = base64.StdEncoding.DecodeString(*msg.MessageText)
+		}
+		handshakes = append(handshakes, Handshake{ID: *msg.MessageID + ":" + *msg.PopReceipt, Payload: data})
 	}
 	return handshakes, nil
 }
@@ -191,7 +197,11 @@ func (p *queueDriver) DeleteToken(ctx context.Context, connID string) error {
 
 func (p *queueDriver) makeSAS(name string, permissions sas.QueuePermissions, duration time.Duration) (string, error) {
 	start, end := p.cfg.sasTimes(duration)
-	sv := sas.QueueSignatureValues{Protocol: sas.ProtocolHTTPSandHTTP, QueueName: name, Permissions: permissions.String(), StartTime: start, ExpiryTime: end}
+	protocol := sas.ProtocolHTTPSandHTTP
+	if p.ep.URL.Scheme == "https" {
+		protocol = sas.ProtocolHTTPS
+	}
+	sv := sas.QueueSignatureValues{Protocol: protocol, QueueName: name, Permissions: permissions.String(), StartTime: start, ExpiryTime: end}
 	cred, err := azqueue.NewSharedKeyCredential(p.ep.Account, p.ep.Key)
 	if err != nil {
 		return "", err
@@ -260,7 +270,11 @@ func (p *queueDriver) NewTransport(_ context.Context, connID string, tokens Sess
 	} else {
 		tx, rx = p.client.NewQueueClient(resName), p.client.NewQueueClient(reqName)
 	}
-	return &queueTransport{connID: connID, txQueue: tx, rxQueue: rx, ep: p.ep, txName: reqName, rxName: resName, cfg: p.cfg, pending: make(map[uint64][]byte)}, nil
+	txName, rxName := reqName, resName
+	if !isInitiator {
+		txName, rxName = resName, reqName
+	}
+	return &queueTransport{connID: connID, txQueue: tx, rxQueue: rx, ep: p.ep, txName: txName, rxName: rxName, cfg: p.cfg, pending: make(map[uint64][]byte)}, nil
 }
 
 func (p *queueDriver) CleanupBootstrap(ctx context.Context) error {
@@ -469,6 +483,9 @@ func (t *queueTransport) ReadRaw(ctx context.Context) (io.ReadCloser, error) {
 		if derr != nil {
 			// Reporting this as ErrNoData would make a persistent failure
 			// (expired SAS, auth, network) look exactly like an idle queue.
+			if queueerror.HasCode(derr, queueerror.QueueNotFound) {
+				return nil, fmt.Errorf("%w: %w", ErrSessionGone, derr)
+			}
 			return nil, derr
 		}
 		return nil, ErrNoData // out-of-order messages await their predecessors

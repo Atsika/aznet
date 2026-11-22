@@ -164,6 +164,13 @@ var (
 	ErrProxyAuthFailed = errors.New("proxy authentication failed")
 	// ErrNoData is returned when no data is available to read.
 	ErrNoData = errors.New("no data available")
+	// ErrSessionGone is returned when a session's storage no longer exists,
+	// typically because the listener closed the connection and deleted it. It
+	// is terminal: unread data went with the storage.
+	ErrSessionGone = errors.New("aznet: session storage no longer exists")
+	// ErrIdleTimeout is returned by Read on a dialed connection configured
+	// with WithIdleTimeout when the peer sends nothing for that long.
+	ErrIdleTimeout = errors.New("aznet: peer idle timeout")
 	// ErrFrameTooLarge is returned when a queued frame exceeds one chunk.
 	ErrFrameTooLarge = errors.New("frame exceeds chunk size")
 	// ErrResourceBeingDeleted is returned when a bootstrap resource cannot be

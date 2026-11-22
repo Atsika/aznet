@@ -125,4 +125,4 @@ It increases polling frequency when data is actively flowing and slows down duri
 ### Janitor
 
 The Janitor is responsible for garbage collection of Azure resources.
-It monitors `peerLastSeen` timestamps and connection states to close idle owned sessions. Crashes and backend failures still require external resource reconciliation.
+It monitors `peerLastSeen` timestamps and connection states to close idle owned sessions. `peerLastSeen` advances whenever a chunk from the peer is decrypted. Before closing a connection that looks idle, the janitor probes storage for pending chunks on behalf of an application that is not reading; see [`WithIdleTimeout`](/reference/options#withidletimeout). Only listeners run a janitor; a dialed connection can opt in to an idle check of its own with the same option. Crashes and backend failures still require external resource reconciliation.

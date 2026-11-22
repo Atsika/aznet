@@ -112,6 +112,7 @@ func WithProxyLog(logf func(format string, args ...any)) Option {
 }
 
 func (c *Config) setProxy(fn ProxyFunc) {
+	c.proxyErr = nil // a later valid proxy option replaces an earlier invalid one
 	c.proxyFn = fn
 }
 

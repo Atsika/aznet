@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,7 +27,13 @@ type Listener struct {
 	closeErr   error
 	cleanupMu  sync.Mutex
 	cleanupErr error // failures from rollback and janitor remain observable at Close
+	// cleanupKept and cleanupDropped bound cleanupErr on a long-lived listener.
+	cleanupKept, cleanupDropped int
+	rejected                    atomic.Uint64
 }
+
+// maxCleanupErrors is how many cleanup failures a listener retains for Close.
+const maxCleanupErrors = 16
 
 func (l *Listener) recordCleanup(err error) {
 	if err == nil {
@@ -34,8 +41,26 @@ func (l *Listener) recordCleanup(err error) {
 	}
 	l.cleanupMu.Lock()
 	defer l.cleanupMu.Unlock()
+	if l.cleanupKept == maxCleanupErrors {
+		l.cleanupDropped++
+		return
+	}
+	l.cleanupKept++
 	l.cleanupErr = errors.Join(l.cleanupErr, err)
 }
+
+// cleanupResult is what Close reports. Caller holds cleanupMu.
+func (l *Listener) cleanupResult() error {
+	if l.cleanupDropped == 0 {
+		return l.cleanupErr
+	}
+	return errors.Join(l.cleanupErr, fmt.Errorf("%d further cleanup failures omitted", l.cleanupDropped))
+}
+
+// RejectedHandshakes counts bootstrap entries Accept discarded because they
+// were not a valid handshake. Anyone holding a bootstrap credential can post
+// such entries, so Accept deletes them and keeps waiting rather than failing.
+func (l *Listener) RejectedHandshakes() uint64 { return l.rejected.Load() }
 
 func (l *Listener) Accept() (net.Conn, error) {
 	l.acceptMu.Lock()
@@ -90,6 +115,13 @@ func (l *Listener) acceptHandshake(hs Handshake) (conn net.Conn, err error) {
 	defer func() {
 		if !handshakeAttempted {
 			deleteHandshake()
+		}
+		if err != nil && owner == nil && deleteErr == nil && l.cfg.ctx.Err() == nil && errors.Is(err, ErrHandshakeFailed) {
+			// Garbage in the shared namespace is not a listener failure. With
+			// the entry deleted, Accept moves on to the next one.
+			l.rejected.Add(1)
+			err = nil
+			return
 		}
 		if deleteErr != nil {
 			err = errors.Join(err, deleteErr)
@@ -213,7 +245,7 @@ func (l *Listener) Close() error {
 			closeConnections()
 			l.cleanupMu.Lock()
 			defer l.cleanupMu.Unlock()
-			done <- l.cleanupErr
+			done <- l.cleanupResult()
 		}()
 		// Setup rollback can perform handshake, transport, token and session cleanup.
 		timer := time.NewTimer(5*cleanupTimeout + closeGracePeriod)
@@ -234,7 +266,7 @@ func (l *Listener) Addr() net.Addr {
 	return ServiceAddr{l.network, l.ep.ServiceURL(), l.cfg.handshakeEndpoint}
 }
 func (l *Listener) janitor() {
-	ticker := time.NewTicker(l.cfg.idleTimeout / 2)
+	ticker := time.NewTicker(max(l.cfg.idleTimeout/2, time.Millisecond))
 	defer ticker.Stop()
 	for {
 		select {
@@ -243,7 +275,18 @@ func (l *Listener) janitor() {
 		case <-ticker.C:
 			l.conns.Range(func(key, value any) bool {
 				c := value.(*Conn)
-				if c.closed.Load() != 0 || time.Since(time.Unix(0, c.peerLastSeen.Load())) > l.cfg.idleTimeout {
+				// Idleness is judged once, then again only after a probe: a second
+				// bare check could cross the threshold and skip the probe.
+				dead := c.closed.Load() != 0
+				if !dead && l.idle(c) {
+					// The application may simply not be reading. Look for the
+					// peer in storage before concluding that it is gone.
+					ctx, cancel := context.WithTimeout(c.ctx, cleanupTimeout)
+					c.probePeer(ctx)
+					cancel()
+					dead = l.idle(c)
+				}
+				if dead {
 					l.recordCleanup(c.Close())
 					l.conns.Delete(key)
 				}
@@ -251,6 +294,10 @@ func (l *Listener) janitor() {
 			})
 		}
 	}
+}
+
+func (l *Listener) idle(c *Conn) bool {
+	return time.Since(time.Unix(0, c.peerLastSeen.Load())) > l.cfg.idleTimeout
 }
 
 // Listen is analogous to net.Listen. It takes a network type (e.g. "azblob")

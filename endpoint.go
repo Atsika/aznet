@@ -55,7 +55,7 @@ func NewEndpoint(u *url.URL) *Endpoint {
 		hostOnly = h
 	}
 
-	ep.IsAzure = strings.HasSuffix(strings.ToLower(hostOnly), ".core.windows.net")
+	ep.IsAzure = isAzureHost(hostOnly)
 
 	if u.User.Username() != "" {
 		ep.Account = u.User.Username()
@@ -81,6 +81,25 @@ func NewEndpoint(u *url.URL) *Endpoint {
 	}
 
 	return ep
+}
+
+// azureStorageSuffixes are the storage endpoint suffixes of the public and
+// sovereign Azure clouds, where the account is the first host label.
+var azureStorageSuffixes = [...]string{
+	".core.windows.net",
+	".core.chinacloudapi.cn",
+	".core.usgovcloudapi.net",
+	".core.cloudapi.de",
+}
+
+func isAzureHost(host string) bool {
+	host = strings.ToLower(host)
+	for _, suffix := range azureStorageSuffixes {
+		if strings.HasSuffix(host, suffix) {
+			return true
+		}
+	}
+	return false
 }
 
 // BuildConnURL constructs the final aznet connection URL with base64 encoded SAS tokens.

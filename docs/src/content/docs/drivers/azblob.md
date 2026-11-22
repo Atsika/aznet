@@ -9,6 +9,8 @@ description: Append blobs, range reads, and independent directional progress.
 
 Writes use conditional append positions so an uncertain retry does not append the same ciphertext twice. The core retains the identical sealed chunk until completion. Reads use ranged downloads; the receive offset advances only by bytes actually read, including bytes returned alongside an error. Fetching headers does not consume the advertised body length.
 
+A read that finds the blob missing (or the range not yet written) is an empty poll: rotation may not have created the next blob yet. A read that finds the session container missing fails with `aznet.ErrSessionGone`, because the listener has deleted the session and nothing further can arrive. Data the dialed side had not yet read is lost with the container, so delivery-sensitive exchanges still need the half-close pattern in [closing ownership](/reference/api#closing-and-resource-ownership).
+
 Independent transmit and receive locks allow appends to progress while a download is waiting, and downloads to progress while an append is waiting. Operations within each direction remain ordered. This removes cross-direction lock contention; it does not remove Azure request latency or polling delay.
 
 ## Limits and rotation

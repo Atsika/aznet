@@ -381,13 +381,25 @@ func TestMalformedHandshakeDoesNotAllocate(t *testing.T) {
 	d := &sessionDriver{}
 	l := sessionListener(t, d, 1)
 	d.batch = append([]Handshake{{ID: "bad", Payload: []byte("bad")}}, d.batch...)
-	if _, err := l.Accept(); !errors.Is(err, ErrHandshakeFailed) {
+	// The malformed entry is deleted and skipped; Accept returns the valid one.
+	if _, err := l.Accept(); err != nil {
 		t.Fatal(err)
 	}
-	if d.creates.Load() != 0 || d.sessions.Load() != 0 {
-		t.Fatal("allocated invalid session")
+	if d.creates.Load() != 1 || d.sessions.Load() != 0 || d.handshakes.Load() != 2 {
+		t.Fatal("malformed handshake allocated a session or was left behind")
 	}
-	if _, err := l.Accept(); err != nil {
+	if l.RejectedHandshakes() != 1 {
+		t.Fatal("rejection not counted")
+	}
+}
+
+func TestMalformedHandshakeDeleteFailureIsReported(t *testing.T) {
+	failure := &azcore.ResponseError{StatusCode: 403, ErrorCode: "injected"}
+	d := &sessionDriver{deletion: func(context.Context) error { return failure }}
+	l := sessionListener(t, d, 0)
+	d.batch = []Handshake{{ID: "bad", Payload: []byte("bad")}}
+	// An entry that cannot be deleted would be skipped forever if hidden.
+	if _, err := l.Accept(); !errors.Is(err, ErrHandshakeFailed) || !errors.Is(err, failure) {
 		t.Fatal(err)
 	}
 }

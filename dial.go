@@ -85,5 +85,8 @@ func Dial(network, address string, opts ...Option) (conn net.Conn, err error) {
 
 	c := newConn(cfg.ctx, cfg.cancel, transport, cfg, noise, driver, connID)
 	c.sessionExpiry = tokens.ExpiresAt
+	if cfg.idleExplicit {
+		c.idleLimit = cfg.idleTimeout
+	}
 	return c, nil
 }

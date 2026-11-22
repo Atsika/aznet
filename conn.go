@@ -65,7 +65,11 @@ type Conn struct {
 	closedWrite atomic.Uint32
 	mtu         int
 	writeLimit  int // BufferLimits.Write, capped by WriteChunks
-	readRemain  int
+	// idleLimit, when positive, fails a Read that waits this long without a
+	// frame from the peer. Set on dialed connections given WithIdleTimeout;
+	// accepted connections are judged by the listener's janitor instead.
+	idleLimit  time.Duration
+	readRemain int
 }
 
 // Buffers encapsulates the internal bytes.Buffer instances used by a connection.
@@ -378,6 +382,7 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+	started := time.Now().UnixNano()
 	for {
 		if c.closed.Load() == 1 {
 			return 0, net.ErrClosed
@@ -442,7 +447,10 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 				case MsgTypeRotate:
 					c.bufs.Read.Next(FrameHeaderSize + fLen)
 					if c.rotator != nil {
-						_ = c.rotator.RotateRX()
+						if err := c.rotator.RotateRX(); err != nil {
+							c.rmu.Unlock()
+							return 0, fmt.Errorf("rotate receive channel: %w", err)
+						}
 					}
 					c.rmu.Unlock()
 					continue
@@ -456,119 +464,186 @@ func (c *Conn) Read(p []byte) (n int, err error) {
 
 		// A previous operation may have received ciphertext before its deadline
 		// interrupted decryption. Process that owned data before polling again.
-		maxChunk := min(c.transport.MaxRawSize(), c.cfg.limits().Pending)
-		if c.bufs.Noise.Len() >= 4 {
-			sealedSize := uint64(binary.BigEndian.Uint32(c.bufs.Noise.Bytes()[:4])) + 4
-			available := c.cfg.limits().Decrypted - c.bufs.Read.Len()
-			if sealedSize > uint64(available)+NoiseOverhead {
-				c.rmu.Unlock()
-				return 0, c.overflow("decrypted chunk")
-			}
-		}
-		decrypted, rest, decodeErr := c.noise.UnsealData(c.bufs.Dec, c.bufs.Noise.Bytes(), maxChunk)
-		if decodeErr != nil && decodeErr != io.ErrShortBuffer {
-			c.rmu.Unlock()
-			if errors.Is(decodeErr, ErrChunkTooLarge) {
-				return 0, c.overflow("ciphertext chunk")
-			}
-			return 0, decodeErr
-		}
+		decodeErr := c.unsealBuffered()
 		if decodeErr == nil {
-			if c.bufs.Read.Len() == 0 {
-				// Transfer ownership instead of copying every decrypted chunk.
-				// The old, fully consumed buffer becomes the next scratch space;
-				// decryption must never reuse the plaintext still owned by Read.
-				c.bufs.Read.Reset()
-				spare := c.bufs.Read.AvailableBuffer()
-				c.bufs.Read = *bytes.NewBuffer(decrypted)
-				c.bufs.Dec = spare
-			} else {
-				// A peer may split a frame across encrypted chunks. Preserve the
-				// incomplete prefix and append the newly authenticated suffix.
-				c.bufs.Dec = decrypted[:0]
-				c.bufs.Read.Write(decrypted)
-			}
-			c.cleanupToken.Do(func() {
-				if c.session != nil {
-					go c.session.deleteToken()
-				}
-			})
-			used := c.bufs.Noise.Len() - len(rest)
-			c.bufs.Noise.Next(used)
 			c.rmu.Unlock()
 			// Drain framed plaintext before decrypting the next chunk.
 			continue
 		}
+		if decodeErr != io.ErrShortBuffer {
+			c.rmu.Unlock()
+			return 0, decodeErr
+		}
 		receiveBudget := c.cfg.limits().Pending - c.bufs.Noise.Len()
 		c.rmu.Unlock()
 
-		// Fetch more data
-		var rawStream io.ReadCloser
-		var err error
-		if reader, ok := c.transport.(limitedRawReader); ok {
-			rawStream, err = reader.ReadRawLimit(ctx, receiveBudget)
-		} else {
-			rawStream, err = c.transport.ReadRaw(ctx)
-		}
-		if err != nil {
-			if errors.Is(err, ErrBufferLimit) {
-				return 0, c.overflow("transport receive")
-			}
+		if err := c.receive(ctx, receiveBudget); err != nil {
 			if errors.Is(err, ErrNoData) {
+				// Only a Read that itself waited out the idle timeout fails, so a
+				// connection the application left unread is not judged by the gap.
+				if c.idleLimit > 0 && time.Since(time.Unix(0, max(started, c.peerLastSeen.Load()))) > c.idleLimit {
+					return 0, ErrIdleTimeout
+				}
 				if err := c.idleWait(ctx); err != nil {
 					return 0, err
 				}
 				continue
 			}
-			if errors.Is(err, context.Canceled) && c.closed.Load() == 1 {
-				return 0, net.ErrClosed
-			}
 			return 0, err
 		}
-
-		// Read directly from the stream into the Noise buffer, then decrypt.
-		// readGate covers fetching, body consumption, decryption and frame parsing.
-		// rmu additionally protects buffer recycling during teardown.
-		c.rmu.Lock()
-		if c.bufs == nil {
-			c.rmu.Unlock()
-			rawStream.Close()
-			return 0, net.ErrClosed
-		}
-
-		// Closing the response body interrupts a blocked stream read as well
-		// as canceling the context passed to ReadRaw.
-		bodyClosed := make(chan struct{})
-		stopClose := context.AfterFunc(ctx, func() {
-			rawStream.Close()
-			close(bodyClosed)
-		})
-		remaining := c.cfg.limits().Pending - c.bufs.Noise.Len()
-		_, err = c.bufs.Noise.ReadFrom(io.LimitReader(rawStream, int64(remaining)))
-		if err == nil {
-			var extra [1]byte
-			n, probeErr := io.ReadFull(rawStream, extra[:])
-			if n > 0 {
-				err = c.overflow("pending ciphertext")
-			} else if probeErr != io.EOF {
-				err = probeErr
-			}
-		}
-		if stopClose() {
-			rawStream.Close()
-		} else {
-			<-bodyClosed
-		}
-		if cause := context.Cause(ctx); cause != nil {
-			err = cause
-		}
-		if err != nil && err != io.EOF {
-			c.rmu.Unlock()
-			return 0, err
-		}
-
-		c.rmu.Unlock()
 		c.poll.Reset()
+	}
+}
+
+// unsealBuffered decrypts one whole chunk from bufs.Noise into bufs.Read and
+// returns io.ErrShortBuffer when none is buffered yet. Any other error is
+// terminal. Caller holds readGate and rmu.
+func (c *Conn) unsealBuffered() error {
+	maxChunk := min(c.transport.MaxRawSize(), c.cfg.limits().Pending)
+	if c.bufs.Noise.Len() >= 4 {
+		sealedSize := uint64(binary.BigEndian.Uint32(c.bufs.Noise.Bytes()[:4])) + 4
+		available := c.cfg.limits().Decrypted - c.bufs.Read.Len()
+		if sealedSize > uint64(available)+NoiseOverhead {
+			return c.overflow("decrypted chunk")
+		}
+	}
+	decrypted, rest, err := c.noise.UnsealData(c.bufs.Dec, c.bufs.Noise.Bytes(), maxChunk)
+	if err != nil {
+		if errors.Is(err, ErrChunkTooLarge) {
+			return c.overflow("ciphertext chunk")
+		}
+		return err
+	}
+	if c.bufs.Read.Len() == 0 {
+		// Transfer ownership instead of copying every decrypted chunk.
+		// The old, fully consumed buffer becomes the next scratch space;
+		// decryption must never reuse the plaintext still owned by Read.
+		c.bufs.Read.Reset()
+		spare := c.bufs.Read.AvailableBuffer()
+		c.bufs.Read = *bytes.NewBuffer(decrypted)
+		c.bufs.Dec = spare
+	} else {
+		// A peer may split a frame across encrypted chunks. Preserve the
+		// incomplete prefix and append the newly authenticated suffix.
+		c.bufs.Dec = decrypted[:0]
+		c.bufs.Read.Write(decrypted)
+	}
+	// An authenticated chunk is proof of the peer, whether or not the
+	// application has read the frames in it yet.
+	c.peerLastSeen.Store(time.Now().UnixNano())
+	c.cleanupToken.Do(func() {
+		if c.session != nil {
+			go c.session.deleteToken()
+		}
+	})
+	c.bufs.Noise.Next(c.bufs.Noise.Len() - len(rest))
+	return nil
+}
+
+// receive pulls one transport response into bufs.Noise. It returns ErrNoData
+// for an empty poll. Caller holds readGate and must not hold rmu.
+func (c *Conn) receive(ctx context.Context, budget int) error {
+	var rawStream io.ReadCloser
+	var err error
+	if reader, ok := c.transport.(limitedRawReader); ok {
+		rawStream, err = reader.ReadRawLimit(ctx, budget)
+	} else {
+		rawStream, err = c.transport.ReadRaw(ctx)
+	}
+	if err != nil {
+		if errors.Is(err, ErrBufferLimit) {
+			return c.overflow("transport receive")
+		}
+		if errors.Is(err, context.Canceled) && c.closed.Load() == 1 {
+			return net.ErrClosed
+		}
+		return err
+	}
+
+	// Read directly from the stream into the Noise buffer. readGate covers
+	// fetching, body consumption, decryption and frame parsing; rmu additionally
+	// protects buffer recycling during teardown.
+	c.rmu.Lock()
+	defer c.rmu.Unlock()
+	if c.bufs == nil {
+		rawStream.Close()
+		return net.ErrClosed
+	}
+
+	// Closing the response body interrupts a blocked stream read as well
+	// as canceling the context passed to ReadRaw.
+	bodyClosed := make(chan struct{})
+	stopClose := context.AfterFunc(ctx, func() {
+		rawStream.Close()
+		close(bodyClosed)
+	})
+	remaining := c.cfg.limits().Pending - c.bufs.Noise.Len()
+	_, err = c.bufs.Noise.ReadFrom(io.LimitReader(rawStream, int64(remaining)))
+	if err == nil {
+		var extra [1]byte
+		n, probeErr := io.ReadFull(rawStream, extra[:])
+		if n > 0 {
+			err = c.overflow("pending ciphertext")
+		} else if probeErr != io.EOF {
+			err = probeErr
+		}
+	}
+	if stopClose() {
+		rawStream.Close()
+	} else {
+		<-bodyClosed
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		err = cause
+	}
+	if err != nil && err != io.EOF {
+		return err
+	}
+	return nil
+}
+
+// probePeer looks for evidence of the peer on behalf of an application that is
+// not reading: it decrypts whatever chunks fit the receive allowance, fetching
+// once if none is buffered, and reports whether one arrived. Frames stay
+// buffered, in order, for the next Read. A Read in progress does this itself,
+// so the probe then reports nothing new.
+func (c *Conn) probePeer(ctx context.Context) bool {
+	select {
+	case c.readGate <- struct{}{}:
+	default:
+		return false
+	}
+	defer func() { <-c.readGate }()
+	seen := false
+	for fetched := false; ; {
+		c.rmu.Lock()
+		if c.bufs == nil || c.closed.Load() != 0 || c.closedRead.Load() != 0 {
+			c.rmu.Unlock()
+			return seen
+		}
+		if c.bufs.Noise.Len() >= 4 {
+			// Unlike Read, unread frames may fill the allowance here. That is
+			// the application's backlog, not a protocol violation: stop.
+			sealedSize := uint64(binary.BigEndian.Uint32(c.bufs.Noise.Bytes()[:4])) + 4
+			if sealedSize > uint64(c.cfg.limits().Decrypted-c.bufs.Read.Len())+NoiseOverhead {
+				c.rmu.Unlock()
+				return seen
+			}
+		}
+		err := c.unsealBuffered()
+		budget := c.cfg.limits().Pending - c.bufs.Noise.Len()
+		c.rmu.Unlock()
+		if err == nil {
+			seen = true
+			continue
+		}
+		if err != io.ErrShortBuffer || fetched || budget <= 0 {
+			return seen
+		}
+		fetched = true
+		if c.receive(ctx, budget) != nil {
+			return seen
+		}
 	}
 }
 
@@ -725,17 +800,37 @@ func (c *Conn) Write(p []byte) (int, error) {
 	return accepted, nil
 }
 
+// flushRetryMax caps the backoff between resends of a failed chunk.
+const flushRetryMax = 30 * time.Second
+
 // flushLoop sends batched writes. Each pass drains everything queued, so bytes
-// that arrive while a chunk is in flight leave together in the next chunk.
+// that arrive while a chunk is in flight leave together in the next chunk. A
+// failed pass is retried on a backoff from dataPoll to flushRetryMax, so a
+// retained chunk does not wait for the application's next write.
 func (c *Conn) flushLoop() {
+	retry := time.NewTimer(time.Hour)
+	retry.Stop()
+	defer retry.Stop()
+	backoff := c.cfg.dataPoll
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
 		case <-c.flushKick:
+		case <-retry.C:
 		}
-		_ = c.flushContext(c.ctx) // a failure is owed to the next Write
+		err := c.flushContext(c.ctx) // a failure is owed to the next Write
 		c.signalWriteSpace()
+		retry.Stop()
+		if err == nil {
+			backoff = c.cfg.dataPoll
+			continue
+		}
+		if c.ctx.Err() != nil || c.limitFailure.Load() != nil || errors.Is(err, net.ErrClosed) {
+			return
+		}
+		retry.Reset(backoff)
+		backoff = min(backoff*2, flushRetryMax)
 	}
 }
 
